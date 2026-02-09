@@ -40,7 +40,7 @@ def _resolve_model(model: str | None, provider: str | None) -> str | None:
             "openai": "openai",
             "google": "google-gla",
             "ollama": "ollama",
-            "ollama-cloud": "ollama",
+            "ollama-cloud": "ollama-cloud",
             "openrouter": "openrouter",
             "xai": "xai",
             "groq": "groq",

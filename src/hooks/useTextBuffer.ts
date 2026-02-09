@@ -72,7 +72,9 @@ export function useTextBuffer(): UseTextBufferResult {
     },
 
     moveCursor: (position: number) => {
-      cursorPos.current = Math.max(0, Math.min(buffer.current.length, position));
+      const clamped = Math.max(0, Math.min(buffer.current.length, position));
+      if (clamped === cursorPos.current) return;
+      cursorPos.current = clamped;
       rerender();
     },
 

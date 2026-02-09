@@ -38,6 +38,7 @@ export function useAgentRunner(
 ): UseAgentRunnerResult {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [workingState, setWorkingState] = useState<WorkingState>({ status: 'idle' });
+  const workingStateRef = useRef<WorkingState>({ status: 'idle' });
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -46,6 +47,20 @@ export function useAgentRunner(
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Only trigger a re-render when the working state actually changes
+  const updateWorkingState = useCallback((next: WorkingState) => {
+    const prev = workingStateRef.current;
+    if (prev.status === next.status && (
+      next.status !== 'tool' || (prev.status === 'tool' && prev.toolName === next.toolName)
+    ) && (
+      next.status !== 'answering' || (prev.status === 'answering' && prev.startTime === next.startTime)
+    )) {
+      return; // No change
+    }
+    workingStateRef.current = next;
+    setWorkingState(next);
+  }, []);
 
   // Build model string for the backend. The model may already contain
   // a provider prefix (e.g. "openrouter:deepseek/deepseek-r1-0528:free")
@@ -100,7 +115,7 @@ export function useAgentRunner(
   const handleEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
       case 'thinking':
-        setWorkingState({ status: 'thinking' });
+        updateWorkingState({ status: 'thinking' });
         updateLastHistoryItem(item => ({
           events: [...item.events, {
             id: `thinking-${Date.now()}`,
@@ -112,7 +127,7 @@ export function useAgentRunner(
 
       case 'tool_start': {
         const toolId = `tool-${event.tool}-${Date.now()}`;
-        setWorkingState({ status: 'tool', toolName: event.tool });
+        updateWorkingState({ status: 'tool', toolName: event.tool });
         updateLastHistoryItem(item => ({
           activeToolId: toolId,
           events: [...item.events, {
@@ -125,7 +140,7 @@ export function useAgentRunner(
       }
 
       case 'tool_end':
-        setWorkingState({ status: 'thinking' });
+        updateWorkingState({ status: 'thinking' });
         updateLastHistoryItem(item => ({
           activeToolId: undefined,
           events: item.events.map(e =>
@@ -137,7 +152,7 @@ export function useAgentRunner(
         break;
 
       case 'tool_error':
-        setWorkingState({ status: 'thinking' });
+        updateWorkingState({ status: 'thinking' });
         updateLastHistoryItem(item => ({
           activeToolId: undefined,
           events: item.events.map(e =>
@@ -149,7 +164,7 @@ export function useAgentRunner(
         break;
 
       case 'answer_start':
-        setWorkingState({ status: 'answering', startTime: Date.now() });
+        updateWorkingState({ status: 'answering', startTime: Date.now() });
         break;
 
       case 'done': {
@@ -159,11 +174,11 @@ export function useAgentRunner(
           status: 'complete' as const,
           duration: item.startTime ? Date.now() - item.startTime : undefined,
         }));
-        setWorkingState({ status: 'idle' });
+        updateWorkingState({ status: 'idle' });
         break;
       }
     }
-  }, [updateLastHistoryItem]);
+  }, [updateLastHistoryItem, updateWorkingState]);
 
   // Run a query through the agent
   const runQuery = useCallback(async (query: string): Promise<RunQueryResult | undefined> => {
@@ -187,7 +202,7 @@ export function useAgentRunner(
     }]);
 
     setError(null);
-    setWorkingState({ status: 'thinking' });
+    updateWorkingState({ status: 'thinking' });
 
     try {
       // Ensure we have a session (retries if earlier attempt failed)
@@ -263,7 +278,7 @@ export function useAgentRunner(
           if (!last || last.status !== 'processing') return prev;
           return [...prev.slice(0, -1), { ...last, status: 'interrupted' }];
         });
-        setWorkingState({ status: 'idle' });
+        updateWorkingState({ status: 'idle' });
         return undefined;
       }
 
@@ -275,12 +290,12 @@ export function useAgentRunner(
         if (!last || last.status !== 'processing') return prev;
         return [...prev.slice(0, -1), { ...last, status: 'error' }];
       });
-      setWorkingState({ status: 'idle' });
+      updateWorkingState({ status: 'idle' });
       return undefined;
     } finally {
       abortControllerRef.current = null;
     }
-  }, [buildModelStr, ensureSession, handleEvent]);
+  }, [buildModelStr, ensureSession, handleEvent, updateWorkingState]);
 
   // Cancel the current execution
   const cancelExecution = useCallback(() => {
@@ -295,8 +310,8 @@ export function useAgentRunner(
       if (!last || last.status !== 'processing') return prev;
       return [...prev.slice(0, -1), { ...last, status: 'interrupted' }];
     });
-    setWorkingState({ status: 'idle' });
-  }, []);
+    updateWorkingState({ status: 'idle' });
+  }, [updateWorkingState]);
 
   // Check if currently processing
   const isProcessing = history.length > 0 && history[history.length - 1].status === 'processing';

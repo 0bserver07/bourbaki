@@ -46,10 +46,10 @@ interface HistoryItemViewProps {
   item: HistoryItem;
 }
 
-export function HistoryItemView({ item }: HistoryItemViewProps) {
+const HistoryItemViewInner = function HistoryItemView({ item }: HistoryItemViewProps) {
   // Add spacing after completed items, but not during processing
   const isComplete = item.status === 'complete' || item.status === 'error' || item.status === 'interrupted';
-  
+
   return (
     <Box flexDirection="column" marginBottom={isComplete ? 1 : 0}>
       {/* Query */}
@@ -57,27 +57,27 @@ export function HistoryItemView({ item }: HistoryItemViewProps) {
         <Text color={colors.muted} backgroundColor={colors.queryBg}>{'❯ '}</Text>
         <Text color={colors.white} backgroundColor={colors.queryBg}>{`${item.query} `}</Text>
       </Box>
-            
+
       {/* Interrupted indicator */}
       {item.status === 'interrupted' && (
         <Box marginLeft={2}>
           <Text color={colors.muted}>⎿  Interrupted · What should Bourbaki do instead?</Text>
         </Box>
       )}
-      
+
       {/* Events (tool calls, thinking) */}
-      <EventListView 
-        events={item.events} 
+      <EventListView
+        events={item.events}
         activeToolId={item.status === 'processing' ? item.activeToolId : undefined}
       />
-      
+
       {/* Answer - only show if we have one */}
       {item.answer && (
         <Box>
           <ProofDisplay text={item.answer} />
         </Box>
       )}
-      
+
       {/* Duration display - show when complete and duration > 15 seconds */}
       {item.status === 'complete' && item.duration !== undefined && item.duration > 15000 && (
         <Box marginTop={1}>
@@ -86,4 +86,6 @@ export function HistoryItemView({ item }: HistoryItemViewProps) {
       )}
     </Box>
   );
-}
+};
+
+export const HistoryItemView = React.memo(HistoryItemViewInner);

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -28,6 +29,8 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_graph.nodes import End
 
 from bourbaki.agent.context import AgentDependencies
@@ -72,12 +75,26 @@ def _record_call(ctx: RunContext[AgentDependencies], tool_name: str, args: dict,
     )
 
 
+def _resolve_model_object(model: str) -> str | OpenAIModel:
+    """Resolve model string, returning a custom model object for Ollama Cloud."""
+    if model.startswith("ollama-cloud:"):
+        model_name = model.removeprefix("ollama-cloud:")
+        api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "ollama")
+        provider = OpenAIProvider(
+            base_url="https://ollama.com/v1",
+            api_key=api_key,
+        )
+        return OpenAIModel(model_name, provider=provider)
+    return model
+
+
 def _create_agent(model: str) -> Agent[AgentDependencies, str]:
     """Create a Pydantic AI agent with all tools registered."""
     system_prompt = build_system_prompt()
+    resolved_model = _resolve_model_object(model)
 
     agent: Agent[AgentDependencies, str] = Agent(
-        model,
+        resolved_model,
         system_prompt=system_prompt,
         retries=2,
     )

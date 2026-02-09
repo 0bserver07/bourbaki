@@ -76,7 +76,7 @@ interface ThinkingViewProps {
   message: string;
 }
 
-export function ThinkingView({ message }: ThinkingViewProps) {
+export const ThinkingView = React.memo(function ThinkingView({ message }: ThinkingViewProps) {
   // Truncate long thinking messages
   const displayMessage = message.length > 200 
     ? message.slice(0, 200) + '...' 
@@ -88,7 +88,7 @@ export function ThinkingView({ message }: ThinkingViewProps) {
       <Text color={colors.white}>{displayMessage}</Text>
     </Box>
   );
-}
+});
 
 interface ToolStartViewProps {
   tool: string;
@@ -96,7 +96,7 @@ interface ToolStartViewProps {
   isActive?: boolean;
 }
 
-export function ToolStartView({ tool, args, isActive = false }: ToolStartViewProps) {
+export const ToolStartView = React.memo(function ToolStartView({ tool, args, isActive = false }: ToolStartViewProps) {
   return (
     <Box flexDirection="column">
       <Box>
@@ -115,7 +115,7 @@ export function ToolStartView({ tool, args, isActive = false }: ToolStartViewPro
       )}
     </Box>
   );
-}
+});
 
 interface ToolEndViewProps {
   tool: string;
@@ -124,7 +124,7 @@ interface ToolEndViewProps {
   duration: number;
 }
 
-export function ToolEndView({ tool, args, result, duration }: ToolEndViewProps) {
+export const ToolEndView = React.memo(function ToolEndView({ tool, args, result, duration }: ToolEndViewProps) {
   // Parse result to get a summary
   let summary = 'Received data';
   
@@ -171,14 +171,14 @@ export function ToolEndView({ tool, args, result, duration }: ToolEndViewProps) 
       </Box>
     </Box>
   );
-}
+});
 
 interface ToolErrorViewProps {
   tool: string;
   error: string;
 }
 
-export function ToolErrorView({ tool, error }: ToolErrorViewProps) {
+export const ToolErrorView = React.memo(function ToolErrorView({ tool, error }: ToolErrorViewProps) {
   return (
     <Box flexDirection="column">
       <Box>
@@ -191,7 +191,7 @@ export function ToolErrorView({ tool, error }: ToolErrorViewProps) {
       </Box>
     </Box>
   );
-}
+});
 
 interface ToolLimitViewProps {
   tool: string;
@@ -200,7 +200,7 @@ interface ToolLimitViewProps {
   blocked: boolean;
 }
 
-export function ToolLimitView({ tool, warning, blockReason, blocked }: ToolLimitViewProps) {
+export const ToolLimitView = React.memo(function ToolLimitView({ tool, warning, blockReason, blocked }: ToolLimitViewProps) {
   return (
     <Box flexDirection="column">
       <Box>
@@ -218,7 +218,7 @@ export function ToolLimitView({ tool, warning, blockReason, blocked }: ToolLimit
       </Box>
     </Box>
   );
-}
+});
 
 interface AgentEventViewProps {
   event: AgentEvent;
@@ -274,7 +274,7 @@ interface EventListViewProps {
 /**
  * Renders a list of agent events
  */
-export function EventListView({ events, activeToolId }: EventListViewProps) {
+export const EventListView = React.memo(function EventListView({ events, activeToolId }: EventListViewProps) {
   return (
     <Box flexDirection="column" gap={0} marginTop={1}>
       {events.map((displayEvent) => {
@@ -313,4 +313,4 @@ export function EventListView({ events, activeToolId }: EventListViewProps) {
       })}
     </Box>
   );
-}
+});

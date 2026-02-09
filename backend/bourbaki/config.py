@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     openrouter_api_key: str | None = None
+    ollama_cloud_api_key: str | None = None
     google_api_key: str | None = None
     xai_api_key: str | None = None
 
@@ -73,6 +74,7 @@ def export_api_keys() -> None:
         "OPENAI_API_KEY": settings.openai_api_key,
         "ANTHROPIC_API_KEY": settings.anthropic_api_key,
         "OPENROUTER_API_KEY": settings.openrouter_api_key,
+        "OLLAMA_CLOUD_API_KEY": settings.ollama_cloud_api_key,
         "GOOGLE_API_KEY": settings.google_api_key,
         "XAI_API_KEY": settings.xai_api_key,
     }
