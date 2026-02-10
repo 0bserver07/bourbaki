@@ -6,7 +6,7 @@
 # Mathlib tactics (norm_num, ring, linarith, simp, omega, etc.).
 #
 # Requirements:
-#   - Lean 4 (elan): https://leanprover.github.io/lean4/doc/setup.html
+#   - elan (Lean toolchain manager): https://leanprover.github.io/lean4/doc/setup.html
 #   - ~4GB disk space for Mathlib + cache
 #
 # Usage:
@@ -17,14 +17,9 @@ set -euo pipefail
 LEAN_PROJECT_DIR=".bourbaki/lean-project"
 
 # Check prerequisites
-if ! command -v lean &>/dev/null && ! command -v elan &>/dev/null; then
-  echo "Error: Lean 4 is not installed."
+if ! command -v elan &>/dev/null; then
+  echo "Error: elan (Lean toolchain manager) is not installed."
   echo "Install via: curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh"
-  exit 1
-fi
-
-if ! command -v lake &>/dev/null; then
-  echo "Error: lake (Lean build tool) not found in PATH."
   exit 1
 fi
 
@@ -35,11 +30,25 @@ if [ -d "$LEAN_PROJECT_DIR" ]; then
   exit 0
 fi
 
+# Step 1: Figure out what toolchain Mathlib needs by checking its lean-toolchain
+# file from the repo, then install that toolchain BEFORE running lake init.
+echo "Checking latest Mathlib toolchain requirement..."
+MATHLIB_TOOLCHAIN=$(curl -sSfL https://raw.githubusercontent.com/leanprover-community/mathlib4/master/lean-toolchain)
+echo "Mathlib requires: $MATHLIB_TOOLCHAIN"
+
+echo "Installing toolchain (this may download ~200MB)..."
+elan toolchain install "$MATHLIB_TOOLCHAIN"
+
+# Step 2: Create the project directory and write lean-toolchain so elan
+# uses the correct version for all lake commands in this directory.
 echo "Creating Lean 4 project with Mathlib at $LEAN_PROJECT_DIR..."
 mkdir -p "$LEAN_PROJECT_DIR"
 cd "$LEAN_PROJECT_DIR"
 
-# Initialize Lake project
+echo "$MATHLIB_TOOLCHAIN" > lean-toolchain
+
+# Step 3: Initialize Lake project with math template using the correct toolchain.
+# elan reads lean-toolchain from cwd and dispatches to the right lake binary.
 lake init bourbaki math
 
 echo "Fetching Mathlib cache (this downloads prebuilt .olean files)..."
@@ -52,4 +61,4 @@ echo ""
 echo "Done! Mathlib is ready."
 echo "Bourbaki will auto-detect Mathlib on next startup."
 echo ""
-echo "To verify, run: lean --run .bourbaki/lean-project/lakefile.lean"
+echo "To verify: cd $LEAN_PROJECT_DIR && lake env lean --version"

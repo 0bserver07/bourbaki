@@ -16,7 +16,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 MATHLIB_IMPORTS = "import Mathlib\nimport Mathlib.Tactic\n"
-LEAN_TEMP_DIR = Path(".bourbaki/lean-temp")
+
+# Resolve .bourbaki paths relative to the project root (parent of backend/)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+LEAN_TEMP_DIR = _PROJECT_ROOT / ".bourbaki" / "lean-temp"
+LEAN_PROJECT_DIR = _PROJECT_ROOT / ".bourbaki" / "lean-project"
 
 # Regex for Lean error output: filename:line:col: severity: message
 ERROR_RE = re.compile(r"^(.+?):(\d+):(\d+):\s+(error|warning|info):\s+(.+)$", re.MULTILINE)
@@ -59,19 +63,23 @@ def detect_lean_capabilities() -> dict[str, Any]:
         _lean_capabilities = caps
         return caps
 
-    # Detect Mathlib — try compiling a minimal import
-    LEAN_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    test_file = LEAN_TEMP_DIR / f"_mathlib_check_{secrets.token_hex(4)}.lean"
-    try:
-        test_file.write_text("import Mathlib.Tactic\n#check Nat.add_comm\n", encoding="utf-8")
-        result = subprocess.run(
-            ["lean", str(test_file)], capture_output=True, text=True, timeout=60,
-        )
-        caps["mathlib"] = result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    # Detect Mathlib — check if lean-project exists and try importing Mathlib
+    if LEAN_PROJECT_DIR.is_dir() and (LEAN_PROJECT_DIR / "lean-toolchain").exists():
+        test_file = LEAN_PROJECT_DIR / f"_mathlib_check_{secrets.token_hex(4)}.lean"
+        try:
+            test_file.write_text("import Mathlib.Tactic\n#check Nat.add_comm\n", encoding="utf-8")
+            result = subprocess.run(
+                ["lake", "env", "lean", str(test_file)],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(LEAN_PROJECT_DIR),
+            )
+            caps["mathlib"] = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            caps["mathlib"] = False
+        finally:
+            test_file.unlink(missing_ok=True)
+    else:
         caps["mathlib"] = False
-    finally:
-        test_file.unlink(missing_ok=True)
 
     logger.info("Lean capabilities: %s", caps)
     _lean_capabilities = caps
@@ -143,27 +151,37 @@ async def lean_prover(
     """
     start = time.monotonic()
 
-    # Only add Mathlib imports if the code explicitly uses Mathlib features
-    # (e.g. references Mathlib tactics, types, or theorems).
-    # Skip for pure Lean 4 code that doesn't need Mathlib.
-    if "import Mathlib" not in code and "import " not in code:
-        # No imports at all — try without Mathlib first (faster).
-        # If it fails, we could retry with Mathlib, but for now keep it simple.
-        pass
+    caps = detect_lean_capabilities()
+    use_mathlib = caps.get("mathlib", False)
 
-    # Write to temp file
-    LEAN_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    # Auto-prepend Mathlib import when Mathlib is available and code
+    # doesn't already have its own imports
+    if use_mathlib and "import " not in code:
+        code = "import Mathlib.Tactic\n\n" + code
+
+    # Write to temp file — use the Lake project dir when Mathlib is available
+    # so `lake env lean` can resolve Mathlib imports
+    if use_mathlib and LEAN_PROJECT_DIR.is_dir():
+        temp_dir = LEAN_PROJECT_DIR
+    else:
+        temp_dir = LEAN_TEMP_DIR
+    temp_dir.mkdir(parents=True, exist_ok=True)
     filename = f"bourbaki_{secrets.token_hex(8)}.lean"
-    filepath = LEAN_TEMP_DIR / filename
+    filepath = temp_dir / filename
 
     try:
         filepath.write_text(code, encoding="utf-8")
 
-        # Try `lean` first, then `lake env lean`
-        raw_output, return_code = await _run_lean(filepath, timeout)
-        if raw_output is None:
-            # lean not found, try lake
-            raw_output, return_code = await _run_lake_lean(filepath, timeout)
+        if use_mathlib and LEAN_PROJECT_DIR.is_dir():
+            # Run via lake env lean from the Mathlib project directory
+            raw_output, return_code = await _run_lake_lean(
+                filepath, timeout, cwd=LEAN_PROJECT_DIR,
+            )
+        else:
+            # Try bare `lean` first, then `lake env lean`
+            raw_output, return_code = await _run_lean(filepath, timeout)
+            if raw_output is None:
+                raw_output, return_code = await _run_lake_lean(filepath, timeout)
 
         if raw_output is None:
             elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -214,13 +232,14 @@ async def _run_lean(filepath: Path, timeout: int) -> tuple[str | None, int]:
         return "Lean timed out", 1
 
 
-async def _run_lake_lean(filepath: Path, timeout: int) -> tuple[str | None, int]:
-    """Fallback: run `lake env lean filepath`."""
+async def _run_lake_lean(filepath: Path, timeout: int, cwd: Path | None = None) -> tuple[str | None, int]:
+    """Run `lake env lean filepath`, optionally within a Lake project directory."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "lake", "env", "lean", str(filepath),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd) if cwd else None,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         output = (stdout or b"").decode() + (stderr or b"").decode()
