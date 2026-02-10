@@ -28,6 +28,7 @@ class Scratchpad:
     """Tracks tool calls, summaries, and limits for a single query."""
 
     tool_call_limit: int = 3
+    tool_call_limits: dict[str, int] = field(default_factory=dict)
     similarity_threshold: float = 0.7
 
     # Internal state
@@ -46,12 +47,13 @@ class Scratchpad:
         Returns dict with 'allowed', optional 'warning', optional 'blockReason'.
         """
         count = self._call_counts.get(tool_name, 0)
+        limit = self.tool_call_limits.get(tool_name, self.tool_call_limit)
 
-        if count >= self.tool_call_limit:
+        if count >= limit:
             return {
                 "allowed": False,
                 "blockReason": (
-                    f"{tool_name} has been called {count} times (limit: {self.tool_call_limit}). "
+                    f"{tool_name} has been called {count} times (limit: {limit}). "
                     "Try a different approach or answer with available information."
                 ),
             }
@@ -69,7 +71,7 @@ class Scratchpad:
                     break
 
         # Last attempt warning
-        if count == self.tool_call_limit - 1:
+        if count == limit - 1:
             result["warning"] = f"This is the last allowed call to {tool_name}."
 
         return result
@@ -115,10 +117,14 @@ class Scratchpad:
 
         lines = ["Tool usage:"]
         for tool, count in self._call_counts.items():
-            remaining = self.tool_call_limit - count
-            lines.append(f"  - {tool}: {count}/{self.tool_call_limit} calls used ({remaining} remaining)")
+            limit = self.tool_call_limits.get(tool, self.tool_call_limit)
+            remaining = limit - count
+            lines.append(f"  - {tool}: {count}/{limit} calls used ({remaining} remaining)")
 
-        if any(c >= self.tool_call_limit for c in self._call_counts.values()):
+        if any(
+            c >= self.tool_call_limits.get(t, self.tool_call_limit)
+            for t, c in self._call_counts.items()
+        ):
             lines.append("Some tools have reached their limit. Use available results to answer.")
 
         return "\n".join(lines)

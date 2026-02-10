@@ -29,6 +29,8 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_graph.nodes import End
@@ -75,8 +77,8 @@ def _record_call(ctx: RunContext[AgentDependencies], tool_name: str, args: dict,
     )
 
 
-def _resolve_model_object(model: str) -> str | OpenAIModel:
-    """Resolve model string, returning a custom model object for Ollama Cloud."""
+def _resolve_model_object(model: str) -> str | OpenAIModel | AnthropicModel:
+    """Resolve model string, returning a custom model object for custom providers."""
     if model.startswith("ollama-cloud:"):
         model_name = model.removeprefix("ollama-cloud:")
         api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "ollama")
@@ -85,6 +87,16 @@ def _resolve_model_object(model: str) -> str | OpenAIModel:
             api_key=api_key,
         )
         return OpenAIModel(model_name, provider=provider)
+
+    if model.startswith("glm:"):
+        model_name = model.removeprefix("glm:")
+        api_key = os.environ.get("GLM_API_KEY", "")
+        provider = AnthropicProvider(
+            base_url="https://api.z.ai/api/anthropic",
+            api_key=api_key,
+        )
+        return AnthropicModel(model_name, provider=provider)
+
     return model
 
 
@@ -231,7 +243,10 @@ async def run_agent(
     """
     model = model or settings.default_model
 
-    scratchpad = Scratchpad(tool_call_limit=settings.tool_call_limit)
+    scratchpad = Scratchpad(
+        tool_call_limit=settings.tool_call_limit,
+        tool_call_limits=settings.tool_call_limits,
+    )
     deps = AgentDependencies(query=query, model=model, scratchpad=scratchpad)
 
     agent = _create_agent(model)

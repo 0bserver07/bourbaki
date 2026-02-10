@@ -61,6 +61,11 @@ const PROVIDERS: Provider[] = [
     models: ['gemini-3-flash-preview', 'gemini-3-pro-preview'],
   },
   {
+    displayName: 'GLM (Z.AI)',
+    providerId: 'glm',
+    models: ['glm-4.7', 'glm-4.5-air'],
+  },
+  {
     displayName: 'xAI',
     providerId: 'xai',
     models: ['grok-4-0709', 'grok-4-1-fast-reasoning'],
@@ -152,7 +157,7 @@ interface ModelSelectorProps {
 export function ModelSelector({ providerId, models, currentModel, onSelect }: ModelSelectorProps) {
   // Normalize model names for comparison (strip provider prefix)
   const stripPrefix = (model: string) => {
-    const prefixes = ['openrouter:', 'ollama:', 'ollama-cloud:'];
+    const prefixes = ['openrouter:', 'ollama:', 'ollama-cloud:', 'glm:'];
     for (const prefix of prefixes) {
       if (model?.startsWith(prefix)) {
         return model.replace(prefix, '');

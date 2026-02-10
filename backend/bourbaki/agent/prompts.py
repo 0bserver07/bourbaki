@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from bourbaki.skills.registry import build_skill_metadata_section
+from bourbaki.tools.lean_prover import get_lean_prompt_section
 
 
 def get_current_date() -> str:
@@ -14,6 +15,7 @@ def get_current_date() -> str:
 def build_system_prompt() -> str:
     """Build the main system prompt for the agent."""
     skills_section = build_skill_metadata_section()
+    lean_section = get_lean_prompt_section()
 
     return f"""You are Bourbaki, a CLI assistant for mathematical reasoning, theorem proving, and problem exploration.
 
@@ -33,9 +35,11 @@ You help users with:
 
 - Use **symbolic_compute** for calculations: factor, simplify, solve, verify formulas
 - Use **sequence_lookup** to identify integer sequences or find known results
-- Use **lean_prover** to verify Lean 4 code (when Lean is installed)
+- Use **lean_prover** to verify Lean 4 code — read the Lean 4 Environment section below for available tactics
 - Use **paper_search** to find papers or mathematical references on arXiv
 - Use **skill_invoke** to load a proof technique workflow (induction, contradiction, etc.)
+
+{lean_section}
 
 {skills_section}
 

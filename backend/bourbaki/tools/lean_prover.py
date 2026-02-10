@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 MATHLIB_IMPORTS = "import Mathlib\nimport Mathlib.Tactic\n"
 LEAN_TEMP_DIR = Path(".bourbaki/lean-temp")
@@ -16,6 +21,109 @@ LEAN_TEMP_DIR = Path(".bourbaki/lean-temp")
 # Regex for Lean error output: filename:line:col: severity: message
 ERROR_RE = re.compile(r"^(.+?):(\d+):(\d+):\s+(error|warning|info):\s+(.+)$", re.MULTILINE)
 GOAL_RE = re.compile(r"⊢\s+(.+)")
+
+# Cached Lean capabilities (detected once at startup)
+_lean_capabilities: dict[str, Any] | None = None
+
+
+def detect_lean_capabilities() -> dict[str, Any]:
+    """Detect Lean 4 installation and Mathlib availability (cached).
+
+    Returns dict with:
+        installed: bool
+        version: str | None
+        mathlib: bool
+    """
+    global _lean_capabilities
+    if _lean_capabilities is not None:
+        return _lean_capabilities
+
+    caps: dict[str, Any] = {"installed": False, "version": None, "mathlib": False}
+
+    lean_bin = shutil.which("lean")
+    if not lean_bin:
+        _lean_capabilities = caps
+        return caps
+
+    # Get version
+    try:
+        result = subprocess.run(
+            ["lean", "--version"], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            caps["installed"] = True
+            # Parse "Lean (version 4.22.0, ...)"
+            m = re.search(r"version\s+([\d.]+)", result.stdout)
+            caps["version"] = m.group(1) if m else "unknown"
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        _lean_capabilities = caps
+        return caps
+
+    # Detect Mathlib — try compiling a minimal import
+    LEAN_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    test_file = LEAN_TEMP_DIR / f"_mathlib_check_{secrets.token_hex(4)}.lean"
+    try:
+        test_file.write_text("import Mathlib.Tactic\n#check Nat.add_comm\n", encoding="utf-8")
+        result = subprocess.run(
+            ["lean", str(test_file)], capture_output=True, text=True, timeout=60,
+        )
+        caps["mathlib"] = result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        caps["mathlib"] = False
+    finally:
+        test_file.unlink(missing_ok=True)
+
+    logger.info("Lean capabilities: %s", caps)
+    _lean_capabilities = caps
+    return caps
+
+
+def get_lean_prompt_section() -> str:
+    """Return a system prompt section describing available Lean 4 capabilities."""
+    caps = detect_lean_capabilities()
+
+    if not caps["installed"]:
+        return """## Lean 4 Environment
+
+Lean 4 is NOT installed. Do not attempt to use the lean_prover tool.
+Write informal proofs only."""
+
+    if caps["mathlib"]:
+        return f"""## Lean 4 Environment
+
+Lean 4 v{caps['version']} is installed WITH Mathlib.
+
+Available tactics include: simp, norm_num, ring, omega, linarith, nlinarith,
+field_simp, push_neg, contrapose, decide, native_decide, ext, funext,
+apply, exact, intro, cases, induction, rw, rfl, constructor, use,
+have, let, show, calc, conv, gcongr, positivity, polyrith, aesop.
+
+Available Mathlib imports: Mathlib.Tactic, Mathlib.Data.*, Mathlib.Algebra.*,
+Mathlib.Analysis.*, Mathlib.Topology.*, Mathlib.NumberTheory.*, etc.
+
+When writing Lean proofs:
+- Start with `import Mathlib` or specific module imports
+- Use `import Mathlib.Tactic` for tactic access without importing everything
+- The lean_prover tool allows multiple attempts — read error output carefully and fix issues iteratively"""
+
+    return f"""## Lean 4 Environment
+
+Lean 4 v{caps['version']} is installed WITHOUT Mathlib (vanilla Lean 4 only).
+
+Available tactics (built-in only): simp, decide, native_decide, rfl,
+apply, exact, intro, cases, induction, rw, constructor, use,
+have, let, show, calc, omega, trivial, assumption, contradiction.
+
+DO NOT use Mathlib tactics: norm_num, ring, linarith, nlinarith, field_simp,
+push_neg, polyrith, aesop, positivity, gcongr — these will fail.
+
+DO NOT write `import Mathlib` — it is not installed.
+
+When writing Lean proofs:
+- Use only core Lean 4 tactics listed above
+- For arithmetic equalities, prefer `native_decide` or `decide` over `norm_num`
+- For simple equalities, `rfl` often works
+- The lean_prover tool allows multiple attempts — read error output carefully and fix issues iteratively"""
 
 
 async def lean_prover(

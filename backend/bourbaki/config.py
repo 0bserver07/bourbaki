@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openrouter_api_key: str | None = None
     ollama_cloud_api_key: str | None = None
+    glm_api_key: str | None = None
     google_api_key: str | None = None
     xai_api_key: str | None = None
 
@@ -44,7 +45,13 @@ class Settings(BaseSettings):
 
     # Agent defaults
     max_iterations: int = 10
-    tool_call_limit: int = 3  # Max calls per tool per query
+    tool_call_limit: int = 3  # Default max calls per tool per query
+
+    # Per-tool call limit overrides (tool_name → limit)
+    # Lean proof search is iterative — the model needs more attempts to refine proofs
+    tool_call_limits: dict[str, int] = {
+        "lean_prover": 8,
+    }
 
     @property
     def bourbaki_path(self) -> Path:
@@ -75,6 +82,7 @@ def export_api_keys() -> None:
         "ANTHROPIC_API_KEY": settings.anthropic_api_key,
         "OPENROUTER_API_KEY": settings.openrouter_api_key,
         "OLLAMA_CLOUD_API_KEY": settings.ollama_cloud_api_key,
+        "GLM_API_KEY": settings.glm_api_key,
         "GOOGLE_API_KEY": settings.google_api_key,
         "XAI_API_KEY": settings.xai_api_key,
     }

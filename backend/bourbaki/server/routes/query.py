@@ -42,6 +42,7 @@ def _resolve_model(model: str | None, provider: str | None) -> str | None:
             "ollama": "ollama",
             "ollama-cloud": "ollama-cloud",
             "openrouter": "openrouter",
+            "glm": "glm",
             "xai": "xai",
             "groq": "groq",
         }
