@@ -45,6 +45,19 @@ You help users with:
 
 {skills_section}
 
+## Self-Correction Protocol
+
+When a Lean tool call (lean_prover or lean_tactic) fails:
+1. Read the error analysis carefully — each error includes a category and recovery hint
+2. If **unknown_identifier** → call mathlib_search to find the correct lemma name. NEVER guess.
+3. If **type_mismatch** → examine the expected vs actual types and adjust the proof term
+4. If **tactic_failed** → try the suggested alternative tactics from the error analysis
+5. If **unsolved_goals** → use lean_tactic to address remaining goals one by one
+6. If **syntax_error** → check for Lean 3 vs 4 syntax issues and fix
+7. If **timeout** → break the proof into smaller lemmas or use more specific tactics
+8. NEVER retry the exact same code — always modify based on the error feedback
+9. After 3 failures on the same goal, fundamentally change your proof strategy
+
 ## Mathematical Workflow
 
 1. **Understand the problem**: Parse the statement, identify domain and structure
@@ -79,6 +92,7 @@ def build_iteration_prompt(
     original_query: str,
     tool_summaries: list[str],
     tool_usage_status: str | None = None,
+    error_summary: str | None = None,
 ) -> str:
     """Build the prompt for subsequent agent iterations."""
     summaries_text = "\n".join(tool_summaries) if tool_summaries else "(no tools called yet)"
@@ -90,6 +104,9 @@ Computations and results so far:
 
     if tool_usage_status:
         prompt += f"\n\n{tool_usage_status}"
+
+    if error_summary:
+        prompt += f"\n\n{error_summary}"
 
     prompt += """
 

@@ -48,6 +48,7 @@ from bourbaki.agent.prompts import build_system_prompt
 from bourbaki.agent.scratchpad import Scratchpad
 from bourbaki.config import settings
 from bourbaki.events import AgentEvent
+from bourbaki.tools.lean_errors import classify_lean_error, classify_lean_errors, format_error_guidance
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import lean_tactic
 from bourbaki.tools.mathlib_search import mathlib_search
@@ -150,8 +151,23 @@ def _create_agent(model: str) -> Agent[AgentDependencies, str]:
         blocked = _check_scratchpad(ctx, "lean_prover", code[:100])
         if blocked:
             return blocked
+        # Warn if this exact code already failed
+        if ctx.deps.scratchpad.is_repeated_approach("lean_prover", code[:200]):
+            logger.info("Repeated approach detected for lean_prover")
         result = await lean_prover(code=code, mode=mode)
         result_str = json.dumps(result, default=str)
+        # Classify errors and append recovery guidance
+        if not result.get("success") and result.get("errors"):
+            classified = classify_lean_errors(result["errors"])
+            guidance = format_error_guidance(classified)
+            if guidance:
+                result["classified_errors"] = classified
+                result_str = json.dumps(result, default=str) + guidance
+            # Record errors in scratchpad
+            for cerr in classified:
+                ctx.deps.scratchpad.record_error(
+                    "lean_prover", cerr["category"], cerr["message"][:200], code[:200],
+                )
         _record_call(ctx, "lean_prover", {"mode": mode}, result_str, code[:100])
         return result_str
 
@@ -184,6 +200,15 @@ def _create_agent(model: str) -> Agent[AgentDependencies, str]:
             return blocked
         result = await lean_tactic(goal=goal, tactic=tactic, proof_state=proof_state)
         result_str = json.dumps(result, default=str)
+        # Classify single error from lean_tactic and append guidance
+        if not result.get("success") and result.get("error"):
+            classified = classify_lean_error(result["error"])
+            result["error_category"] = classified.category
+            result["recovery"] = classified.recovery
+            result_str = json.dumps(result, default=str)
+            ctx.deps.scratchpad.record_error(
+                "lean_tactic", classified.category, classified.message[:200], tactic,
+            )
         _record_call(ctx, "lean_tactic", {"goal": goal[:80], "tactic": tactic}, result_str, tactic)
         return result_str
 

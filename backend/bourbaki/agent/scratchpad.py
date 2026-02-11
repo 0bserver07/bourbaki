@@ -24,6 +24,15 @@ class ToolContext:
 
 
 @dataclass
+class ErrorRecord:
+    """Record of a Lean error and what was tried."""
+    tool: str
+    category: str
+    message: str
+    code_or_tactic: str
+
+
+@dataclass
 class Scratchpad:
     """Tracks tool calls, summaries, and limits for a single query."""
 
@@ -38,6 +47,9 @@ class Scratchpad:
     _tool_contexts: list[ToolContext] = field(default_factory=list)
     _summaries: list[str] = field(default_factory=list)
     _executed_skills: set[str] = field(default_factory=set)
+    # Error tracking for self-correction loop
+    _error_history: list[ErrorRecord] = field(default_factory=list)
+    _failed_approaches: set[str] = field(default_factory=set)
 
     def can_call_tool(
         self, tool_name: str, query: str | None = None,
@@ -100,6 +112,65 @@ class Scratchpad:
 
     def mark_skill_executed(self, skill_name: str) -> None:
         self._executed_skills.add(skill_name)
+
+    # --- Error tracking for self-correction ---
+
+    def record_error(
+        self,
+        tool: str,
+        category: str,
+        message: str,
+        code_or_tactic: str,
+    ) -> None:
+        """Record a Lean error for self-correction tracking."""
+        self._error_history.append(ErrorRecord(
+            tool=tool, category=category,
+            message=message, code_or_tactic=code_or_tactic,
+        ))
+        # Track the approach signature to prevent exact retries
+        approach_key = f"{tool}:{category}:{code_or_tactic[:200]}"
+        self._failed_approaches.add(approach_key)
+
+    def is_repeated_approach(self, tool: str, code_or_tactic: str) -> bool:
+        """Check if this exact approach has already failed."""
+        # Check against all error categories for this code
+        for cat in ("unknown_identifier", "type_mismatch", "tactic_failed",
+                     "unsolved_goals", "syntax_error", "timeout", "other"):
+            key = f"{tool}:{cat}:{code_or_tactic[:200]}"
+            if key in self._failed_approaches:
+                return True
+        return False
+
+    def get_error_count_for_category(self, category: str) -> int:
+        """Count how many errors of a given category have occurred."""
+        return sum(1 for e in self._error_history if e.category == category)
+
+    def should_change_strategy(self) -> bool:
+        """Check if the agent has failed enough times to warrant a strategy change."""
+        lean_errors = [e for e in self._error_history if e.tool in ("lean_prover", "lean_tactic")]
+        return len(lean_errors) >= 3
+
+    def get_error_summary(self) -> str | None:
+        """Format error history into guidance for the agent."""
+        if not self._error_history:
+            return None
+
+        lean_errors = [e for e in self._error_history if e.tool in ("lean_prover", "lean_tactic")]
+        if not lean_errors:
+            return None
+
+        lines = [f"Previous Lean errors ({len(lean_errors)} total):"]
+        # Show last 3 errors to avoid overwhelming the prompt
+        for err in lean_errors[-3:]:
+            lines.append(f"  - [{err.category}] {err.message[:100]}")
+
+        if self.should_change_strategy():
+            lines.append(
+                "WARNING: Multiple failures detected. Consider a fundamentally "
+                "different proof strategy instead of minor variations on the same approach."
+            )
+
+        return "\n".join(lines)
 
     def get_tool_summaries(self) -> list[str]:
         return list(self._summaries)
