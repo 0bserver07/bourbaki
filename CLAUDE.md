@@ -143,3 +143,17 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 - **Verification:** Lean 4 + Mathlib
 - **Sequences:** OEIS API
 - **Papers:** arXiv API
+
+## Development Roadmap
+
+The roadmap for closing the gap with SOTA theorem provers (Axiom, Aristotle, LeanDojo,
+AlphaProof, etc.) lives in `.bourbaki/roadmap/` (gitignored). Read it for context on
+what's been done and what's planned:
+
+- `.bourbaki/roadmap/README.md` — overview and reference systems
+- `.bourbaki/roadmap/tracker.md` — current task status across all phases
+- `.bourbaki/roadmap/phases/` — detailed plans for each phase
+
+Current phases: (1) Self-correction loop, (2) Best-first proof search,
+(3) Informal-to-formal pipeline, (4) Semantic Mathlib retrieval,
+(5) miniF2F benchmark, (6) Multi-agent proving.
