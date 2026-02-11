@@ -57,8 +57,19 @@ lake exe cache get
 echo "Building project..."
 lake build
 
+# Step 5: Build lean4-repl for tactic-by-tactic interaction
+echo "Setting up lean4-repl for interactive tactic mode..."
+REPL_DIR=".lake/repl"
+if [ ! -d "$REPL_DIR" ]; then
+  git clone https://github.com/leanprover-community/repl "$REPL_DIR"
+  cd "$REPL_DIR" && lake build && cd ../..
+  echo "lean4-repl built successfully."
+else
+  echo "lean4-repl already exists at $REPL_DIR"
+fi
+
 echo ""
-echo "Done! Mathlib is ready."
+echo "Done! Mathlib and lean4-repl are ready."
 echo "Bourbaki will auto-detect Mathlib on next startup."
 echo ""
 echo "To verify: cd $LEAN_PROJECT_DIR && lake env lean --version"

@@ -49,6 +49,8 @@ from bourbaki.agent.scratchpad import Scratchpad
 from bourbaki.config import settings
 from bourbaki.events import AgentEvent
 from bourbaki.tools.lean_prover import lean_prover
+from bourbaki.tools.lean_repl import lean_tactic
+from bourbaki.tools.mathlib_search import mathlib_search
 from bourbaki.tools.paper_search import paper_search
 from bourbaki.tools.sequence_lookup import sequence_lookup
 from bourbaki.tools.skill_tool import skill_invoke
@@ -151,6 +153,38 @@ def _create_agent(model: str) -> Agent[AgentDependencies, str]:
         result = await lean_prover(code=code, mode=mode)
         result_str = json.dumps(result, default=str)
         _record_call(ctx, "lean_prover", {"mode": mode}, result_str, code[:100])
+        return result_str
+
+    @agent.tool(strict=False)
+    async def tool_mathlib_search(
+        ctx: RunContext[AgentDependencies],
+        query: str,
+        mode: str = "name",
+        max_results: int = 5,
+    ) -> str:
+        """Search Mathlib for lemmas by name, type signature, or natural language description."""
+        blocked = _check_scratchpad(ctx, "mathlib_search", query)
+        if blocked:
+            return blocked
+        result = await mathlib_search(query=query, mode=mode, max_results=max_results)
+        result_str = json.dumps(result, default=str)
+        _record_call(ctx, "mathlib_search", {"query": query, "mode": mode}, result_str, query)
+        return result_str
+
+    @agent.tool(strict=False)
+    async def tool_lean_tactic(
+        ctx: RunContext[AgentDependencies],
+        goal: str,
+        tactic: str,
+        proof_state: int | None = None,
+    ) -> str:
+        """Apply a single Lean 4 tactic to a proof state. Returns remaining goals."""
+        blocked = _check_scratchpad(ctx, "lean_tactic", tactic)
+        if blocked:
+            return blocked
+        result = await lean_tactic(goal=goal, tactic=tactic, proof_state=proof_state)
+        result_str = json.dumps(result, default=str)
+        _record_call(ctx, "lean_tactic", {"goal": goal[:80], "tactic": tactic}, result_str, tactic)
         return result_str
 
     @agent.tool(strict=False)

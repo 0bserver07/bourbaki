@@ -27,6 +27,8 @@ The backend is Python (FastAPI + Pydantic AI). The TUI is TypeScript (React + In
 |------|------|---------|
 | `symbolic_compute` | `backend/bourbaki/tools/symbolic_compute.py` | Native SymPy (30 ops + aliases) |
 | `lean_prover` | `backend/bourbaki/tools/lean_prover.py` | Lean 4 via asyncio subprocess |
+| `lean_tactic` | `backend/bourbaki/tools/lean_repl.py` | Lean 4 REPL for tactic-by-tactic interaction |
+| `mathlib_search` | `backend/bourbaki/tools/mathlib_search.py` | Loogle + LeanSearch for Mathlib lemma lookup |
 | `sequence_lookup` | `backend/bourbaki/tools/sequence_lookup.py` | OEIS via httpx |
 | `paper_search` | `backend/bourbaki/tools/paper_search.py` | arXiv via httpx |
 | `web_search` | `backend/bourbaki/tools/web_search.py` | Exa API for academic/general web search |
