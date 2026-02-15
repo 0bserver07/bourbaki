@@ -16,6 +16,7 @@ from typing import Any
 
 from bourbaki.autonomous.modal_runner import execute_strategy_local
 from bourbaki.autonomous.progress import ProgressReport
+from bourbaki.autonomous.search_tree import prove_with_search
 from bourbaki.autonomous.strategies import (
     DEFAULT_STRATEGIES,
     DeadEnd,
@@ -41,6 +42,9 @@ class AutonomousSearchConfig:
         checkpoint_interval: int = 10,
         auto_resume: bool = True,
         max_dead_ends_per_strategy: int = 3,
+        use_search_tree: bool = False,
+        search_tree_budget: int = 100,
+        search_tree_max_depth: int = 30,
     ):
         self.max_iterations = max_iterations
         self.max_hours = max_hours
@@ -48,6 +52,9 @@ class AutonomousSearchConfig:
         self.checkpoint_interval = checkpoint_interval
         self.auto_resume = auto_resume
         self.max_dead_ends_per_strategy = max_dead_ends_per_strategy
+        self.use_search_tree = use_search_tree
+        self.search_tree_budget = search_tree_budget
+        self.search_tree_max_depth = search_tree_max_depth
 
 
 class AutonomousSearch:
@@ -226,7 +233,63 @@ class AutonomousSearch:
         self._proof_state = state
 
     async def _run_loop(self) -> None:
-        """Main search loop — gets strategies and executes them via LLM."""
+        """Main search loop — gets strategies and executes them via LLM.
+
+        If use_search_tree is enabled, first attempts best-first tactic search
+        via the Lean REPL before falling back to strategy rotation.
+        """
+        # Phase 1: Try best-first proof search tree (if enabled and problem has Lean statement)
+        if (
+            self._config.use_search_tree
+            and self._problem
+            and self._problem.get("lean_statement")
+        ):
+            self._emit({
+                "type": "strategy_attempt",
+                "strategy": "best-first-search",
+                "approach": "Tactic-by-tactic best-first search using Lean REPL",
+            })
+
+            search_result = await prove_with_search(
+                theorem=self._problem["lean_statement"],
+                budget=self._config.search_tree_budget,
+                timeout=self._config.max_hours * 3600,
+                max_depth=self._config.search_tree_max_depth,
+                use_mathlib=True,
+            )
+
+            self._iteration += 1
+
+            if search_result.success:
+                self._proof_state = {
+                    "complete": True,
+                    "proof_code": search_result.proof_code,
+                    "tactics": search_result.proof_tactics,
+                }
+                self._insights.append(
+                    f"Best-first search found proof: {len(search_result.proof_tactics)} tactics, "
+                    f"{search_result.nodes_explored} nodes explored"
+                )
+                self._emit({
+                    "type": "completed",
+                    "success": True,
+                    "result": search_result.proof_code,
+                })
+                self._status = "completed"
+                return
+            else:
+                self._insights.append(
+                    f"Best-first search failed: {search_result.error} "
+                    f"({search_result.nodes_explored} nodes explored)"
+                )
+                self._emit({
+                    "type": "strategy_result",
+                    "strategy": "best-first-search",
+                    "success": False,
+                    "insight": f"Explored {search_result.nodes_explored} proof states without finding a proof",
+                })
+
+        # Phase 2: Strategy rotation (original approach)
         while self._status == "running":
             # Check limits
             if self._iteration >= self._config.max_iterations:
