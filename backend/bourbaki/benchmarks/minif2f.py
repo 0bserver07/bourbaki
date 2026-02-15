@@ -127,18 +127,15 @@ async def attempt_proof(
                 duration_seconds=time.monotonic() - start,
             )
 
-    # Default: try common automation tactics
+    # Default: try common automation tactics (ordered by likelihood, kept short
+    # since each attempt with `import Mathlib` takes ~90s of compilation)
     automation_tactics = [
-        "simp",
+        "norm_num",
         "omega",
         "ring",
-        "norm_num",
-        "decide",
+        "simp",
         "linarith",
-        "nlinarith",
-        "aesop",
-        "simp_all",
-        "norm_num [Nat.Prime]",
+        "decide",
     ]
 
     attempts = 0
@@ -149,7 +146,7 @@ async def attempt_proof(
 
         try:
             result = await asyncio.wait_for(
-                lean_prover(code=proof_code, mode="check", timeout=60),
+                lean_prover(code=proof_code, mode="check", timeout=180),
                 timeout=timeout,
             )
             if result.get("proofComplete"):

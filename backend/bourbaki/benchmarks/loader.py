@@ -32,6 +32,9 @@ _THEOREM_SIMPLE_RE = re.compile(
 # Extract imports from the file
 _IMPORT_RE = re.compile(r"^import\s+.+$", re.MULTILINE)
 
+# Extract preamble lines (import, set_option, open, etc.)
+_PREAMBLE_RE = re.compile(r"^(?:import|set_option|open)\s+.+$", re.MULTILINE)
+
 # Extract the problem source from the filename
 # e.g., "aime_1983_p1" → "aime", "imo_1964_p4" → "imo"
 _SOURCE_RE = re.compile(r"^([a-z]+)_")
@@ -87,14 +90,22 @@ def load_minif2f_problems(
     splits = ["valid", "test"] if split == "all" else [split]
 
     for s in splits:
-        split_dir = base / "Minif2f" / s.capitalize()
-        if not split_dir.is_dir():
-            # Try alternative directory structures
-            split_dir = base / "minif2f" / s
-            if not split_dir.is_dir():
-                split_dir = base / s
-                if not split_dir.is_dir():
-                    continue
+        # Try common directory naming conventions
+        split_name = s.capitalize()  # "Valid" or "Test"
+        candidates = [
+            base / "MiniF2F" / split_name,
+            base / "Minif2f" / split_name,
+            base / "minif2f" / s,
+            base / split_name,
+            base / s,
+        ]
+        split_dir = None
+        for candidate in candidates:
+            if candidate.is_dir():
+                split_dir = candidate
+                break
+        if split_dir is None:
+            continue
 
         for lean_file in sorted(split_dir.glob("*.lean")):
             problem = _parse_lean_file(lean_file, s)
@@ -122,22 +133,26 @@ def _parse_lean_file(path: Path, split: str) -> MiniF2FProblem | None:
     # Extract imports
     imports = _IMPORT_RE.findall(content)
 
+    # Extract full preamble (imports + set_option + open)
+    preamble_lines = _PREAMBLE_RE.findall(content)
+
     # Extract theorem statement
     m = _THEOREM_SIMPLE_RE.search(content)
     if not m:
         return None
 
     statement = m.group(1).strip()
-    theorem_name = m.group(2)
 
     # Determine source from filename
     stem = path.stem
     source_match = _SOURCE_RE.match(stem)
     source = source_match.group(1) if source_match else "unknown"
 
-    # Build the full Lean code for verification (imports + statement + proof placeholder)
-    import_block = "\n".join(imports)
-    full_code = f"{import_block}\n\n{statement} := by\n  sorry"
+    # Build the full Lean code for verification — include all preamble directives
+    # (imports, set_option maxHeartbeats, open namespaces) so the proof environment
+    # matches what miniF2F expects
+    preamble_block = "\n".join(preamble_lines)
+    full_code = f"{preamble_block}\n\n{statement} := by\n  sorry"
 
     return MiniF2FProblem(
         id=stem,
