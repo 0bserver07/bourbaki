@@ -17,12 +17,19 @@ AUTOMATION_TACTICS = [
     "omega",
     "norm_num",
     "linarith",
+    "nlinarith",
     "decide",
     "aesop",
     "trivial",
     "assumption",
     "contradiction",
     "rfl",
+    "positivity",
+    "norm_cast",
+    "field_simp",
+    "push_cast",
+    "ring_nf",
+    "simp_all",
 ]
 
 # Goal pattern → candidate tactics
@@ -32,26 +39,39 @@ _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [
     (r"∀", ["intro", "intros"]),
     (r"∃", ["use", "refine ⟨?_, ?_⟩", "exact ⟨_, _⟩"]),
     # Connectives
-    (r"∧", ["constructor", "exact ⟨_, _⟩", "And.intro"]),
+    (r"∧", ["constructor", "exact ⟨_, _⟩", "refine ⟨?_, ?_⟩"]),
     (r"∨", ["left", "right", "Or.inl", "Or.inr"]),
     (r"↔", ["constructor", "Iff.intro"]),
     (r"¬", ["intro", "push_neg"]),
     (r"False", ["contradiction", "exact absurd", "exfalso"]),
     (r"True", ["trivial", "exact True.intro"]),
     # Equality
-    (r"=", ["rfl", "ring", "simp", "omega", "norm_num", "ext", "funext", "congr"]),
+    (r"=", ["rfl", "ring", "simp", "omega", "norm_num", "ext", "funext",
+            "congr", "norm_cast", "push_cast", "ring_nf"]),
     # Inequality / ordering
-    (r"[<≤>≥]", ["linarith", "omega", "norm_num", "nlinarith", "positivity", "gcongr"]),
+    (r"[<≤>≥]", ["linarith", "omega", "norm_num", "nlinarith", "positivity",
+                  "gcongr", "norm_cast"]),
     (r"≠", ["intro", "push_neg", "omega", "norm_num"]),
     # Membership / set operations
     (r"∈", ["simp", "exact mem_of", "apply mem_of"]),
     (r"⊆", ["intro", "simp"]),
     # Natural numbers
-    (r"Nat\.", ["omega", "simp [Nat.]", "norm_num", "induction"]),
+    (r"Nat\.", ["omega", "simp [Nat.]", "norm_num", "induction", "norm_cast"]),
     (r"Fin\.", ["simp", "omega", "fin_cases"]),
     # Division / modular arithmetic
-    (r"[%∣]", ["omega", "norm_num", "simp [Nat.dvd_iff_mod_eq_zero]"]),
+    (r"[%∣]", ["omega", "norm_num", "simp [Nat.dvd_iff_mod_eq_zero]",
+               "decide", "norm_num [Nat.Prime]"]),
     (r"Nat\.Prime", ["norm_num [Nat.Prime]", "decide"]),
+    # Type casts / coercions
+    (r"[↑↓]|Int\.ofNat|Nat\.cast|Int\.toNat", ["norm_cast", "push_cast", "simp"]),
+    (r"(?:ℤ|Int)\.", ["omega", "norm_num", "push_cast", "norm_cast"]),
+    (r"(?:ℚ|Rat)\.", ["field_simp", "ring", "norm_num", "push_cast"]),
+    (r"(?:ℝ|Real)\.", ["field_simp", "ring", "norm_num", "nlinarith", "positivity"]),
+    # Powers / exponentials
+    (r"\^", ["ring", "norm_num", "nlinarith", "simp [pow_succ]",
+             "simp [Nat.pow_succ]"]),
+    # Absolute value
+    (r"abs|‖", ["simp [abs_le]", "norm_num", "nlinarith"]),
     # Algebraic structures
     (r"Group\.|Ring\.|Field\.", ["group", "ring", "field_simp"]),
     # Summation / product
@@ -61,6 +81,10 @@ _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [
     (r"fun\s", ["ext", "funext", "simp"]),
     # Lists / arrays
     (r"List\.", ["simp [List.]", "induction", "cases"]),
+    # GCD / LCM
+    (r"gcd|lcm", ["omega", "norm_num", "simp [Nat.gcd]", "decide"]),
+    # Modular arithmetic
+    (r"Zmod|ZMod", ["simp", "decide", "norm_num"]),
 ]
 
 # Compiled patterns
@@ -120,6 +144,14 @@ def generate_candidates(
         _add("push_neg")
         _add("contrapose")
         _add("by_contra")
+        _add("norm_cast")
+        _add("push_cast")
+        _add("field_simp")
+
+    if depth < 5:
+        # Slightly deeper — try rewriting and simplification combos
+        _add("simp only [not_lt, not_le]")
+        _add("ring_nf")
 
     # 5. Induction variants (if goal mentions natural numbers or lists)
     if re.search(r"(?:Nat|ℕ|List|Fin)", primary_goal):
@@ -128,10 +160,19 @@ def generate_candidates(
         if var_match:
             var = var_match.group(1)
             _add(f"induction {var}")
+            _add(f"induction {var} with\n| zero => simp\n| succ n ih => simp_all")
             _add(f"cases {var}")
+            _add(f"cases {var} with\n| zero => simp\n| succ n => simp_all")
         else:
             _add("induction n")
             _add("cases n")
+
+    # 6. Hypothesis manipulation (if hypotheses exist in goal)
+    hyp_match = re.findall(r"([a-z_]\w*)\s*:", primary_goal)
+    if hyp_match and depth < 4:
+        for h in hyp_match[:3]:  # Limit to avoid combinatorial explosion
+            _add(f"simp at {h}")
+            _add(f"rw [{h}]")
 
     return candidates
 

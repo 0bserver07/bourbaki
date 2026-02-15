@@ -193,7 +193,8 @@ class ProofSearchTree:
         """Run best-first search to find a proof.
 
         Args:
-            budget: Maximum number of tactic attempts.
+            budget: Maximum number of node expansions (each expansion tries
+                    all candidate tactics for one proof state).
             timeout: Maximum time in seconds.
             use_mathlib: Whether to query mathlib_search for candidates.
 
@@ -255,7 +256,7 @@ class ProofSearchTree:
 
             # Expand the node
             children = await self.expand(node, candidates)
-            attempts += len(candidates)
+            attempts += 1
 
             # Add successful children to frontier
             for child in children:

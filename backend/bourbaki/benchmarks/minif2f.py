@@ -35,6 +35,14 @@ AUTOMATION_TACTICS = [
     "simp",
     "linarith",
     "decide",
+    "nlinarith",
+    "positivity",
+    "norm_cast",
+    "field_simp",
+    "polyrith",
+    "simp_all",
+    "push_cast",
+    "ring_nf",
 ]
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -360,6 +368,16 @@ async def attempt_proof_search(
                 proof_code=search_result.proof_code,
                 tactics_used=len(search_result.proof_tactics),
                 attempts=search_result.nodes_explored,
+                duration_seconds=time.monotonic() - start,
+            )
+        else:
+            search_attempts = search_result.nodes_explored
+            return ProblemResult(
+                problem_id=problem.id,
+                source=problem.source,
+                solved=False,
+                error=f"Automation + search failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
+                attempts=auto_result.attempts + search_attempts,
                 duration_seconds=time.monotonic() - start,
             )
     except (asyncio.TimeoutError, Exception) as e:
