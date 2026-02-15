@@ -1,8 +1,14 @@
 """Lean 4 REPL session manager for tactic-by-tactic interaction.
 
 Uses lean4-repl (https://github.com/leanprover-community/repl) for a
-persistent subprocess that keeps Mathlib loaded, eliminating 20-30s
+persistent subprocess that keeps Mathlib loaded, eliminating ~90s
 import cost per call and enabling incremental proof construction.
+
+Protocol notes (from lean4-repl README):
+- Commands are JSON objects separated by BLANK LINES (\\n\\n)
+- Responses are multi-line JSON separated by blank lines
+- Must run via ``lake env <repl-binary>`` for proper Lean environment
+- Imports can only be used without an ``env`` field
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -26,20 +33,27 @@ _active_session: LeanREPLSession | None = None
 
 
 class LeanREPLSession:
-    """Manages a persistent lean4-repl subprocess."""
+    """Manages a persistent lean4-repl subprocess.
 
-    def __init__(self) -> None:
+    The REPL must be started via ``lake env <repl>`` so that the Lake
+    project environment (and pre-built Mathlib oleans) are available.
+    Commands are separated by blank lines; responses are multi-line JSON
+    also separated by blank lines.
+    """
+
+    def __init__(self, import_full_mathlib: bool = False) -> None:
         self.proc: asyncio.subprocess.Process | None = None
         self.env_id: int = 0  # Current environment ID for chaining commands
         self._initialized: bool = False
         self._lock = asyncio.Lock()
+        self._import_full_mathlib = import_full_mathlib
 
     @property
     def is_running(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
 
     async def start(self) -> None:
-        """Start the lean4-repl subprocess."""
+        """Start the lean4-repl subprocess via ``lake env``."""
         if self.is_running:
             return
 
@@ -49,16 +63,21 @@ class LeanREPLSession:
                 "lean4-repl not found. Run scripts/setup-lean.sh to build it."
             )
 
+        lake_bin = shutil.which("lake")
+        if lake_bin is None:
+            raise RuntimeError("lake not found in PATH")
+
+        # Must run via `lake env` so Lean can resolve Mathlib imports
         self.proc = await asyncio.create_subprocess_exec(
-            str(repl_path),
+            lake_bin, "env", str(repl_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             cwd=str(LEAN_PROJECT_DIR),
         )
         self.env_id = 0
         self._initialized = False
-        logger.info("Started lean4-repl (pid=%s)", self.proc.pid)
+        logger.info("Started lean4-repl via lake env (pid=%s)", self.proc.pid)
 
     async def stop(self) -> None:
         """Stop the REPL subprocess."""
@@ -74,32 +93,69 @@ class LeanREPLSession:
             self.env_id = 0
 
     async def ensure_initialized(self) -> None:
-        """Import Mathlib.Tactic on first use (pays cost once)."""
+        """Import Mathlib on first use (pays cost once, ~16-37s)."""
         if self._initialized:
             return
         async with self._lock:
             if self._initialized:
                 return
-            result = await self.send_cmd("import Mathlib.Tactic")
+            import_cmd = "import Mathlib" if self._import_full_mathlib else "import Mathlib.Tactic"
+            result = await self.send_cmd(import_cmd, env=None, timeout=300)
             if result.get("env") is not None:
                 self.env_id = result["env"]
                 self._initialized = True
-                logger.info("Mathlib.Tactic loaded in REPL (env=%d)", self.env_id)
+                logger.info("%s loaded in REPL (env=%d)", import_cmd, self.env_id)
             else:
-                logger.warning("Failed to load Mathlib.Tactic: %s", result)
+                logger.warning("Failed to load %s: %s", import_cmd, result)
 
-    async def send_cmd(self, cmd: str, env: int | None = None) -> dict[str, Any]:
+    async def _read_response(self, timeout: float = 120) -> dict[str, Any]:
+        """Read a multi-line JSON response from the REPL.
+
+        The lean4-repl outputs pretty-printed JSON separated by blank lines.
+        We read lines until we hit a blank line after accumulating content,
+        then parse the concatenated result.
+        """
+        assert self.proc is not None
+        assert self.proc.stdout is not None
+
+        lines: list[str] = []
+
+        async def _read_until_blank() -> None:
+            while True:
+                raw = await self.proc.stdout.readline()  # type: ignore[union-attr]
+                if not raw:
+                    # EOF — process may have crashed
+                    if not lines:
+                        lines.append('{"error": "REPL process ended unexpectedly"}')
+                    return
+                text = raw.decode()
+                if text.strip() == "":
+                    if lines:
+                        return  # End of this response
+                    continue  # Skip leading blank lines
+                lines.append(text)
+
+        await asyncio.wait_for(_read_until_blank(), timeout=timeout)
+
+        joined = "".join(lines)
+        try:
+            return json.loads(joined)
+        except json.JSONDecodeError:
+            return {"error": f"Invalid JSON from REPL: {joined[:300]}"}
+
+    async def send_cmd(
+        self, cmd: str, env: int | None = None, timeout: float = 120,
+    ) -> dict[str, Any]:
         """Send a command to the REPL and return the parsed JSON response.
 
-        The lean4-repl protocol: send a JSON object per line, read a JSON response.
-        Command format: {"cmd": "...", "env": N}
+        Commands are JSON objects followed by a blank line (the REPL protocol
+        uses blank lines as delimiters between commands/responses).
         """
         if not self.is_running:
             await self.start()
 
         assert self.proc is not None
         assert self.proc.stdin is not None
-        assert self.proc.stdout is not None
 
         request: dict[str, Any] = {"cmd": cmd}
         if env is not None:
@@ -107,23 +163,16 @@ class LeanREPLSession:
         elif self._initialized:
             request["env"] = self.env_id
 
-        line = json.dumps(request) + "\n"
-        self.proc.stdin.write(line.encode())
+        # Protocol: JSON + blank line separator
+        payload = json.dumps(request) + "\n\n"
+        self.proc.stdin.write(payload.encode())
         await self.proc.stdin.drain()
 
-        # Read response — lean4-repl outputs one JSON object per line
-        response_line = await asyncio.wait_for(
-            self.proc.stdout.readline(), timeout=120,
-        )
-        if not response_line:
-            return {"error": "REPL returned empty response (process may have crashed)"}
+        return await self._read_response(timeout=timeout)
 
-        try:
-            return json.loads(response_line.decode())
-        except json.JSONDecodeError:
-            return {"error": f"Invalid JSON from REPL: {response_line.decode()[:200]}"}
-
-    async def send_tactic(self, tactic: str, proof_state: int) -> dict[str, Any]:
+    async def send_tactic(
+        self, tactic: str, proof_state: int, timeout: float = 60,
+    ) -> dict[str, Any]:
         """Send a tactic to apply to a given proof state.
 
         Tactic format: {"tactic": "...", "proofState": N}
@@ -134,23 +183,13 @@ class LeanREPLSession:
 
         assert self.proc is not None
         assert self.proc.stdin is not None
-        assert self.proc.stdout is not None
 
         request = {"tactic": tactic, "proofState": proof_state}
-        line = json.dumps(request) + "\n"
-        self.proc.stdin.write(line.encode())
+        payload = json.dumps(request) + "\n\n"
+        self.proc.stdin.write(payload.encode())
         await self.proc.stdin.drain()
 
-        response_line = await asyncio.wait_for(
-            self.proc.stdout.readline(), timeout=60,
-        )
-        if not response_line:
-            return {"error": "REPL returned empty response"}
-
-        try:
-            return json.loads(response_line.decode())
-        except json.JSONDecodeError:
-            return {"error": f"Invalid JSON from REPL: {response_line.decode()[:200]}"}
+        return await self._read_response(timeout=timeout)
 
 
 def _find_repl_binary() -> Path | None:
@@ -167,11 +206,17 @@ def _find_repl_binary() -> Path | None:
     return None
 
 
-async def get_session() -> LeanREPLSession:
-    """Get or create the singleton REPL session."""
+async def get_session(full_mathlib: bool = False) -> LeanREPLSession:
+    """Get or create the singleton REPL session.
+
+    Args:
+        full_mathlib: If True, import full Mathlib (slower init, needed for
+                      problems using Mathlib types). Default imports only
+                      Mathlib.Tactic (faster, sufficient for most proofs).
+    """
     global _active_session
     if _active_session is None or not _active_session.is_running:
-        _active_session = LeanREPLSession()
+        _active_session = LeanREPLSession(import_full_mathlib=full_mathlib)
         await _active_session.start()
         await _active_session.ensure_initialized()
     return _active_session
@@ -270,13 +315,19 @@ async def lean_tactic(
 
             goals = result.get("goals", [])
             new_ps = result.get("proofState")
-            proof_complete = isinstance(goals, list) and len(goals) == 0 and "error" not in result
+            # lean4-repl signals completion via proofStatus or empty goals
+            proof_complete = (
+                result.get("proofStatus") == "Completed"
+                or (isinstance(goals, list) and len(goals) == 0
+                    and "error" not in result and "message" not in result)
+            )
 
-            if "error" in result:
+            if "error" in result or ("message" in result and not proof_complete):
+                error_msg = result.get("error") or result.get("message", "Unknown error")
                 elapsed = int((time.monotonic() - start) * 1000)
                 return {
                     "success": False,
-                    "error": result["error"],
+                    "error": error_msg,
                     "goals": goals if goals else None,
                     "proofState": proof_state,  # Keep the old state for retry
                     "proofComplete": False,

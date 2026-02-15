@@ -22,8 +22,19 @@ from bourbaki.benchmarks.loader import (
     load_minif2f_problems,
 )
 from bourbaki.tools.lean_prover import lean_prover
+from bourbaki.tools.lean_repl import LeanREPLSession, stop_session
 
 logger = logging.getLogger(__name__)
+
+# Default automation tactics (ordered by likelihood of solving miniF2F problems)
+AUTOMATION_TACTICS = [
+    "norm_num",
+    "omega",
+    "ring",
+    "simp",
+    "linarith",
+    "decide",
+]
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 RESULTS_DIR = _PROJECT_ROOT / ".bourbaki" / "benchmarks" / "results"
@@ -127,19 +138,10 @@ async def attempt_proof(
                 duration_seconds=time.monotonic() - start,
             )
 
-    # Default: try common automation tactics (ordered by likelihood, kept short
-    # since each attempt with `import Mathlib` takes ~90s of compilation)
-    automation_tactics = [
-        "norm_num",
-        "omega",
-        "ring",
-        "simp",
-        "linarith",
-        "decide",
-    ]
-
+    # Default: try common automation tactics via lean_prover (slow path,
+    # ~90s per attempt due to Mathlib import; prefer attempt_proof_repl)
     attempts = 0
-    for tactic in automation_tactics:
+    for tactic in AUTOMATION_TACTICS:
         attempts += 1
         # Build proof attempt: replace sorry with the tactic
         proof_code = problem.full_lean_code.replace("sorry", tactic)
@@ -176,6 +178,116 @@ async def attempt_proof(
 ProveFunction = Any  # Callable[[MiniF2FProblem], Awaitable[ProblemResult]]
 
 
+async def attempt_proof_repl(
+    problem: MiniF2FProblem,
+    session: LeanREPLSession,
+    tactics: list[str] | None = None,
+    timeout: int = 60,
+) -> ProblemResult:
+    """Attempt to prove a problem using the REPL (fast path).
+
+    Uses a pre-initialized REPL session with Mathlib loaded, so each tactic
+    attempt takes ~0.01-0.1s instead of ~90s.
+
+    Args:
+        problem: The miniF2F problem to attempt.
+        session: Pre-initialized LeanREPLSession with Mathlib loaded.
+        tactics: List of tactics to try. Defaults to AUTOMATION_TACTICS.
+        timeout: Timeout in seconds for the entire problem.
+
+    Returns:
+        ProblemResult with success/failure details.
+    """
+    start = time.monotonic()
+    tactics = tactics or AUTOMATION_TACTICS
+
+    # Build the problem command: preamble (without imports) + theorem + sorry
+    # The REPL session already has Mathlib imported, so we skip import lines
+    preamble_lines = []
+    for line in problem.full_lean_code.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("import"):
+            continue  # Already imported in session
+        if stripped.startswith("set_option") or stripped.startswith("open"):
+            preamble_lines.append(stripped)
+        elif stripped.startswith("theorem") or stripped.startswith("lemma"):
+            break
+
+    preamble = "\n".join(preamble_lines) if preamble_lines else ""
+    cmd = f"{preamble}\n{problem.statement} := by sorry" if preamble else f"{problem.statement} := by sorry"
+
+    try:
+        # Send theorem to get proof state (uses base Mathlib env)
+        result = await asyncio.wait_for(
+            session.send_cmd(cmd, env=session.env_id),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return ProblemResult(
+            problem_id=problem.id,
+            source=problem.source,
+            solved=False,
+            error="Timeout setting up proof state",
+            duration_seconds=time.monotonic() - start,
+        )
+
+    sorries = result.get("sorries", [])
+    if not sorries:
+        # Check for errors in the response
+        messages = result.get("messages", [])
+        error_msgs = [m.get("data", "") for m in messages if m.get("severity") == "error"]
+        return ProblemResult(
+            problem_id=problem.id,
+            source=problem.source,
+            solved=False,
+            error=f"No proof state: {'; '.join(error_msgs) if error_msgs else 'unknown'}",
+            duration_seconds=time.monotonic() - start,
+        )
+
+    ps = sorries[0]
+    ps_id = ps.get("proofState", 0) if isinstance(ps, dict) else 0
+
+    # Try each tactic against the proof state
+    attempts = 0
+    for tactic in tactics:
+        attempts += 1
+        try:
+            tactic_result = await asyncio.wait_for(
+                session.send_tactic(tactic, ps_id),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            continue
+
+        goals = tactic_result.get("goals", [])
+        proof_complete = (
+            tactic_result.get("proofStatus") == "Completed"
+            or (isinstance(goals, list) and len(goals) == 0
+                and "error" not in tactic_result
+                and "message" not in tactic_result)
+        )
+
+        if proof_complete:
+            return ProblemResult(
+                problem_id=problem.id,
+                source=problem.source,
+                solved=True,
+                proof_code=f"{problem.statement} := by {tactic}",
+                tactics_used=1,
+                attempts=attempts,
+                duration_seconds=time.monotonic() - start,
+            )
+
+    return ProblemResult(
+        problem_id=problem.id,
+        source=problem.source,
+        solved=False,
+        error="All automation tactics failed",
+        attempts=attempts,
+        duration_seconds=time.monotonic() - start,
+    )
+
+
 async def run_minif2f(
     split: str = "valid",
     source_filter: str | None = None,
@@ -184,6 +296,7 @@ async def run_minif2f(
     timeout: int = 300,
     concurrency: int = 1,
     minif2f_dir: Path | None = None,
+    use_repl: bool = True,
 ) -> BenchmarkResult:
     """Run Bourbaki on miniF2F problems and report pass rate.
 
@@ -195,6 +308,8 @@ async def run_minif2f(
         timeout: Timeout per problem in seconds.
         concurrency: Number of parallel proof attempts.
         minif2f_dir: Path to miniF2F-lean4 checkout.
+        use_repl: Use REPL for automation tactics (default True, ~40x faster).
+                  Falls back to lean_prover if REPL not available.
 
     Returns:
         BenchmarkResult with aggregate and per-problem results.
@@ -218,26 +333,65 @@ async def run_minif2f(
     overall_start = time.monotonic()
     results: list[ProblemResult] = []
 
-    if concurrency <= 1:
-        # Sequential execution
-        for i, problem in enumerate(problems):
-            logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
-            result = await attempt_proof(problem, prove_fn, timeout)
-            results.append(result)
-            status = "SOLVED" if result.solved else "FAILED"
-            logger.info("  %s (%.1fs)", status, result.duration_seconds)
-    else:
-        # Parallel execution with semaphore
-        sem = asyncio.Semaphore(concurrency)
+    # Set up REPL session if requested (one-time Mathlib import)
+    repl_session: LeanREPLSession | None = None
+    if use_repl and prove_fn is None:
+        try:
+            repl_session = LeanREPLSession(import_full_mathlib=True)
+            await repl_session.start()
+            logger.info("Initializing REPL with full Mathlib import...")
+            await repl_session.ensure_initialized()
+            if not repl_session._initialized:
+                logger.warning("REPL init failed, falling back to lean_prover")
+                repl_session = None
+        except Exception as e:
+            logger.warning("REPL not available (%s), using lean_prover", e)
+            repl_session = None
 
-        async def bounded_attempt(p: MiniF2FProblem) -> ProblemResult:
-            async with sem:
-                return await attempt_proof(p, prove_fn, timeout)
+    try:
+        if concurrency <= 1:
+            # Sequential execution
+            for i, problem in enumerate(problems):
+                logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
+                if repl_session is not None:
+                    result = await attempt_proof_repl(
+                        problem, repl_session, timeout=timeout,
+                    )
+                else:
+                    result = await attempt_proof(problem, prove_fn, timeout)
+                results.append(result)
+                status = "SOLVED" if result.solved else "FAILED"
+                logger.info("  %s (%.2fs)", status, result.duration_seconds)
+        else:
+            # Parallel execution with semaphore
+            # Note: REPL is sequential (single process), so parallel only
+            # works with lean_prover or custom prove_fn
+            if repl_session is not None:
+                logger.warning(
+                    "REPL is sequential; ignoring concurrency=%d", concurrency,
+                )
+                for i, problem in enumerate(problems):
+                    logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
+                    result = await attempt_proof_repl(
+                        problem, repl_session, timeout=timeout,
+                    )
+                    results.append(result)
+                    status = "SOLVED" if result.solved else "FAILED"
+                    logger.info("  %s (%.2fs)", status, result.duration_seconds)
+            else:
+                sem = asyncio.Semaphore(concurrency)
 
-        results = await asyncio.gather(
-            *(bounded_attempt(p) for p in problems)
-        )
-        results = list(results)
+                async def bounded_attempt(p: MiniF2FProblem) -> ProblemResult:
+                    async with sem:
+                        return await attempt_proof(p, prove_fn, timeout)
+
+                results = await asyncio.gather(
+                    *(bounded_attempt(p) for p in problems)
+                )
+                results = list(results)
+    finally:
+        if repl_session is not None:
+            await repl_session.stop()
 
     # Compute aggregate stats
     total_time = time.monotonic() - overall_start
@@ -268,6 +422,7 @@ async def run_minif2f(
             "source_filter": source_filter,
             "timeout": timeout,
             "concurrency": concurrency,
+            "use_repl": repl_session is not None,
             "prove_fn": prove_fn.__name__ if prove_fn and hasattr(prove_fn, "__name__") else "default",
         },
         timestamp=datetime.now(timezone.utc).isoformat(),
