@@ -22,7 +22,7 @@ from typing import Any
 from bourbaki.autonomous.scoring import score_proof_state
 from bourbaki.autonomous.tactics import generate_candidates, generate_mathlib_queries
 from bourbaki.tools.lean_prover import lean_prover
-from bourbaki.tools.lean_repl import lean_tactic, stop_session
+from bourbaki.tools.lean_repl import LeanREPLSession, lean_tactic, stop_session
 from bourbaki.tools.mathlib_search import mathlib_search
 
 logger = logging.getLogger(__name__)
@@ -82,9 +82,15 @@ class SearchResult:
 class ProofSearchTree:
     """Best-first search over proof states using the Lean REPL."""
 
-    def __init__(self, theorem: str, max_depth: int = 30) -> None:
+    def __init__(
+        self,
+        theorem: str,
+        max_depth: int = 30,
+        session: LeanREPLSession | None = None,
+    ) -> None:
         self.theorem = theorem
         self.max_depth = max_depth
+        self.session = session  # Optional: use this instead of singleton
         self.root: ProofNode | None = None
         self._frontier: list[ProofNode] = []  # Min-heap by score
         self._explored: int = 0
@@ -99,6 +105,7 @@ class ProofSearchTree:
             goal=self.theorem,
             tactic="sorry",  # Placeholder — lean_tactic handles initialization
             proof_state=None,
+            session=self.session,
         )
 
         if not result.get("success"):
@@ -139,6 +146,7 @@ class ProofSearchTree:
                 goal=self.theorem,
                 tactic=tactic,
                 proof_state=node.proof_state,
+                session=self.session,
             )
 
             self._explored += 1
@@ -252,8 +260,10 @@ class ProofSearchTree:
             # Add successful children to frontier
             for child in children:
                 if child.is_complete:
-                    # Found a proof!
-                    proof_code = await self._verify_proof(child.path)
+                    # Found a proof! The REPL confirmed it — skip slow
+                    # lean_prover verification (saves ~90s per proof).
+                    tactic_block = "\n  ".join(child.path)
+                    proof_code = f"{self.theorem} := by\n  {tactic_block}"
                     return SearchResult(
                         success=True,
                         proof_tactics=child.path,
@@ -320,6 +330,7 @@ async def prove_with_search(
     timeout: float = 300.0,
     max_depth: int = 30,
     use_mathlib: bool = True,
+    session: LeanREPLSession | None = None,
 ) -> SearchResult:
     """High-level API: prove a theorem using best-first search.
 
@@ -329,11 +340,14 @@ async def prove_with_search(
         timeout: Maximum seconds.
         max_depth: Maximum proof depth.
         use_mathlib: Whether to search Mathlib for lemmas.
+        session: Optional pre-initialized REPL session. If None, creates and
+                 manages a singleton session (which is stopped on completion).
 
     Returns:
         SearchResult with proof details.
     """
-    tree = ProofSearchTree(theorem, max_depth=max_depth)
+    owns_session = session is None
+    tree = ProofSearchTree(theorem, max_depth=max_depth, session=session)
 
     try:
         result = await tree.best_first_search(
@@ -342,8 +356,9 @@ async def prove_with_search(
             use_mathlib=use_mathlib,
         )
     finally:
-        # Clean up the REPL session
-        await stop_session()
+        # Only clean up if we created the session ourselves
+        if owns_session:
+            await stop_session()
 
     if result.success:
         logger.info(

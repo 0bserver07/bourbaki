@@ -21,6 +21,7 @@ from bourbaki.benchmarks.loader import (
     get_problem_stats,
     load_minif2f_problems,
 )
+from bourbaki.autonomous.search_tree import prove_with_search
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession, stop_session
 
@@ -288,6 +289,92 @@ async def attempt_proof_repl(
     )
 
 
+async def attempt_proof_search(
+    problem: MiniF2FProblem,
+    session: LeanREPLSession,
+    budget: int = 64,
+    timeout: int = 60,
+    use_mathlib: bool = False,
+) -> ProblemResult:
+    """Attempt to prove a problem using best-first search tree.
+
+    First tries automation tactics via REPL (fast). If those fail, runs a
+    best-first search over tactic sequences.
+
+    Args:
+        problem: The miniF2F problem to attempt.
+        session: Pre-initialized LeanREPLSession with Mathlib loaded.
+        budget: Max tactic attempts for the search tree.
+        timeout: Timeout in seconds for the entire problem.
+        use_mathlib: Whether to query Mathlib search during tree expansion.
+
+    Returns:
+        ProblemResult with success/failure details.
+    """
+    start = time.monotonic()
+
+    # Phase 1: Try automation tactics first (instant)
+    auto_result = await attempt_proof_repl(
+        problem, session, timeout=min(timeout, 30),
+    )
+    if auto_result.solved:
+        return auto_result
+
+    # Phase 2: Best-first search tree
+    # Build the theorem statement for the search tree
+    preamble_lines = []
+    for line in problem.full_lean_code.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("import"):
+            continue
+        if stripped.startswith("set_option") or stripped.startswith("open"):
+            preamble_lines.append(stripped)
+        elif stripped.startswith("theorem") or stripped.startswith("lemma"):
+            break
+
+    preamble = "\n".join(preamble_lines) if preamble_lines else ""
+    theorem = f"{preamble}\n{problem.statement}" if preamble else problem.statement
+
+    remaining_time = timeout - (time.monotonic() - start)
+    if remaining_time <= 5:
+        return auto_result  # Not enough time for search
+
+    try:
+        search_result = await asyncio.wait_for(
+            prove_with_search(
+                theorem=theorem,
+                budget=budget,
+                timeout=remaining_time,
+                max_depth=15,
+                use_mathlib=use_mathlib,
+                session=session,
+            ),
+            timeout=remaining_time + 5,
+        )
+
+        if search_result.success:
+            return ProblemResult(
+                problem_id=problem.id,
+                source=problem.source,
+                solved=True,
+                proof_code=search_result.proof_code,
+                tactics_used=len(search_result.proof_tactics),
+                attempts=search_result.nodes_explored,
+                duration_seconds=time.monotonic() - start,
+            )
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.debug("Search tree failed for %s: %s", problem.id, e)
+
+    return ProblemResult(
+        problem_id=problem.id,
+        source=problem.source,
+        solved=False,
+        error=f"Automation + search failed ({auto_result.attempts} auto + search)",
+        attempts=auto_result.attempts,
+        duration_seconds=time.monotonic() - start,
+    )
+
+
 async def run_minif2f(
     split: str = "valid",
     source_filter: str | None = None,
@@ -297,6 +384,9 @@ async def run_minif2f(
     concurrency: int = 1,
     minif2f_dir: Path | None = None,
     use_repl: bool = True,
+    use_search: bool = False,
+    search_budget: int = 64,
+    use_mathlib_search: bool = False,
 ) -> BenchmarkResult:
     """Run Bourbaki on miniF2F problems and report pass rate.
 
@@ -310,6 +400,9 @@ async def run_minif2f(
         minif2f_dir: Path to miniF2F-lean4 checkout.
         use_repl: Use REPL for automation tactics (default True, ~40x faster).
                   Falls back to lean_prover if REPL not available.
+        use_search: Use best-first search tree after automation fails.
+        search_budget: Max tactic attempts per problem for search tree.
+        use_mathlib_search: Query Mathlib APIs during search tree expansion.
 
     Returns:
         BenchmarkResult with aggregate and per-problem results.
@@ -353,7 +446,14 @@ async def run_minif2f(
             # Sequential execution
             for i, problem in enumerate(problems):
                 logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
-                if repl_session is not None:
+                if repl_session is not None and use_search:
+                    result = await attempt_proof_search(
+                        problem, repl_session,
+                        budget=search_budget,
+                        timeout=timeout,
+                        use_mathlib=use_mathlib_search,
+                    )
+                elif repl_session is not None:
                     result = await attempt_proof_repl(
                         problem, repl_session, timeout=timeout,
                     )
@@ -372,9 +472,17 @@ async def run_minif2f(
                 )
                 for i, problem in enumerate(problems):
                     logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
-                    result = await attempt_proof_repl(
-                        problem, repl_session, timeout=timeout,
-                    )
+                    if use_search:
+                        result = await attempt_proof_search(
+                            problem, repl_session,
+                            budget=search_budget,
+                            timeout=timeout,
+                            use_mathlib=use_mathlib_search,
+                        )
+                    else:
+                        result = await attempt_proof_repl(
+                            problem, repl_session, timeout=timeout,
+                        )
                     results.append(result)
                     status = "SOLVED" if result.solved else "FAILED"
                     logger.info("  %s (%.2fs)", status, result.duration_seconds)
@@ -423,6 +531,9 @@ async def run_minif2f(
             "timeout": timeout,
             "concurrency": concurrency,
             "use_repl": repl_session is not None,
+            "use_search": use_search,
+            "search_budget": search_budget if use_search else None,
+            "use_mathlib_search": use_mathlib_search if use_search else None,
             "prove_fn": prove_fn.__name__ if prove_fn and hasattr(prove_fn, "__name__") else "default",
         },
         timestamp=datetime.now(timezone.utc).isoformat(),

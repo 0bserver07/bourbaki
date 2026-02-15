@@ -234,6 +234,7 @@ async def lean_tactic(
     goal: str,
     tactic: str,
     proof_state: int | None = None,
+    session: LeanREPLSession | None = None,
 ) -> dict[str, Any]:
     """Apply a single Lean 4 tactic to a proof state.
 
@@ -243,6 +244,8 @@ async def lean_tactic(
         tactic: The tactic to apply (e.g. "ring", "intro n", "induction n").
         proof_state: Proof state ID from a previous lean_tactic call. If None,
                      initializes a new proof from the goal statement.
+        session: Optional pre-initialized REPL session. If None, uses the
+                 singleton session.
 
     Returns:
         Dict with success, goals, proofState, proofComplete, duration fields.
@@ -250,7 +253,7 @@ async def lean_tactic(
     start = time.monotonic()
 
     repl_available = _find_repl_binary() is not None
-    if not repl_available:
+    if not repl_available and session is None:
         return {
             "success": False,
             "error": "lean4-repl not found. Run scripts/setup-lean.sh to build it. "
@@ -259,7 +262,8 @@ async def lean_tactic(
         }
 
     try:
-        session = await get_session()
+        if session is None:
+            session = await get_session()
 
         if proof_state is None:
             # Initialize: send the goal statement with `sorry` to get the proof state
@@ -274,8 +278,19 @@ async def lean_tactic(
             sorries = result.get("sorries", [])
             if sorries:
                 ps = sorries[0]
-                goals = ps.get("goals", []) if isinstance(ps, dict) else []
-                ps_id = ps.get("proofState", 0) if isinstance(ps, dict) else 0
+                # lean4-repl uses "goal" (singular string) in sorry responses,
+                # but "goals" (list) in tactic responses
+                if isinstance(ps, dict):
+                    if "goals" in ps:
+                        goals = ps["goals"]
+                    elif "goal" in ps:
+                        goals = [ps["goal"]] if ps["goal"] else []
+                    else:
+                        goals = []
+                    ps_id = ps.get("proofState", 0)
+                else:
+                    goals = []
+                    ps_id = 0
 
                 elapsed = int((time.monotonic() - start) * 1000)
                 return {
