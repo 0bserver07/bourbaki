@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from bourbaki.autonomous.scoring import score_proof_state
+from bourbaki.autonomous.scoring import NoveltyTracker, score_proof_state
 from bourbaki.autonomous.tactics import generate_candidates, generate_mathlib_queries
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession, lean_tactic, stop_session
@@ -110,7 +110,7 @@ class ProofSearchTree:
         self.root: ProofNode | None = None
         self._frontier: list[ProofNode] = []  # Min-heap by score
         self._explored: int = 0
-        self._seen_goals: set[str] = set()  # For state deduplication
+        self._novelty_tracker = NoveltyTracker()  # For state deduplication + novelty bonus
 
     async def initialize(self) -> ProofNode | None:
         """Initialize the search tree by stating the theorem with sorry.
@@ -132,11 +132,8 @@ class ProofSearchTree:
             proof_state=result.get("proofState", 0),
             goals=result.get("goals", []),
             tactic_history=[],
-            score=score_proof_state(result.get("goals", []), 0),
+            score=score_proof_state(result.get("goals", []), 0, self._novelty_tracker),
         )
-
-        # Add root's goals to seen set
-        self._goal_key(self.root.goals)
 
         heapq.heappush(self._frontier, self.root)
         return self.root
@@ -175,17 +172,15 @@ class ProofSearchTree:
             new_ps = result.get("proofState", node.proof_state)
 
             # State deduplication: skip if we've seen this exact goal set
-            goal_key = self._goal_key(new_goals)
-            if goal_key in self._seen_goals and new_goals:
+            if self._novelty_tracker.has_seen(new_goals) and new_goals:
                 continue
-            self._seen_goals.add(goal_key)
 
             child = ProofNode(
                 proof_state=new_ps,
                 goals=new_goals,
                 tactic_history=node.tactic_history + [tactic],
                 parent=node,
-                score=score_proof_state(new_goals, node.depth + 1),
+                score=score_proof_state(new_goals, node.depth + 1, self._novelty_tracker),
                 depth=node.depth + 1,
                 tactic=tactic,
             )
@@ -330,16 +325,12 @@ class ProofSearchTree:
         logger.warning("REPL proof did not verify: %s", result.get("errors"))
         return proof_code  # Return anyway — it may be close
 
-    def _goal_key(self, goals: list[str]) -> str:
-        """Create a hashable key from a goal set for deduplication."""
-        return "|".join(sorted(goals))
-
     def get_stats(self) -> dict[str, Any]:
         """Get search tree statistics."""
         return {
             "nodes_explored": self._explored,
             "frontier_size": len(self._frontier),
-            "seen_states": len(self._seen_goals),
+            "seen_states": self._novelty_tracker.seen_count,
         }
 
 
