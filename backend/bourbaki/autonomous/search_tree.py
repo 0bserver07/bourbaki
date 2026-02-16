@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -77,6 +78,21 @@ class SearchResult:
             "total_time": round(self.total_time, 2),
             "error": self.error,
         }
+
+
+def ucb_adjusted_score(node: ProofNode, exploration_constant: float = 1.0) -> float:
+    """Adjust node score with UCB exploration bonus.
+
+    Uses UCB1 formula: bonus = C * sqrt(ln(parent_visits) / (1 + node_visits)).
+    Lower score = more promising, so bonus is subtracted.
+    """
+    if node.parent is None or node.parent.visits == 0:
+        return node.score
+
+    bonus = exploration_constant * math.sqrt(
+        math.log(node.parent.visits) / (1 + node.visits)
+    )
+    return node.score - bonus
 
 
 class ProofSearchTree:
@@ -175,6 +191,7 @@ class ProofSearchTree:
             )
 
             node.children.append(child)
+            node.visits += 1
             children.append(child)
 
             # If proof is complete, don't add more children
@@ -273,6 +290,7 @@ class ProofSearchTree:
                         max_depth=child.depth,
                         total_time=time.monotonic() - start,
                     )
+                child.score = ucb_adjusted_score(child)
                 heapq.heappush(self._frontier, child)
 
         # Search exhausted
