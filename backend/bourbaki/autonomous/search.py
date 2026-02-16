@@ -45,6 +45,11 @@ class AutonomousSearchConfig:
         use_search_tree: bool = False,
         search_tree_budget: int = 100,
         search_tree_max_depth: int = 30,
+        # Phase 0: Recursive decomposition
+        use_decomposition: bool = True,
+        decomposition_max_depth: int = 2,
+        decomposition_max_sketches: int = 3,
+        decomposition_subgoal_budget: int = 50,
     ):
         self.max_iterations = max_iterations
         self.max_hours = max_hours
@@ -55,6 +60,10 @@ class AutonomousSearchConfig:
         self.use_search_tree = use_search_tree
         self.search_tree_budget = search_tree_budget
         self.search_tree_max_depth = search_tree_max_depth
+        self.use_decomposition = use_decomposition
+        self.decomposition_max_depth = decomposition_max_depth
+        self.decomposition_max_sketches = decomposition_max_sketches
+        self.decomposition_subgoal_budget = decomposition_subgoal_budget
 
 
 class AutonomousSearch:
@@ -238,6 +247,68 @@ class AutonomousSearch:
         If use_search_tree is enabled, first attempts best-first tactic search
         via the Lean REPL before falling back to strategy rotation.
         """
+        # Phase 0: Recursive subgoal decomposition
+        if (
+            self._config.use_decomposition
+            and self._problem
+            and self._problem.get("lean_statement")
+        ):
+            from bourbaki.autonomous.decomposer import (
+                DecompositionConfig,
+                decompose_and_prove,
+            )
+
+            self._emit({
+                "type": "strategy_attempt",
+                "strategy": "recursive-decomposition",
+                "approach": "HILBERT-style recursive subgoal decomposition",
+            })
+
+            decomp_config = DecompositionConfig(
+                max_recursion_depth=self._config.decomposition_max_depth,
+                max_sketches=self._config.decomposition_max_sketches,
+                subgoal_search_budget=self._config.decomposition_subgoal_budget,
+                model=settings.default_model,
+            )
+
+            decomp_result = await decompose_and_prove(
+                theorem=self._problem["lean_statement"],
+                config=decomp_config,
+            )
+
+            self._iteration += 1
+
+            if decomp_result.success and decomp_result.proof_code:
+                self._proof_state = {
+                    "complete": True,
+                    "proof_code": decomp_result.proof_code,
+                }
+                self._insights.append(
+                    f"Decomposition found proof: {decomp_result.subgoals_solved} subgoals, "
+                    f"{decomp_result.sketches_tried} sketches tried, "
+                    f"depth={decomp_result.recursion_depth_reached}"
+                )
+                self._emit({
+                    "type": "completed",
+                    "success": True,
+                    "result": decomp_result.proof_code,
+                })
+                self._status = "completed"
+                return
+            else:
+                insight = (
+                    f"Decomposition partial: {decomp_result.subgoals_solved}/{decomp_result.subgoals_total} "
+                    f"subgoals solved ({decomp_result.sketches_tried} sketches tried)"
+                )
+                self._insights.append(insight)
+                self._emit({
+                    "type": "strategy_result",
+                    "strategy": "recursive-decomposition",
+                    "success": False,
+                    "insight": insight,
+                    "partial_progress": decomp_result.to_dict(),
+                })
+
         # Phase 1: Try best-first proof search tree (if enabled and problem has Lean statement)
         if (
             self._config.use_search_tree
