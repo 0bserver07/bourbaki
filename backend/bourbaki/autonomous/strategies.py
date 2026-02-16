@@ -31,6 +31,7 @@ class StrategyResult:
     insight: str | None = None
     proof_code: str | None = None
     time_spent: int = 0  # milliseconds
+    verified: bool = False  # Whether proof_code was verified against Lean
 
 
 @dataclass

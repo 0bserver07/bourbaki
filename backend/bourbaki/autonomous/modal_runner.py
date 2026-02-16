@@ -72,18 +72,19 @@ def _parse_strategy_response(
     elapsed_ms: int,
 ) -> StrategyResult:
     """Parse LLM response into a StrategyResult."""
-    success = "**SUCCESS:** true" in text.lower() or "**success:** true" in text
+    success = "**success:** true" in text.lower()
     insight = None
     partial_progress = None
     proof_code = None
 
-    # Extract insight
+    # Extract insight and partial progress
     for line in text.split("\n"):
-        lower = line.strip().lower()
+        stripped = line.strip()
+        lower = stripped.lower()
         if lower.startswith("**insight:**"):
-            insight = line.split(":", 1)[1].strip() if ":" in line else None
+            insight = stripped[len("**INSIGHT:**"):].strip() or None
         elif lower.startswith("**partial_progress:**"):
-            partial_progress = line.split(":", 1)[1].strip() if ":" in line else None
+            partial_progress = stripped[len("**PARTIAL_PROGRESS:**"):].strip() or None
 
     # Extract Lean code block
     if "```lean" in text:
@@ -122,7 +123,26 @@ async def execute_strategy_local(
         agent: Agent[None, str] = Agent(model, system_prompt=PROOF_SYSTEM_PROMPT)
         result = await agent.run(prompt)
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        return _parse_strategy_response(result.output, strategy["id"], elapsed_ms)
+        parsed = _parse_strategy_response(result.output, strategy["id"], elapsed_ms)
+
+        # Verify generated code against Lean if the LLM claims success
+        if parsed.success and parsed.proof_code:
+            try:
+                from bourbaki.tools.lean_prover import lean_prover
+                verification = await lean_prover(code=parsed.proof_code, mode="check")
+                if verification.get("proofComplete"):
+                    parsed.verified = True
+                else:
+                    parsed.success = False
+                    parsed.error = (
+                        "LLM claimed success but Lean verification failed: "
+                        + str(verification.get("errors", "unknown error"))
+                    )
+            except Exception as e:
+                parsed.error = f"Verification error: {e}"
+                parsed.success = False
+
+        return parsed
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         return StrategyResult(
