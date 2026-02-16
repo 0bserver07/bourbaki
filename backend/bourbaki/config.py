@@ -50,9 +50,9 @@ class Settings(BaseSettings):
     # Per-tool call limit overrides (tool_name → limit)
     # Lean proof search is iterative — the model needs more attempts to refine proofs
     tool_call_limits: dict[str, int] = {
-        "lean_prover": 8,
-        "lean_tactic": 20,
-        "mathlib_search": 5,
+        "lean_prover": 15,
+        "lean_tactic": 30,
+        "mathlib_search": 10,
     }
 
     @property
