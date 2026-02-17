@@ -236,6 +236,81 @@ def _find_repl_binary() -> Path | None:
     return None
 
 
+class REPLSessionPool:
+    """Pool of REPL sessions for parallel tactic screening."""
+
+    def __init__(self, max_size: int = 4, full_mathlib: bool = False) -> None:
+        self._pool: asyncio.Queue[LeanREPLSession] = asyncio.Queue(maxsize=max_size)
+        self._all_sessions: list[LeanREPLSession] = []
+        self._max_size = max_size
+        self._created = 0
+        self._full_mathlib = full_mathlib
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> LeanREPLSession:
+        """Acquire a REPL session from the pool (creates one if needed)."""
+        # Try to get an existing session without blocking
+        try:
+            session = self._pool.get_nowait()
+            if session.is_running:
+                return session
+            # Session died — create a new one
+        except asyncio.QueueEmpty:
+            pass
+
+        # Create a new session if under limit
+        async with self._lock:
+            if self._created < self._max_size:
+                session = LeanREPLSession(import_full_mathlib=self._full_mathlib)
+                await session.start()
+                await session.ensure_initialized()
+                self._all_sessions.append(session)
+                self._created += 1
+                return session
+
+        # At capacity — wait for one to be released
+        session = await self._pool.get()
+        if not session.is_running:
+            await session.start()
+            await session.ensure_initialized()
+        return session
+
+    async def release(self, session: LeanREPLSession) -> None:
+        """Return a session to the pool."""
+        if session.is_running:
+            try:
+                self._pool.put_nowait(session)
+            except asyncio.QueueFull:
+                await session.stop()
+        else:
+            await session.stop()
+
+    async def shutdown(self) -> None:
+        """Stop all sessions in the pool."""
+        for session in self._all_sessions:
+            await session.stop()
+        self._all_sessions.clear()
+        self._created = 0
+        # Drain the queue
+        while not self._pool.empty():
+            try:
+                self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+
+# Global pool (lazy-initialized)
+_session_pool: REPLSessionPool | None = None
+
+
+async def get_pool(max_size: int = 4, full_mathlib: bool = False) -> REPLSessionPool:
+    """Get or create the global session pool."""
+    global _session_pool
+    if _session_pool is None:
+        _session_pool = REPLSessionPool(max_size=max_size, full_mathlib=full_mathlib)
+    return _session_pool
+
+
 async def get_session(full_mathlib: bool = False) -> LeanREPLSession:
     """Get or create the singleton REPL session.
 
