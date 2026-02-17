@@ -50,6 +50,9 @@ class Scratchpad:
     # Error tracking for self-correction loop
     _error_history: list[ErrorRecord] = field(default_factory=list)
     _failed_approaches: set[str] = field(default_factory=set)
+    # Correction round tracking (per goal/code hash — Goedel-V2: 2 rounds optimal)
+    max_correction_rounds: int = 2
+    _correction_rounds: dict[str, int] = field(default_factory=dict)
 
     def can_call_tool(
         self, tool_name: str, query: str | None = None,
@@ -130,6 +133,19 @@ class Scratchpad:
         # Track the approach signature to prevent exact retries
         approach_key = f"{tool}:{category}:{code_or_tactic[:200]}"
         self._failed_approaches.add(approach_key)
+        # Increment correction round for this goal
+        self.increment_correction_round(code_or_tactic)
+
+    def increment_correction_round(self, goal_key: str) -> int:
+        """Increment and return correction round count for a goal."""
+        key = goal_key[:200]
+        self._correction_rounds[key] = self._correction_rounds.get(key, 0) + 1
+        return self._correction_rounds[key]
+
+    def is_correction_exhausted(self, goal_key: str) -> bool:
+        """Check if correction rounds are exhausted for a goal."""
+        key = goal_key[:200]
+        return self._correction_rounds.get(key, 0) >= self.max_correction_rounds
 
     def is_repeated_approach(self, tool: str, code_or_tactic: str) -> bool:
         """Check if this exact approach has already failed."""

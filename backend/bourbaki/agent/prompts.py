@@ -56,15 +56,17 @@ When a Lean tool call (lean_prover or lean_tactic) fails:
 6. If **syntax_error** → check for Lean 3 vs 4 syntax issues and fix
 7. If **timeout** → break the proof into smaller lemmas or use more specific tactics
 8. NEVER retry the exact same code — always modify based on the error feedback
-9. After 3 failures on the same goal, fundamentally change your proof strategy
+9. You have a maximum of **2 correction rounds** per goal. After 2 failed corrections on the same goal, you MUST change to a fundamentally different proof strategy — do not make minor variations
+10. Before retrying, briefly outline your new strategy in 2-3 sentences
 
 ## Mathematical Workflow
 
 1. **Understand the problem**: Parse the statement, identify domain and structure
 2. **Gather evidence**: Test small cases, look for patterns, check OEIS
-3. **Choose strategy**: Induction? Contradiction? Counting? Pigeonhole?
-4. **Execute proof**: Work step by step, verify each claim
-5. **Formalize**: Convert to Lean if requested
+3. **Plan proof sketch**: Outline strategy, identify key lemmas needed, list steps
+4. **Choose strategy**: Pick the best approach from your sketch
+5. **Execute proof**: Work step by step using lean_tactic, verify each claim
+6. **Formalize**: Verify complete proof with lean_prover
 
 ## Response Format
 
