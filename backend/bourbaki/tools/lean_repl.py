@@ -41,12 +41,16 @@ class LeanREPLSession:
     also separated by blank lines.
     """
 
+    _STDERR_BUFFER_SIZE = 20
+
     def __init__(self, import_full_mathlib: bool = False) -> None:
         self.proc: asyncio.subprocess.Process | None = None
         self.env_id: int = 0  # Current environment ID for chaining commands
         self._initialized: bool = False
         self._lock = asyncio.Lock()
         self._import_full_mathlib = import_full_mathlib
+        self._stderr_buffer: list[str] = []
+        self._stderr_task: asyncio.Task[None] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -72,15 +76,41 @@ class LeanREPLSession:
             lake_bin, "env", str(repl_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             cwd=str(LEAN_PROJECT_DIR),
         )
         self.env_id = 0
         self._initialized = False
+        self._stderr_buffer.clear()
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
         logger.info("Started lean4-repl via lake env (pid=%s)", self.proc.pid)
+
+    async def _drain_stderr(self) -> None:
+        """Background task: read stderr and buffer recent lines."""
+        assert self.proc is not None and self.proc.stderr is not None
+        try:
+            while True:
+                raw = await self.proc.stderr.readline()
+                if not raw:
+                    break
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    logger.debug("lean4-repl stderr: %s", line)
+                    self._stderr_buffer.append(line)
+                    if len(self._stderr_buffer) > self._STDERR_BUFFER_SIZE:
+                        self._stderr_buffer.pop(0)
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def get_stderr_recent(self) -> list[str]:
+        """Return the most recent stderr lines."""
+        return list(self._stderr_buffer)
 
     async def stop(self) -> None:
         """Stop the REPL subprocess."""
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         if self.proc is not None:
             try:
                 self.proc.terminate()
