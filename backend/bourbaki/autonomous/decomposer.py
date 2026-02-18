@@ -35,6 +35,7 @@ from bourbaki.autonomous.sketch import (
     SketchContext,
     SketchGenerator,
 )
+from bourbaki.tools.lemma_library import LemmaCache, LemmaEntry, get_lemma_library
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ class DecompositionConfig:
     parallel_subgoals: bool = True
     # Maximum number of parallel subgoal solves (to avoid overloading)
     max_parallel: int = 4
+    # Aletheia-style NL reasoning: let the LLM reason freely before formalization
+    use_nl_reasoning: bool = True
 
     # Legacy alias
     @property
@@ -78,7 +81,7 @@ class SubgoalResult:
     success: bool
     tactics: list[str] = field(default_factory=list)
     depth_reached: int = 0
-    method: str = ""  # "search" or "decompose"
+    method: str = ""  # "search", "decompose", or "cache"
     time_spent: float = 0.0
     error: str | None = None
 
@@ -156,6 +159,7 @@ async def _solve_single_subgoal(
     depth: int,
     previous_attempts: list[str],
     solved_siblings: dict[str, list[str]],
+    lemma_cache: LemmaCache | None = None,
 ) -> SubgoalResult:
     """Solve a single subgoal: first try flat search, then recursive decomposition.
 
@@ -166,6 +170,7 @@ async def _solve_single_subgoal(
         depth: Current recursion depth.
         previous_attempts: Failed approaches to communicate to recursive calls.
         solved_siblings: Already-solved sibling subgoals (label -> tactics), for context.
+        lemma_cache: Optional shared cache for solved subgoals within this proof session.
 
     Returns:
         SubgoalResult with success/failure and proof tactics.
@@ -181,6 +186,24 @@ async def _solve_single_subgoal(
         "Solving subgoal %s (depth=%d, budget=%d, timeout=%.0fs): %s",
         subgoal.label, depth, budget, timeout, subgoal.lean_type[:80],
     )
+
+    # Step 0: Check the shared lemma cache for a previously solved similar goal
+    if lemma_cache is not None:
+        cached_tactics = lemma_cache.lookup(subgoal.lean_type)
+        if cached_tactics is not None:
+            elapsed = time.monotonic() - start
+            logger.info(
+                "Subgoal %s solved from lemma cache (%d tactics, %.1fs)",
+                subgoal.label, len(cached_tactics), elapsed,
+            )
+            return SubgoalResult(
+                label=subgoal.label,
+                lean_type=subgoal.lean_type,
+                success=True,
+                tactics=cached_tactics,
+                method="cache",
+                time_spent=elapsed,
+            )
 
     # Step 1: Try flat search (best-first tactic search)
     try:
@@ -276,11 +299,15 @@ async def _solve_subgoals_parallel(
     sketch_generator: SketchGenerator,
     depth: int,
     previous_attempts: list[str],
+    lemma_cache: LemmaCache | None = None,
 ) -> list[SubgoalResult]:
     """Solve independent subgoals in parallel, dependent ones sequentially.
 
     Subgoals that have no dependencies on earlier subgoals can be solved
     concurrently. Dependent subgoals wait for their dependencies.
+
+    When a subgoal is solved, its solution is added to the shared lemma_cache
+    so sibling subgoals with similar goals can reuse it.
     """
     results: dict[str, SubgoalResult] = {}
     solved_proofs: dict[str, list[str]] = {}
@@ -317,6 +344,7 @@ async def _solve_subgoals_parallel(
                     return await _solve_single_subgoal(
                         sg, config, sketch_generator, depth,
                         previous_attempts, dict(solved_proofs),
+                        lemma_cache=lemma_cache,
                     )
 
             batch_results = await asyncio.gather(
@@ -337,16 +365,23 @@ async def _solve_subgoals_parallel(
                     results[sg.label] = br
                     if br.success:
                         solved_proofs[sg.label] = br.tactics
+                        # Share solved subgoal with siblings via cache
+                        if lemma_cache is not None:
+                            lemma_cache.add(sg.lean_type, br.tactics)
         else:
             # Sequential solving
             for sg in ready:
                 sr = await _solve_single_subgoal(
                     sg, config, sketch_generator, depth,
                     previous_attempts, dict(solved_proofs),
+                    lemma_cache=lemma_cache,
                 )
                 results[sg.label] = sr
                 if sr.success:
                     solved_proofs[sg.label] = sr.tactics
+                    # Share solved subgoal with siblings via cache
+                    if lemma_cache is not None:
+                        lemma_cache.add(sg.lean_type, sr.tactics)
 
         pending = still_pending
 
@@ -396,7 +431,10 @@ async def decompose_and_prove(
     start = time.monotonic()
 
     if sketch_generator is None:
-        sketch_generator = LLMSketchGenerator(config.model)
+        sketch_generator = LLMSketchGenerator(
+            config.model,
+            use_nl_reasoning=config.use_nl_reasoning,
+        )
 
     result = DecompositionResult(
         success=False,
@@ -424,6 +462,9 @@ async def decompose_and_prove(
 
     # Track the best partial result across sketches
     best_partial: DecompositionResult | None = None
+
+    # Create a shared lemma cache for this proof session
+    lemma_cache = LemmaCache()
 
     # Try each sketch (up to max_sketches)
     for sketch_idx, sketch in enumerate(sketches[:config.max_sketches]):
@@ -454,6 +495,7 @@ async def decompose_and_prove(
             sketch_generator=sketch_generator,
             depth=depth,
             previous_attempts=previous_attempts or [],
+            lemma_cache=lemma_cache,
         )
 
         # Collect results
@@ -518,6 +560,10 @@ async def decompose_and_prove(
                 sketch_result.subgoals_total, sketch_result.sketches_tried,
                 depth, sketch_result.verified,
             )
+
+            # Save solved subgoals to the persistent lemma library
+            _save_subgoals_to_library(subgoal_results, theorem)
+
             return sketch_result
 
         # Some subgoals failed — try next sketch
@@ -531,10 +577,35 @@ async def decompose_and_prove(
         best_partial.total_time = time.monotonic() - start
         # If best_partial has a stitched proof (all solved but verification failed),
         # still return it as a success — the solver pipeline can retry verification
+
+        # Save any solved subgoals even on partial success
+        if best_partial.subgoal_results:
+            _save_subgoals_to_library(best_partial.subgoal_results, theorem)
+
         return best_partial
 
     result.total_time = time.monotonic() - start
     return result
+
+
+def _save_subgoals_to_library(
+    subgoal_results: list[SubgoalResult],
+    theorem: str,
+) -> None:
+    """Save solved subgoals to the persistent lemma library."""
+    try:
+        library = get_lemma_library()
+        for sr in subgoal_results:
+            if sr.success and sr.tactics:
+                library.add(LemmaEntry(
+                    goal_pattern=sr.lean_type,
+                    tactics=sr.tactics,
+                    source="decomposer",
+                    theorem_context=theorem,
+                ))
+        library.save_if_dirty()
+    except Exception as exc:
+        logger.debug("Failed to save subgoal lemmas to library: %s", exc)
 
 
 def _extract_tactics_from_proof(proof_code: str) -> list[str]:

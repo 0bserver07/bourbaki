@@ -2,6 +2,10 @@
 
 Orchestrates Strategist, Searcher, Prover, and Verifier roles
 to collaboratively construct and verify Lean 4 proofs.
+
+Includes Aletheia-style NL reasoning pre-pass: before strategizing,
+the LLM reasons freely in natural language about the theorem, and
+those insights guide the strategist and prover phases.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 from bourbaki.agent.messages import AgentMessage, MessageBus
 from bourbaki.agent.roles import STRATEGIST, SEARCHER, PROVER, VERIFIER
 from bourbaki.tools.lean_prover import lean_prover
+from bourbaki.tools.lemma_library import LemmaEntry, get_lemma_library
 from bourbaki.tools.mathlib_search import mathlib_search
 
 logger = logging.getLogger(__name__)
@@ -34,21 +39,24 @@ class ProofCoordinator:
     """Orchestrates multi-agent proof construction.
 
     Workflow:
-    1. Strategist generates proof sketch + subgoals
-    2. Searcher finds relevant Mathlib lemmas for each subgoal
-    3. Prover constructs proof using tactics guided by strategy + lemmas
-    4. Verifier confirms with lean_prover
-    5. On failure: loop back to Strategist with insights
+    1. (Optional) NL reasoning: free-form analysis of the theorem
+    2. Strategist generates proof sketch + subgoals (guided by NL reasoning)
+    3. Searcher finds relevant Mathlib lemmas for each subgoal
+    4. Prover constructs proof using tactics guided by strategy + lemmas + NL reasoning
+    5. Verifier confirms with lean_prover
+    6. On failure: loop back to Strategist with insights
     """
 
     def __init__(
         self,
         model: str,
         pool: Any = None,  # Optional REPLSessionPool
+        use_nl_reasoning: bool = True,
     ) -> None:
         from bourbaki.agent.core import _resolve_model_object
         self.model = _resolve_model_object(model)
         self.pool = pool
+        self.use_nl_reasoning = use_nl_reasoning
         self.bus = MessageBus()
         self._stats: dict[str, int] = {
             "strategist": 0,
@@ -68,7 +76,7 @@ class ProofCoordinator:
         Args:
             theorem: Lean 4 theorem statement.
             timeout: Maximum time in seconds.
-            max_retries: Maximum retry cycles (strategist → prover).
+            max_retries: Maximum retry cycles (strategist -> prover).
 
         Returns:
             CoordinatorResult with proof details.
@@ -76,14 +84,21 @@ class ProofCoordinator:
         start = time.monotonic()
         previous_errors: list[str] = []
 
+        # Pre-pass: Generate NL reasoning once (shared across retries)
+        nl_reasoning: str | None = None
+        if self.use_nl_reasoning:
+            nl_reasoning = await self._generate_nl_reasoning(theorem)
+
         for attempt in range(max_retries):
             if time.monotonic() - start > timeout:
                 break
 
             logger.info("Coordinator attempt %d/%d for: %s", attempt + 1, max_retries, theorem[:80])
 
-            # Phase 1: Strategist generates proof sketch
-            strategy = await self._run_strategist(theorem, previous_errors)
+            # Phase 1: Strategist generates proof sketch (guided by NL reasoning)
+            strategy = await self._run_strategist(
+                theorem, previous_errors, nl_reasoning=nl_reasoning,
+            )
             self._stats["strategist"] += 1
 
             # Phase 2: Searcher finds relevant lemmas
@@ -92,8 +107,10 @@ class ProofCoordinator:
             )
             self._stats["searcher"] += 1
 
-            # Phase 3: Prover attempts proof
-            proof_code = await self._run_prover(theorem, strategy, lemmas)
+            # Phase 3: Prover attempts proof (with NL reasoning context)
+            proof_code = await self._run_prover(
+                theorem, strategy, lemmas, nl_reasoning=nl_reasoning,
+            )
             self._stats["prover"] += 1
 
             if proof_code is None:
@@ -106,6 +123,22 @@ class ProofCoordinator:
 
             if verified:
                 elapsed = time.monotonic() - start
+
+                # Save verified proof tactics to the persistent lemma library
+                try:
+                    library = get_lemma_library()
+                    tactics = _extract_coordinator_tactics(proof_code)
+                    if tactics:
+                        library.add(LemmaEntry(
+                            goal_pattern=theorem,
+                            tactics=tactics,
+                            source="coordinator",
+                            theorem_context=theorem,
+                        ))
+                        library.save_if_dirty()
+                except Exception as exc:
+                    logger.debug("Failed to save coordinator lemma: %s", exc)
+
                 return CoordinatorResult(
                     success=True,
                     proof_code=proof_code,
@@ -125,14 +158,50 @@ class ProofCoordinator:
             total_time=elapsed,
         )
 
+    async def _generate_nl_reasoning(self, theorem: str) -> str | None:
+        """Generate free-form NL reasoning about the theorem (Aletheia-style).
+
+        This pre-pass lets the LLM reason freely before any formal planning,
+        producing insights that guide the strategist and prover phases.
+
+        Returns the NL analysis string, or None on failure.
+        """
+        from bourbaki.autonomous.sketch import (
+            build_nl_reasoning_prompt,
+            NL_REASONING_MAX_CHARS,
+        )
+
+        try:
+            from pydantic_ai import Agent
+
+            prompt = build_nl_reasoning_prompt(theorem)
+            agent: Agent[None, str] = Agent(self.model, system_prompt=(
+                "You are a mathematician. Provide a concise but insightful "
+                "analysis. Do NOT write any Lean code or formal proofs."
+            ))
+            result = await agent.run(prompt)
+            reasoning = result.output.strip()
+            if len(reasoning) > NL_REASONING_MAX_CHARS:
+                reasoning = reasoning[:NL_REASONING_MAX_CHARS] + "..."
+            logger.info(
+                "Coordinator NL reasoning generated (%d chars)", len(reasoning),
+            )
+            return reasoning
+        except Exception as e:
+            logger.warning("Coordinator NL reasoning failed: %s", e)
+            return None
+
     async def _run_strategist(
         self,
         theorem: str,
         previous_errors: list[str],
+        nl_reasoning: str | None = None,
     ) -> dict[str, Any]:
         """Generate a proof strategy using LLM.
 
         Returns dict with 'sketch' (list of steps) and 'subgoals' (list of goals).
+        When NL reasoning is provided, it is included as context so the
+        strategy benefits from the free-form mathematical analysis.
         """
         try:
             from pydantic_ai import Agent
@@ -146,9 +215,18 @@ class ProofCoordinator:
                     + "\n\nTry a fundamentally different approach."
                 )
 
+            reasoning_context = ""
+            if nl_reasoning:
+                reasoning_context = (
+                    "\n\nMATHEMATICAL ANALYSIS (use these insights to guide your strategy):\n"
+                    + nl_reasoning
+                    + "\n"
+                )
+
             prompt = (
                 f"{STRATEGIST.system_prompt_addendum}\n\n"
                 f"Theorem: {theorem}\n"
+                f"{reasoning_context}"
                 f"{error_context}\n\n"
                 "Output a JSON object with:\n"
                 '- "sketch": list of proof steps (tactics or strategies)\n'
@@ -206,10 +284,13 @@ class ProofCoordinator:
         theorem: str,
         strategy: dict[str, Any],
         lemmas: list[dict[str, Any]],
+        nl_reasoning: str | None = None,
     ) -> str | None:
         """Attempt to construct a proof using LLM guided by strategy and lemmas.
 
         Returns the proof code string if successful, None otherwise.
+        When NL reasoning is provided, it gives the prover additional
+        mathematical context for constructing the proof.
         """
         try:
             from pydantic_ai import Agent
@@ -220,9 +301,16 @@ class ProofCoordinator:
                 for l in lemmas[:10]
             )
 
+            reasoning_section = ""
+            if nl_reasoning:
+                reasoning_section = (
+                    f"\nMathematical analysis:\n{nl_reasoning}\n"
+                )
+
             prompt = (
                 f"{PROVER.system_prompt_addendum}\n\n"
-                f"Theorem: {theorem}\n\n"
+                f"Theorem: {theorem}\n"
+                f"{reasoning_section}\n"
                 f"Proof strategy:\n"
                 + "\n".join(f"- {s}" for s in sketch)
                 + f"\n\nAvailable Mathlib lemmas:\n{lemma_info}\n\n"
@@ -314,7 +402,7 @@ class ProofCoordinator:
                             total_time=elapsed,
                         )
 
-            # No immediate winner — wait for remaining
+            # No immediate winner -- wait for remaining
             if pending:
                 remaining_timeout = max(0, timeout - (time.monotonic() - start))
                 done2, still_pending = await asyncio.wait(
@@ -350,3 +438,20 @@ class ProofCoordinator:
             agent_stats=dict(self._stats),
             total_time=elapsed,
         )
+
+
+def _extract_coordinator_tactics(proof_code: str) -> list[str]:
+    """Extract tactic lines from a coordinator-produced proof."""
+    import re
+
+    by_match = re.search(r":=\s*by\b", proof_code)
+    if not by_match:
+        return []
+
+    tactic_block = proof_code[by_match.end():].strip()
+    tactics = [
+        line.strip()
+        for line in tactic_block.split("\n")
+        if line.strip() and not line.strip().startswith("--")
+    ]
+    return tactics

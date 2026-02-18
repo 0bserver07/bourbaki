@@ -5,7 +5,12 @@ Lean have/sorry skeletons. The SketchGenerator protocol is pluggable —
 the default LLMSketchGenerator uses the configured model, but a
 Numina-style generator-verifier can be swapped in.
 
-Reference: HILBERT (Apple), Aristotle lemma-based reasoning, Goedel-V2 proof planning.
+Includes an Aletheia-style NL reasoning pre-pass: before generating
+formal proof steps, the LLM reasons freely in natural language about
+the problem, then uses those insights to guide the formal decomposition.
+
+Reference: HILBERT (Apple), Aristotle lemma-based reasoning, Goedel-V2 proof planning,
+DeepMind Aletheia (NL reasoning → formal verification).
 """
 
 from __future__ import annotations
@@ -17,6 +22,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+# Maximum character budget for NL reasoning output to avoid prompt bloat (~500 tokens)
+NL_REASONING_MAX_CHARS = 2000
 
 
 @dataclass
@@ -34,6 +42,7 @@ class ProofSketch:
     steps: list[SketchStep]     # Ordered informal steps
     key_lemmas: list[str] = field(default_factory=list)  # Expected Mathlib lemmas
     final_step: str | None = None  # Optional tactic to close after all haves
+    nl_reasoning: str | None = None  # NL reasoning from Aletheia-style pre-analysis
 
 
 @dataclass
@@ -96,6 +105,25 @@ steps that are not independently provable, overly complex single steps.
 """
 
 
+NL_REASONING_PROMPT = """\
+You are a mathematician analyzing a theorem to prove.
+
+THEOREM:
+{theorem}
+
+Before writing any formal proof, reason through the following in natural language:
+
+1. PROBLEM TYPE: What area of mathematics is this? What structures are involved?
+2. KEY OBSERVATIONS: What patterns, symmetries, or special cases do you notice?
+3. PROOF STRATEGY: What approach is most likely to work? Why?
+4. INTERMEDIATE STEPS: What intermediate results or lemmas would you need?
+5. POTENTIAL PITFALLS: What could go wrong with this approach?
+
+Be specific and mathematical. Reference known theorems when applicable.
+Keep your analysis concise — focus on the most important insights.
+"""
+
+
 SUBGOAL_SKETCH_PROMPT = """\
 You are decomposing a SUBGOAL that arose from a larger proof decomposition.
 The original proof was split into parts, and this particular subgoal could not
@@ -122,13 +150,20 @@ Each sketch has:
 """
 
 
-def parse_sketch_response(response: str) -> list[ProofSketch]:
+def parse_sketch_response(
+    response: str,
+    nl_reasoning: str | None = None,
+) -> list[ProofSketch]:
     """Parse LLM response into ProofSketch objects.
 
     Handles:
     - Raw JSON
     - JSON wrapped in markdown code blocks
     - Invalid JSON (returns empty list)
+
+    Args:
+        response: Raw LLM response containing JSON sketch data.
+        nl_reasoning: Optional NL reasoning to attach to each sketch.
     """
     # Strip markdown code blocks if present
     text = response.strip()
@@ -164,18 +199,45 @@ def parse_sketch_response(response: str) -> list[ProofSketch]:
             steps=steps,
             key_lemmas=s.get("key_lemmas", []),
             final_step=s.get("final_step"),
+            nl_reasoning=nl_reasoning,
         ))
 
     return sketches
 
 
-def build_sketch_prompt(context: SketchContext) -> str:
+def build_nl_reasoning_prompt(theorem: str) -> str:
+    """Build the prompt for the NL reasoning pre-analysis phase.
+
+    This is the first phase of Aletheia-style generation: let the LLM
+    reason freely about the problem before formal decomposition.
+    """
+    return NL_REASONING_PROMPT.format(theorem=theorem)
+
+
+def build_sketch_prompt(
+    context: SketchContext,
+    nl_reasoning: str | None = None,
+) -> str:
     """Build the prompt for sketch generation.
 
     Uses the subgoal-specific prompt at depth > 0, which emphasizes
     minimal decomposition and atomic steps.
+
+    Args:
+        context: Sketch generation context.
+        nl_reasoning: Optional NL reasoning from the pre-analysis phase.
+            When provided, it is prepended to the context section so the
+            formal sketch is guided by the free-form analysis.
     """
     context_parts = []
+
+    # Inject NL reasoning as context for the formal sketch
+    if nl_reasoning:
+        context_parts.append(
+            "MATHEMATICAL ANALYSIS (use this to guide your decomposition):\n"
+            + nl_reasoning
+        )
+
     if context.mathlib_results:
         lemma_names = [r.get("name", "") for r in context.mathlib_results[:5]]
         context_parts.append(f"Potentially relevant Mathlib lemmas: {', '.join(lemma_names)}")
@@ -214,20 +276,78 @@ class SketchGenerator(Protocol):
 
 
 class LLMSketchGenerator:
-    """Default sketch generator using the configured LLM."""
+    """Default sketch generator using the configured LLM.
 
-    def __init__(self, model: str) -> None:
+    Supports an optional Aletheia-style NL reasoning pre-pass: when
+    ``use_nl_reasoning`` is True, the generator first asks the LLM to
+    reason freely about the theorem in natural language, then feeds
+    those insights into the formal sketch generation prompt.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        use_nl_reasoning: bool = True,
+    ) -> None:
         self.model = model
+        self.use_nl_reasoning = use_nl_reasoning
+
+    async def _generate_nl_reasoning(self, theorem: str) -> str | None:
+        """Phase 1: Generate free-form NL reasoning about the theorem.
+
+        Returns the NL analysis string, or None on failure.
+        The output is capped at NL_REASONING_MAX_CHARS to keep the
+        downstream sketch prompt concise.
+        """
+        from pydantic_ai import Agent
+        from bourbaki.agent.core import _resolve_model_object
+
+        prompt = build_nl_reasoning_prompt(theorem)
+        resolved_model = _resolve_model_object(self.model)
+        agent: Agent[None, str] = Agent(resolved_model, system_prompt=(
+            "You are a mathematician. Provide a concise but insightful "
+            "analysis. Do NOT write any Lean code or formal proofs."
+        ))
+
+        try:
+            result = await agent.run(prompt)
+            reasoning = result.output.strip()
+            # Cap length to avoid bloating the sketch prompt
+            if len(reasoning) > NL_REASONING_MAX_CHARS:
+                reasoning = reasoning[:NL_REASONING_MAX_CHARS] + "..."
+            logger.info(
+                "NL reasoning generated (%d chars) for: %s",
+                len(reasoning), theorem[:60],
+            )
+            return reasoning
+        except Exception as e:
+            logger.warning("NL reasoning generation failed: %s", e)
+            return None
 
     async def generate(self, context: SketchContext) -> list[ProofSketch]:
         """Generate proof sketches by prompting the LLM.
+
+        When ``use_nl_reasoning`` is enabled:
+        - Phase 1: Ask the LLM to analyze the theorem in natural language.
+        - Phase 2: Feed the NL analysis into the sketch generation prompt
+          so the formal decomposition is guided by free-form reasoning.
+
+        The NL reasoning is stored on each ``ProofSketch.nl_reasoning``
+        field so it can be passed downstream to the decomposer, coordinator,
+        and prover.
 
         Uses _resolve_model_object for custom provider support.
         """
         from pydantic_ai import Agent
         from bourbaki.agent.core import _resolve_model_object
 
-        prompt = build_sketch_prompt(context)
+        # Phase 1: NL reasoning (skip for deep subgoals — they are simple)
+        nl_reasoning: str | None = None
+        if self.use_nl_reasoning and context.depth == 0:
+            nl_reasoning = await self._generate_nl_reasoning(context.theorem)
+
+        # Phase 2: Formal sketch generation (with NL reasoning as context)
+        prompt = build_sketch_prompt(context, nl_reasoning=nl_reasoning)
         resolved_model = _resolve_model_object(self.model)
         agent: Agent[None, str] = Agent(resolved_model, system_prompt=(
             "You are a proof planning assistant for Lean 4 formalization. "
@@ -236,7 +356,9 @@ class LLMSketchGenerator:
 
         try:
             result = await agent.run(prompt)
-            sketches = parse_sketch_response(result.output)
+            sketches = parse_sketch_response(
+                result.output, nl_reasoning=nl_reasoning,
+            )
             # Filter out sketches with no usable steps
             return [s for s in sketches if s.steps]
         except Exception as e:

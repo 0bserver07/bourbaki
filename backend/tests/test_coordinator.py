@@ -22,7 +22,7 @@ async def test_coordinator_prove_success():
 
     # Mock the search phase
     mock_lemmas = [
-        {"name": "Nat.add_comm", "type": "∀ m n, m + n = n + m"},
+        {"name": "Nat.add_comm", "type": "forall m n, m + n = n + m"},
     ]
 
     # Mock the prover phase
@@ -45,7 +45,7 @@ async def test_coordinator_prove_retry_on_failure():
 
     call_count = 0
 
-    async def mock_prover(theorem, strategy, lemmas):
+    async def mock_prover(theorem, strategy, lemmas, nl_reasoning=None):
         nonlocal call_count
         call_count += 1
         if call_count == 1:

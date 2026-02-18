@@ -1,6 +1,6 @@
 """Integration test for multi-agent proof pipeline.
 
-Tests the full flow: Coordinator → Strategist → Searcher → Prover → Verifier,
+Tests the full flow: Coordinator -> Strategist -> Searcher -> Prover -> Verifier,
 including the retry path on prover failure.
 """
 
@@ -17,28 +17,28 @@ from bourbaki.agent.roles import ALL_ROLES, STRATEGIST, PROVER, VERIFIER
 
 @pytest.mark.asyncio
 async def test_full_pipeline_success():
-    """Full pipeline: strategy → search → prove → verify → success."""
+    """Full pipeline: strategy -> search -> prove -> verify -> success."""
     coord = ProofCoordinator(model="openai:gpt-4o")
 
     # Mock strategy generation
-    async def mock_strategist(theorem, previous_errors):
+    async def mock_strategist(theorem, previous_errors, nl_reasoning=None):
         return {
             "sketch": ["intro n", "induction n", "simp", "ring"],
-            "subgoals": ["base case: P(0)", "inductive step: P(n) → P(n+1)"],
+            "subgoals": ["base case: P(0)", "inductive step: P(n) -> P(n+1)"],
         }
 
     # Mock lemma search
     async def mock_searcher(theorem, subgoals):
         return [
-            {"name": "Nat.add_comm", "type": "∀ m n, m + n = n + m", "module": "Mathlib"},
-            {"name": "Nat.succ_pos", "type": "∀ n, 0 < n + 1", "module": "Mathlib"},
+            {"name": "Nat.add_comm", "type": "forall m n, m + n = n + m", "module": "Mathlib"},
+            {"name": "Nat.succ_pos", "type": "forall n, 0 < n + 1", "module": "Mathlib"},
         ]
 
     # Mock proof construction
-    async def mock_prover(theorem, strategy, lemmas):
+    async def mock_prover(theorem, strategy, lemmas, nl_reasoning=None):
         return (
             "import Mathlib.Tactic\n\n"
-            "theorem test_sum : ∀ n : ℕ, 2 * (Finset.range (n + 1)).sum id = n * (n + 1) := by\n"
+            "theorem test_sum : forall n : Nat, 2 * (Finset.range (n + 1)).sum id = n * (n + 1) := by\n"
             "  intro n\n"
             "  induction n with\n"
             "  | zero => simp\n"
@@ -54,7 +54,7 @@ async def test_full_pipeline_success():
             with patch.object(coord, "_run_prover", side_effect=mock_prover):
                 with patch.object(coord, "_run_verifier", side_effect=mock_verifier):
                     result = await coord.prove(
-                        "theorem test_sum : ∀ n : ℕ, 2 * (Finset.range (n + 1)).sum id = n * (n + 1)",
+                        "theorem test_sum : forall n : Nat, 2 * (Finset.range (n + 1)).sum id = n * (n + 1)",
                         max_retries=3,
                     )
 
@@ -68,12 +68,12 @@ async def test_full_pipeline_success():
 
 @pytest.mark.asyncio
 async def test_pipeline_retry_after_prover_failure():
-    """Pipeline retry: prover fails → back to strategist → second attempt succeeds."""
+    """Pipeline retry: prover fails -> back to strategist -> second attempt succeeds."""
     coord = ProofCoordinator(model="openai:gpt-4o")
 
     strategy_calls = 0
 
-    async def mock_strategist(theorem, previous_errors):
+    async def mock_strategist(theorem, previous_errors, nl_reasoning=None):
         nonlocal strategy_calls
         strategy_calls += 1
         if strategy_calls == 1:
@@ -85,7 +85,7 @@ async def test_pipeline_retry_after_prover_failure():
 
     prover_calls = 0
 
-    async def mock_prover(theorem, strategy, lemmas):
+    async def mock_prover(theorem, strategy, lemmas, nl_reasoning=None):
         nonlocal prover_calls
         prover_calls += 1
         if prover_calls == 1:
@@ -110,18 +110,18 @@ async def test_pipeline_retry_after_prover_failure():
 
 @pytest.mark.asyncio
 async def test_pipeline_verification_failure_triggers_retry():
-    """Verifier rejects proof → back to strategist → retry."""
+    """Verifier rejects proof -> back to strategist -> retry."""
     coord = ProofCoordinator(model="openai:gpt-4o")
 
     verifier_calls = 0
 
-    async def mock_strategist(theorem, previous_errors):
+    async def mock_strategist(theorem, previous_errors, nl_reasoning=None):
         return {"sketch": ["simp"], "subgoals": []}
 
     async def mock_searcher(theorem, subgoals):
         return []
 
-    async def mock_prover(theorem, strategy, lemmas):
+    async def mock_prover(theorem, strategy, lemmas, nl_reasoning=None):
         return "theorem t : True := by simp"
 
     async def mock_verifier(proof_code):
