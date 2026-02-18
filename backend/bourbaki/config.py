@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     # Optional tool API keys
     exasearch_api_key: str | None = None
+    leanexplore_api_key: str | None = None
 
     # Erdős Problems API (separate service)
     erdos_api_url: str = "http://localhost:3001"

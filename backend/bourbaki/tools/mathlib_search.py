@@ -1,7 +1,8 @@
-"""Mathlib search via Loogle (type/name) and LeanSearch (natural language) APIs."""
+"""Mathlib search via Loogle (type/name), LeanSearch (natural language), and LeanExplore (semantic) APIs."""
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -9,8 +10,15 @@ import httpx
 
 LOOGLE_API = "https://loogle.lean-lang.org/json"
 LEANSEARCH_API = "https://leansearch.net/api/search"
+LEANEXPLORE_API = "https://www.leanexplore.com/api/v2/search"
 USER_AGENT = "Bourbaki/0.1.0 (Mathematical Reasoning Agent)"
 TIMEOUT = 15
+
+
+def _get_leanexplore_api_key() -> str | None:
+    """Get LeanExplore API key from config or environment."""
+    from bourbaki.config import settings
+    return settings.leanexplore_api_key or os.environ.get("LEANEXPLORE_API_KEY")
 
 
 async def mathlib_search(
@@ -18,13 +26,15 @@ async def mathlib_search(
     mode: str = "name",
     max_results: int = 5,
 ) -> dict[str, Any]:
-    """Search Mathlib for lemmas by name, type signature, or natural language.
+    """Search Mathlib for lemmas by name, type signature, natural language, or semantic search.
 
     Args:
         query: Search query. For mode="name" or "type", use Loogle syntax
                (e.g. "Nat.add_comm", "_ * (_ ^ _)", "(?a -> ?b) -> List ?a -> List ?b").
                For mode="natural", use plain English (e.g. "product of positive numbers is positive").
-        mode: "name" or "type" for Loogle API, "natural" for LeanSearch API.
+               For mode="semantic", use natural language (uses LeanExplore's hybrid ranking).
+        mode: "name" or "type" for Loogle API, "natural" for LeanSearch API,
+              "semantic" for LeanExplore API (hybrid semantic + BM25 + PageRank).
         max_results: Maximum results to return (default 5, max 10).
 
     Returns:
@@ -37,10 +47,12 @@ async def mathlib_search(
         return await _search_loogle(query, max_results, mode, start)
     elif mode == "natural":
         return await _search_leansearch(query, max_results, start)
+    elif mode == "semantic":
+        return await _search_semantic(query, max_results, start)
     else:
         return {
             "success": False,
-            "error": f"Unknown mode: {mode!r}. Use 'name', 'type', or 'natural'.",
+            "error": f"Unknown mode: {mode!r}. Use 'name', 'type', 'natural', or 'semantic'.",
             "query": query,
             "mode": mode,
         }
@@ -167,3 +179,63 @@ async def _search_leansearch(
             "mode": "natural",
             "duration": elapsed,
         }
+
+
+async def _search_leanexplore(
+    query: str, max_results: int, start: float,
+) -> dict[str, Any]:
+    """Search Mathlib via LeanExplore (semantic + BM25 + PageRank hybrid)."""
+    api_key = _get_leanexplore_api_key()
+    if api_key is None:
+        return None  # type: ignore[return-value]
+
+    try:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Bearer {api_key}",
+        }
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                LEANEXPLORE_API,
+                params={"q": query, "limit": max_results},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw_results = data.get("results", [])[:max_results]
+        results = []
+        for hit in raw_results:
+            results.append({
+                "name": hit.get("name", ""),
+                "module": hit.get("module", ""),
+                # source_text serves as the type signature
+                "type": hit.get("source_text", ""),
+                "doc": hit.get("docstring") or hit.get("informalization") or "",
+            })
+
+        elapsed = int((time.monotonic() - start) * 1000)
+        return {
+            "success": True,
+            "results": results,
+            "count": len(results),
+            "query": query,
+            "mode": "semantic",
+            "duration": elapsed,
+        }
+
+    except (httpx.HTTPStatusError, httpx.HTTPError):
+        return None  # type: ignore[return-value]
+
+
+async def _search_semantic(
+    query: str, max_results: int, start: float,
+) -> dict[str, Any]:
+    """Semantic search: try LeanExplore first, fall back to LeanSearch."""
+    # Try LeanExplore if API key is available
+    result = await _search_leanexplore(query, max_results, start)
+    if result is not None:
+        return result
+
+    # Fallback to LeanSearch (natural language)
+    return await _search_leansearch(query, max_results, start)
