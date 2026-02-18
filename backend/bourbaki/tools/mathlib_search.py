@@ -1,12 +1,15 @@
-"""Mathlib search via Loogle (type/name), LeanSearch (natural language), and LeanExplore (semantic) APIs."""
+"""Mathlib search via Loogle (type/name), LeanSearch (natural language), LeanExplore (semantic), and local FAISS index."""
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 LOOGLE_API = "https://loogle.lean-lang.org/json"
 LEANSEARCH_API = "https://leansearch.net/api/search"
@@ -33,8 +36,10 @@ async def mathlib_search(
                (e.g. "Nat.add_comm", "_ * (_ ^ _)", "(?a -> ?b) -> List ?a -> List ?b").
                For mode="natural", use plain English (e.g. "product of positive numbers is positive").
                For mode="semantic", use natural language (uses LeanExplore's hybrid ranking).
+               For mode="local", use natural language (uses local FAISS embedding index).
         mode: "name" or "type" for Loogle API, "natural" for LeanSearch API,
-              "semantic" for LeanExplore API (hybrid semantic + BM25 + PageRank).
+              "semantic" for LeanExplore API (hybrid semantic + BM25 + PageRank),
+              "local" for offline FAISS embedding search (fastest, no network).
         max_results: Maximum results to return (default 5, max 10).
 
     Returns:
@@ -49,10 +54,15 @@ async def mathlib_search(
         return await _search_leansearch(query, max_results, start)
     elif mode == "semantic":
         return await _search_semantic(query, max_results, start)
+    elif mode == "local":
+        return await _search_local(query, max_results, start)
     else:
         return {
             "success": False,
-            "error": f"Unknown mode: {mode!r}. Use 'name', 'type', 'natural', or 'semantic'.",
+            "error": (
+                f"Unknown mode: {mode!r}. "
+                "Use 'name', 'type', 'natural', 'semantic', or 'local'."
+            ),
             "query": query,
             "mode": mode,
         }
@@ -228,14 +238,36 @@ async def _search_leanexplore(
         return None  # type: ignore[return-value]
 
 
+async def _search_local(
+    query: str, max_results: int, start: float,
+) -> dict[str, Any]:
+    """Search using the local FAISS embedding index (offline, fastest)."""
+    from bourbaki.tools.mathlib_embeddings import search_local
+    return await search_local(query, max_results)
+
+
 async def _search_semantic(
     query: str, max_results: int, start: float,
 ) -> dict[str, Any]:
-    """Semantic search: try LeanExplore first, fall back to LeanSearch."""
-    # Try LeanExplore if API key is available
+    """Semantic search: try local FAISS first, then LeanExplore, then LeanSearch."""
+    # 1. Try local FAISS index (fastest, no network)
+    try:
+        from bourbaki.tools.mathlib_embeddings import is_index_available, search_local
+
+        if is_index_available():
+            result = await search_local(query, max_results)
+            if result.get("success"):
+                # Override mode to indicate it came through the semantic pathway
+                result["mode"] = "semantic"
+                logger.debug("Semantic search served by local FAISS index")
+                return result
+    except Exception as e:
+        logger.debug("Local FAISS index not available: %s", e)
+
+    # 2. Try LeanExplore if API key is available
     result = await _search_leanexplore(query, max_results, start)
     if result is not None:
         return result
 
-    # Fallback to LeanSearch (natural language)
+    # 3. Fallback to LeanSearch (natural language)
     return await _search_leansearch(query, max_results, start)
