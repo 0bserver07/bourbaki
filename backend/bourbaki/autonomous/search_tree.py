@@ -28,7 +28,13 @@ from bourbaki.autonomous.tactics import (
 )
 from bourbaki.tools.lean_lsp_tools import lsp_suggest_tactics
 from bourbaki.tools.lean_prover import lean_prover
-from bourbaki.tools.lean_repl import LeanREPLSession, lean_tactic, stop_session
+from bourbaki.tools.lean_repl import (
+    LeanREPLSession,
+    REPLSessionPool,
+    get_pool,
+    lean_tactic,
+    stop_session,
+)
 from bourbaki.tools.mathlib_search import mathlib_search
 
 logger = logging.getLogger(__name__)
@@ -103,15 +109,21 @@ def ucb_adjusted_score(node: ProofNode, exploration_constant: float = 1.0) -> fl
 class ProofSearchTree:
     """Best-first search over proof states using the Lean REPL."""
 
+    # Maximum tactic history depth for parallel replay.  Nodes deeper than
+    # this are expanded sequentially to avoid expensive replay overhead.
+    MAX_REPLAY_DEPTH = 20
+
     def __init__(
         self,
         theorem: str,
         max_depth: int = 30,
         session: LeanREPLSession | None = None,
+        pool: REPLSessionPool | None = None,
     ) -> None:
         self.theorem = theorem
         self.max_depth = max_depth
         self.session = session  # Optional: use this instead of singleton
+        self.pool = pool  # Optional: pool for parallel expansion
         self.root: ProofNode | None = None
         self._frontier: list[ProofNode] = []  # Min-heap by score
         self._explored: int = 0
@@ -261,6 +273,217 @@ class ProofSearchTree:
 
         return children
 
+    async def _expand_node_in_session(
+        self,
+        node: ProofNode,
+        pool: REPLSessionPool,
+        candidates: list[str],
+        max_corrections: int = 2,
+    ) -> list[ProofNode]:
+        """Expand a single node using a session acquired from the pool.
+
+        Acquires a session, replays the tactic history to reach the node's
+        proof state, then tries all candidate tactics.  The session is
+        always released back to the pool afterwards.
+
+        Args:
+            node: The proof state to expand.
+            pool: Session pool to acquire from.
+            candidates: Tactic strings to try.
+            max_corrections: Max correction attempts per failed tactic.
+
+        Returns:
+            List of new child nodes (successful tactic applications only).
+        """
+        session = await pool.acquire()
+        try:
+            # Replay tactic history to reach this node's proof state
+            replay = await session.replay_tactics(
+                self.theorem, node.tactic_history,
+            )
+            if not replay.get("success"):
+                logger.warning(
+                    "Replay failed for node at depth %d: %s",
+                    node.depth, replay.get("error"),
+                )
+                return []
+
+            replay_ps = replay["proofState"]
+
+            # Now try each candidate tactic against the replayed proof state
+            children: list[ProofNode] = []
+            correction_queue: list[tuple[str, str, int]] = []
+
+            for tactic in candidates:
+                result = await lean_tactic(
+                    goal=self.theorem,
+                    tactic=tactic,
+                    proof_state=replay_ps,
+                    session=session,
+                )
+                self._explored += 1
+
+                if not result.get("success"):
+                    error_msg = result.get("error", "")
+                    if error_msg and max_corrections > 0:
+                        correction_queue.append((tactic, error_msg, 1))
+                    continue
+
+                new_goals = result.get("goals", [])
+                new_ps = result.get("proofState", replay_ps)
+
+                if self._novelty_tracker.has_seen(new_goals) and new_goals:
+                    continue
+
+                child = ProofNode(
+                    proof_state=new_ps,
+                    goals=new_goals,
+                    tactic_history=node.tactic_history + [tactic],
+                    parent=node,
+                    score=score_proof_state(
+                        new_goals, node.depth + 1, self._novelty_tracker,
+                    ),
+                    depth=node.depth + 1,
+                    tactic=tactic,
+                )
+                node.children.append(child)
+                children.append(child)
+
+                if child.is_complete:
+                    logger.info(
+                        "Proof complete (parallel) at depth %d: %s",
+                        child.depth, child.path,
+                    )
+                    return [child]
+
+            # Error-conditioned correction loop
+            seen_corrections: set[str] = set()
+            while correction_queue:
+                failed_tactic, error_msg, round_num = correction_queue.pop(0)
+                if round_num > max_corrections:
+                    continue
+
+                repairs = generate_correction_candidates(
+                    failed_tactic, error_msg, node.goals,
+                )
+                for repair in repairs:
+                    if repair in seen_corrections:
+                        continue
+                    seen_corrections.add(repair)
+
+                    result = await lean_tactic(
+                        goal=self.theorem,
+                        tactic=repair,
+                        proof_state=replay_ps,
+                        session=session,
+                    )
+                    self._explored += 1
+
+                    if not result.get("success"):
+                        if round_num < max_corrections:
+                            repair_error = result.get("error", "")
+                            if repair_error and repair_error != error_msg:
+                                correction_queue.append(
+                                    (repair, repair_error, round_num + 1),
+                                )
+                        continue
+
+                    new_goals = result.get("goals", [])
+                    new_ps = result.get("proofState", replay_ps)
+
+                    if self._novelty_tracker.has_seen(new_goals) and new_goals:
+                        continue
+
+                    child = ProofNode(
+                        proof_state=new_ps,
+                        goals=new_goals,
+                        tactic_history=node.tactic_history + [repair],
+                        parent=node,
+                        score=score_proof_state(
+                            new_goals, node.depth + 1, self._novelty_tracker,
+                        ),
+                        depth=node.depth + 1,
+                        tactic=repair,
+                    )
+                    node.children.append(child)
+                    children.append(child)
+
+                    if child.is_complete:
+                        logger.info(
+                            "Proof complete via correction (parallel) at depth %d: %s",
+                            child.depth, child.path,
+                        )
+                        return [child]
+
+            return children
+
+        except Exception as exc:
+            logger.warning(
+                "Parallel expansion failed for node at depth %d: %s",
+                node.depth, exc,
+            )
+            return []
+        finally:
+            await pool.release(session)
+
+    async def expand_parallel(
+        self,
+        nodes: list[ProofNode],
+        pool: REPLSessionPool,
+        candidates_per_node: list[list[str]],
+        max_corrections: int = 2,
+    ) -> list[list[ProofNode]]:
+        """Expand multiple nodes in parallel using the session pool.
+
+        Each node is expanded in its own REPL session (acquired from the
+        pool).  The tactic history is replayed to reach the node's proof
+        state before trying candidates.
+
+        Nodes deeper than ``MAX_REPLAY_DEPTH`` are skipped from parallel
+        expansion to avoid expensive replay overhead.
+
+        Args:
+            nodes: Frontier nodes to expand concurrently.
+            pool: Session pool to draw from.
+            candidates_per_node: Candidate tactics for each node (same order).
+            max_corrections: Max correction attempts per failed tactic.
+
+        Returns:
+            A list of child-node lists, one per input node (in the same order).
+        """
+        async def _empty() -> list[ProofNode]:
+            return []
+
+        tasks: list[asyncio.Task[list[ProofNode]]] = []
+        for node, candidates in zip(nodes, candidates_per_node):
+            if node.depth > self.MAX_REPLAY_DEPTH:
+                # Too deep — skip parallel expansion for this node
+                logger.debug(
+                    "Skipping parallel expansion for depth-%d node (exceeds MAX_REPLAY_DEPTH=%d)",
+                    node.depth, self.MAX_REPLAY_DEPTH,
+                )
+                tasks.append(asyncio.create_task(_empty()))
+                continue
+
+            task = asyncio.create_task(
+                self._expand_node_in_session(
+                    node, pool, candidates, max_corrections,
+                ),
+            )
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Unwrap results — convert exceptions to empty lists
+        out: list[list[ProofNode]] = []
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning("Parallel expansion task failed: %s", r)
+                out.append([])
+            else:
+                out.append(r)
+        return out
+
     async def _fetch_lsp_tactics(
         self,
         node: ProofNode,
@@ -308,6 +531,7 @@ class ProofSearchTree:
         timeout: float = 300.0,
         use_mathlib: bool = True,
         use_lsp: bool = False,
+        parallel: int = 1,
     ) -> SearchResult:
         """Run best-first search to find a proof.
 
@@ -318,6 +542,10 @@ class ProofSearchTree:
             use_mathlib: Whether to query mathlib_search for candidates.
             use_lsp: Whether to query the Lean LSP for tactic completions
                      at shallow depths (depth < 3).
+            parallel: Number of frontier nodes to expand concurrently.
+                      When 1 (default), behaves identically to the original
+                      sequential algorithm.  When >1, uses the
+                      ``REPLSessionPool`` to expand multiple nodes at once.
 
         Returns:
             SearchResult with success/failure details.
@@ -350,73 +578,145 @@ class ProofSearchTree:
             if time.monotonic() - start > timeout:
                 break
 
-            # Pop the most promising node
-            node = heapq.heappop(self._frontier)
+            if parallel <= 1:
+                # --- Sequential expansion (original algorithm) ---
+                node = heapq.heappop(self._frontier)
 
-            # Increment visits on this node (selected for expansion)
-            node.visits += 1
-            # Propagate visit count up to ancestors for UCB
-            ancestor = node.parent
-            while ancestor is not None:
-                ancestor.visits += 1
-                ancestor = ancestor.parent
+                node.visits += 1
+                ancestor = node.parent
+                while ancestor is not None:
+                    ancestor.visits += 1
+                    ancestor = ancestor.parent
 
-            # Skip if too deep
-            if node.depth >= self.max_depth:
-                continue
+                if node.depth >= self.max_depth:
+                    continue
 
-            max_depth_seen = max(max_depth_seen, node.depth)
+                max_depth_seen = max(max_depth_seen, node.depth)
 
-            # Generate candidate tactics
-            candidates = generate_candidates(
-                goals=node.goals,
-                depth=node.depth,
-            )
+                candidates = generate_candidates(
+                    goals=node.goals,
+                    depth=node.depth,
+                )
 
-            # Optionally search Mathlib for relevant lemmas
-            if use_mathlib and node.depth < 5:
-                mathlib_results = await self._search_mathlib(node.goals)
-                if mathlib_results:
+                if use_mathlib and node.depth < 5:
+                    mathlib_results = await self._search_mathlib(node.goals)
+                    if mathlib_results:
+                        candidates = generate_candidates(
+                            goals=node.goals,
+                            depth=node.depth,
+                            mathlib_results=mathlib_results,
+                        )
+
+                if use_lsp and node.depth < 3:
+                    existing = set(candidates)
+                    lsp_tactics = await self._fetch_lsp_tactics(
+                        node, existing, timeout=5.0,
+                    )
+                    if lsp_tactics:
+                        candidates.extend(lsp_tactics)
+                        logger.debug(
+                            "LSP added %d tactics at depth %d",
+                            len(lsp_tactics), node.depth,
+                        )
+
+                children = await self.expand(node, candidates)
+                attempts += 1
+
+                for child in children:
+                    if child.is_complete:
+                        tactic_block = "\n  ".join(child.path)
+                        proof_code = f"{self.theorem} := by\n  {tactic_block}"
+                        return SearchResult(
+                            success=True,
+                            proof_tactics=child.path,
+                            proof_code=proof_code,
+                            nodes_explored=self._explored,
+                            max_depth=child.depth,
+                            total_time=time.monotonic() - start,
+                        )
+                    child.score = ucb_adjusted_score(child)
+                    heapq.heappush(self._frontier, child)
+            else:
+                # --- Parallel expansion ---
+                # Pop up to `parallel` nodes from the frontier
+                batch_nodes: list[ProofNode] = []
+                while self._frontier and len(batch_nodes) < parallel:
+                    node = heapq.heappop(self._frontier)
+                    if node.depth >= self.max_depth:
+                        continue
+                    # Skip nodes too deep for efficient replay
+                    if node.depth > self.MAX_REPLAY_DEPTH:
+                        continue
+                    batch_nodes.append(node)
+
+                if not batch_nodes:
+                    break
+
+                # Update visit counts for all batch nodes
+                for node in batch_nodes:
+                    node.visits += 1
+                    ancestor = node.parent
+                    while ancestor is not None:
+                        ancestor.visits += 1
+                        ancestor = ancestor.parent
+                    max_depth_seen = max(max_depth_seen, node.depth)
+
+                # Generate candidates for each node
+                candidates_per_node: list[list[str]] = []
+                for node in batch_nodes:
                     candidates = generate_candidates(
                         goals=node.goals,
                         depth=node.depth,
-                        mathlib_results=mathlib_results,
                     )
 
-            # Optionally fetch LSP tactic completions (shallow depths only)
-            if use_lsp and node.depth < 3:
-                existing = set(candidates)
-                lsp_tactics = await self._fetch_lsp_tactics(
-                    node, existing, timeout=5.0,
+                    if use_mathlib and node.depth < 5:
+                        mathlib_results = await self._search_mathlib(node.goals)
+                        if mathlib_results:
+                            candidates = generate_candidates(
+                                goals=node.goals,
+                                depth=node.depth,
+                                mathlib_results=mathlib_results,
+                            )
+
+                    if use_lsp and node.depth < 3:
+                        existing = set(candidates)
+                        lsp_tactics = await self._fetch_lsp_tactics(
+                            node, existing, timeout=5.0,
+                        )
+                        if lsp_tactics:
+                            candidates.extend(lsp_tactics)
+
+                    candidates_per_node.append(candidates)
+
+                # Get the pool (use the one supplied at init, or create/get global)
+                pool = self.pool
+                if pool is None:
+                    pool = await get_pool(
+                        max_size=parallel, full_mathlib=True,
+                    )
+
+                # Expand all nodes in parallel
+                all_children = await self.expand_parallel(
+                    batch_nodes, pool, candidates_per_node,
                 )
-                if lsp_tactics:
-                    candidates.extend(lsp_tactics)
-                    logger.debug(
-                        "LSP added %d tactics at depth %d",
-                        len(lsp_tactics), node.depth,
-                    )
+                attempts += len(batch_nodes)
 
-            # Expand the node
-            children = await self.expand(node, candidates)
-            attempts += 1
-
-            # Add successful children to frontier
-            for child in children:
-                if child.is_complete:
-                    # Found a proof! The REPL confirmed it — skip slow
-                    # lean_prover verification (saves ~90s per proof).
-                    tactic_block = "\n  ".join(child.path)
-                    proof_code = f"{self.theorem} := by\n  {tactic_block}"
-                    return SearchResult(
-                        success=True,
-                        proof_tactics=child.path,
-                        proof_code=proof_code,
-                        nodes_explored=self._explored,
-                        max_depth=child.depth,
-                        total_time=time.monotonic() - start,
-                    )
-                child.score = ucb_adjusted_score(child)
-                heapq.heappush(self._frontier, child)
+                # Process results
+                for children in all_children:
+                    for child in children:
+                        if child.is_complete:
+                            tactic_block = "\n  ".join(child.path)
+                            proof_code = f"{self.theorem} := by\n  {tactic_block}"
+                            return SearchResult(
+                                success=True,
+                                proof_tactics=child.path,
+                                proof_code=proof_code,
+                                nodes_explored=self._explored,
+                                max_depth=child.depth,
+                                total_time=time.monotonic() - start,
+                            )
+                        child.score = ucb_adjusted_score(child)
+                        heapq.heappush(self._frontier, child)
 
         # Search exhausted
         return SearchResult(
@@ -481,6 +781,8 @@ async def prove_with_search(
     use_mathlib: bool = True,
     use_lsp: bool = False,
     session: LeanREPLSession | None = None,
+    parallel: int = 1,
+    pool: REPLSessionPool | None = None,
 ) -> SearchResult:
     """High-level API: prove a theorem using best-first search.
 
@@ -493,12 +795,18 @@ async def prove_with_search(
         use_lsp: Whether to use Lean LSP tactic completions at shallow depths.
         session: Optional pre-initialized REPL session. If None, creates and
                  manages a singleton session (which is stopped on completion).
+        parallel: Number of frontier nodes to expand concurrently (default 1
+                  for backward-compatible sequential behaviour).
+        pool: Optional pre-initialized ``REPLSessionPool``.  When *parallel* > 1
+              and no pool is given, one is created automatically via ``get_pool()``.
 
     Returns:
         SearchResult with proof details.
     """
-    owns_session = session is None
-    tree = ProofSearchTree(theorem, max_depth=max_depth, session=session)
+    owns_session = session is None and parallel <= 1
+    tree = ProofSearchTree(
+        theorem, max_depth=max_depth, session=session, pool=pool,
+    )
 
     try:
         result = await tree.best_first_search(
@@ -506,9 +814,10 @@ async def prove_with_search(
             timeout=timeout,
             use_mathlib=use_mathlib,
             use_lsp=use_lsp,
+            parallel=parallel,
         )
     finally:
-        # Only clean up if we created the session ourselves
+        # Only clean up if we created the session ourselves (sequential mode)
         if owns_session:
             await stop_session()
 

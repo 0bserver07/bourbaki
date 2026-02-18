@@ -62,6 +62,9 @@ class AutonomousSearchConfig:
         use_ensemble: bool = False,
         # LSP tactic completions (5th candidate source in search tree)
         use_lsp: bool = False,
+        # Parallel tactic expansion: number of frontier nodes to expand
+        # concurrently using the REPL session pool. 1 = sequential (default).
+        parallel_sessions: int = 1,
     ):
         self.max_iterations = max_iterations
         self.max_hours = max_hours
@@ -86,6 +89,7 @@ class AutonomousSearchConfig:
         self.multi_agent_retries = multi_agent_retries
         self.use_ensemble = use_ensemble
         self.use_lsp = use_lsp
+        self.parallel_sessions = parallel_sessions
 
 
 class AutonomousSearch:
@@ -357,6 +361,7 @@ class AutonomousSearch:
                 max_depth=self._config.search_tree_max_depth,
                 use_mathlib=True,
                 use_lsp=self._config.use_lsp,
+                parallel=self._config.parallel_sessions,
             )
 
             self._iteration += 1

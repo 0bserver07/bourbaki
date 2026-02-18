@@ -223,6 +223,104 @@ class LeanREPLSession:
 
         return await self._read_response(timeout=timeout)
 
+    async def replay_tactics(
+        self, theorem: str, tactics: list[str], timeout: float = 120,
+    ) -> dict[str, Any]:
+        """Replay a tactic history to reach a specific proof state.
+
+        Initializes the theorem with ``sorry`` to get the initial proof state,
+        then applies each tactic in sequence.  Returns the final state
+        (proof_state, goals) or an error dict.
+
+        This is used for parallel expansion: each REPL session has its own
+        proof-state IDs, so to expand a node in a different session we must
+        replay the tactic history that produced that node.
+
+        Args:
+            theorem: The Lean 4 theorem statement (e.g. ``theorem foo : 1 + 1 = 2``).
+            tactics: Ordered list of tactics to replay.
+            timeout: Per-command timeout in seconds.
+
+        Returns:
+            Dict with ``success``, ``proofState``, ``goals`` on success,
+            or ``success: False`` with ``error`` on failure.
+        """
+        if not self.is_running:
+            await self.start()
+        await self.ensure_initialized()
+
+        # Step 1: Initialize the theorem with sorry to get the initial proof state
+        stmt = theorem if "sorry" in theorem else theorem.rstrip().rstrip(":=") + " := by sorry"
+        result = await self.send_cmd(stmt, timeout=timeout)
+
+        if "env" in result:
+            self.env_id = result["env"]
+
+        # Extract the initial proof state from sorries
+        sorries = result.get("sorries", [])
+        if not sorries:
+            # Check for errors
+            messages = result.get("messages", [])
+            error_msgs = [
+                m.get("data", "") for m in messages
+                if m.get("severity") == "error"
+            ]
+            if error_msgs:
+                return {
+                    "success": False,
+                    "error": f"Failed to initialize theorem: {'; '.join(error_msgs)}",
+                }
+            # No sorries and no errors — theorem might be trivially solved
+            return {
+                "success": True,
+                "proofState": 0,
+                "goals": [],
+            }
+
+        ps = sorries[0]
+        if isinstance(ps, dict):
+            proof_state = ps.get("proofState", 0)
+            if "goals" in ps:
+                goals = ps["goals"]
+            elif "goal" in ps:
+                goals = [ps["goal"]] if ps["goal"] else []
+            else:
+                goals = []
+        else:
+            proof_state = 0
+            goals = []
+
+        # Step 2: Replay each tactic sequentially
+        for i, tactic in enumerate(tactics):
+            tactic_result = await self.send_tactic(tactic, proof_state, timeout=timeout)
+
+            if "error" in tactic_result or "message" in tactic_result:
+                error_msg = tactic_result.get("error") or tactic_result.get("message", "")
+                # A response is a genuine error when it has an error/message AND
+                # either has no goals key at all or has non-empty goals.  An empty
+                # goals list *with* an explicit "goals" key and no error means the
+                # proof state completed successfully.
+                has_explicit_goals = "goals" in tactic_result
+                goals_empty = has_explicit_goals and tactic_result["goals"] == []
+                if error_msg and not goals_empty:
+                    return {
+                        "success": False,
+                        "error": f"Replay failed at tactic {i} ({tactic!r}): {error_msg}",
+                        "failed_at": i,
+                    }
+
+            new_ps = tactic_result.get("proofState")
+            if new_ps is not None:
+                proof_state = new_ps
+
+            goals = tactic_result.get("goals", goals)
+
+        return {
+            "success": True,
+            "proofState": proof_state,
+            "goals": goals,
+        }
+
 
 def _find_repl_binary() -> Path | None:
     """Find the lean4-repl binary."""
