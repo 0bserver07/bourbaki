@@ -72,12 +72,14 @@ class LeanREPLSession:
             raise RuntimeError("lake not found in PATH")
 
         # Must run via `lake env` so Lean can resolve Mathlib imports
+        # Use 4MB buffer to handle large Lean responses (default 64KB is too small)
         self.proc = await asyncio.create_subprocess_exec(
             lake_bin, "env", str(repl_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(LEAN_PROJECT_DIR),
+            limit=4 * 1024 * 1024,
         )
         self.env_id = 0
         self._initialized = False
