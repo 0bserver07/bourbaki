@@ -181,6 +181,7 @@ def generate_mathlib_queries(goals: list[str]) -> list[tuple[str, str]]:
     """Generate mathlib_search queries based on goal structure.
 
     Returns list of (query, mode) tuples for mathlib_search.
+    Includes semantic, type, and natural language queries.
     """
     if not goals:
         return []
@@ -192,11 +193,13 @@ def generate_mathlib_queries(goals: list[str]) -> list[tuple[str, str]]:
     goal_type_match = re.search(r"⊢\s*(.+)", primary_goal)
     goal_type = goal_type_match.group(1).strip() if goal_type_match else primary_goal
 
-    # Type signature search — most precise
+    # Semantic search — best for goal-state-aware retrieval (hybrid ranking)
+    queries.append((goal_type, "semantic"))
+
+    # Type signature search — most precise for exact type matching
     queries.append((goal_type, "type"))
 
-    # Natural language search — broader
-    # Simplify the goal for natural language
+    # Natural language search — broader, catches differently-named lemmas
     nl_query = goal_type
     nl_query = re.sub(r"[∀∃].*?,\s*", "", nl_query)  # Strip quantifiers
     nl_query = nl_query.replace("→", "implies").replace("↔", "iff")

@@ -298,15 +298,24 @@ class ProofSearchTree:
         )
 
     async def _search_mathlib(self, goals: list[str]) -> list[dict[str, Any]]:
-        """Search Mathlib for lemmas relevant to the current goals."""
+        """Search Mathlib for lemmas relevant to the current goals.
+
+        Tries semantic mode first (best for goal-state queries), then
+        falls back to type/natural. Deduplicates results by lemma name.
+        """
         queries = generate_mathlib_queries(goals)
         results: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
 
-        for query, mode in queries[:2]:  # Limit to 2 queries per state
+        for query, mode in queries[:3]:  # Up to 3 queries (semantic, type, natural)
             try:
                 result = await mathlib_search(query=query, mode=mode, max_results=3)
                 if result.get("success"):
-                    results.extend(result.get("results", []))
+                    for hit in result.get("results", []):
+                        name = hit.get("name", "")
+                        if name and name not in seen_names:
+                            seen_names.add(name)
+                            results.append(hit)
             except Exception:
                 continue
 
