@@ -177,6 +177,73 @@ def generate_candidates(
     return candidates
 
 
+def generate_correction_candidates(
+    failed_tactic: str,
+    error_msg: str,
+    goals: list[str],
+) -> list[str]:
+    """Generate correction candidates based on a failed tactic and its error.
+
+    Implements Goedel-V2-style error-conditioned repair: instead of blindly
+    retrying, use the error message to guide the next attempt.
+
+    Args:
+        failed_tactic: The tactic that failed.
+        error_msg: The Lean error message.
+        goals: Current remaining goals.
+
+    Returns:
+        List of repair tactic candidates (may be empty if no repair is applicable).
+    """
+    corrections: list[str] = []
+    err = error_msg.lower()
+
+    # Unknown identifier → try with simp or norm_num preprocessing
+    if "unknown identifier" in err or "unknown constant" in err:
+        corrections.append(f"simp only [] <;> {failed_tactic}")
+        corrections.append(f"norm_cast <;> {failed_tactic}")
+        # Extract the unknown name for a targeted search hint
+        name_match = re.search(r"unknown (?:identifier|constant) '([^']+)'", error_msg)
+        if name_match:
+            corrections.append(f"open {name_match.group(1).rsplit('.', 1)[0]} in {failed_tactic}")
+
+    # Type mismatch → try with cast or conversion
+    elif "type mismatch" in err:
+        corrections.append(f"norm_cast <;> {failed_tactic}")
+        corrections.append(f"push_cast <;> {failed_tactic}")
+        corrections.append(f"simp only [] <;> {failed_tactic}")
+
+    # Unsolved goals → chain with simp_all or aesop
+    elif "unsolved goals" in err or "goals remaining" in err:
+        corrections.append(f"{failed_tactic} <;> simp_all")
+        corrections.append(f"{failed_tactic} <;> aesop")
+        corrections.append(f"{failed_tactic} <;> omega")
+        corrections.append(f"{failed_tactic} <;> norm_num")
+
+    # Tactic failed → try stronger variants
+    elif "tactic" in err and "failed" in err:
+        if failed_tactic == "linarith":
+            corrections.append("nlinarith")
+            corrections.append("nlinarith [sq_nonneg _]")
+        elif failed_tactic == "simp":
+            corrections.append("simp_all")
+            corrections.append("simp [mul_comm, mul_assoc, add_comm]")
+        elif failed_tactic == "omega":
+            corrections.append("norm_num")
+            corrections.append("decide")
+        elif failed_tactic == "ring":
+            corrections.append("ring_nf")
+            corrections.append("field_simp")
+        elif failed_tactic.startswith("exact"):
+            corrections.append(failed_tactic.replace("exact", "apply", 1))
+        elif failed_tactic.startswith("apply"):
+            corrections.append(failed_tactic.replace("apply", "exact", 1))
+
+    # Timeout → skip (no point retrying the same tactic)
+
+    return corrections
+
+
 def generate_mathlib_queries(goals: list[str]) -> list[tuple[str, str]]:
     """Generate mathlib_search queries based on goal structure.
 

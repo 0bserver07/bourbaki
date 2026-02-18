@@ -36,8 +36,18 @@ class ErrorRecord:
 class Scratchpad:
     """Tracks tool calls, summaries, and limits for a single query."""
 
-    tool_call_limit: int = 3
-    tool_call_limits: dict[str, int] = field(default_factory=dict)
+    tool_call_limit: int = 5
+    tool_call_limits: dict[str, int] = field(default_factory=lambda: {
+        "lean_tactic": 25,
+        "lean_prover": 10,
+        "mathlib_search": 10,
+        "symbolic_compute": 8,
+        "autoformalize": 6,
+        "paper_search": 5,
+        "web_search": 5,
+        "sequence_lookup": 5,
+        "skill_invoke": 5,
+    })
     similarity_threshold: float = 0.7
 
     # Internal state

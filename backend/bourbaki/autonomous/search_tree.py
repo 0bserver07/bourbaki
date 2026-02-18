@@ -12,7 +12,6 @@ Reference architectures:
 
 from __future__ import annotations
 
-import asyncio
 import heapq
 import logging
 import math
@@ -21,7 +20,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bourbaki.autonomous.scoring import NoveltyTracker, score_proof_state
-from bourbaki.autonomous.tactics import generate_candidates, generate_mathlib_queries
+from bourbaki.autonomous.tactics import (
+    generate_candidates,
+    generate_correction_candidates,
+    generate_mathlib_queries,
+)
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession, lean_tactic, stop_session
 from bourbaki.tools.mathlib_search import mathlib_search
@@ -142,17 +145,24 @@ class ProofSearchTree:
         self,
         node: ProofNode,
         candidates: list[str],
+        max_corrections: int = 2,
     ) -> list[ProofNode]:
         """Expand a node by trying candidate tactics.
+
+        Uses Goedel-V2-style error-conditioned repair: when a tactic fails,
+        the error message is used to generate targeted correction candidates
+        (up to max_corrections rounds per failed tactic).
 
         Args:
             node: The proof state to expand.
             candidates: Tactic strings to try.
+            max_corrections: Max correction attempts per failed tactic.
 
         Returns:
             List of new child nodes (successful tactic applications only).
         """
         children: list[ProofNode] = []
+        correction_queue: list[tuple[str, str, int]] = []  # (tactic, error, round)
 
         for tactic in candidates:
             result = await lean_tactic(
@@ -165,7 +175,10 @@ class ProofSearchTree:
             self._explored += 1
 
             if not result.get("success"):
-                # Tactic failed — skip but don't add to tree
+                # Queue error-conditioned corrections (round 1)
+                error_msg = result.get("error", "")
+                if error_msg and max_corrections > 0:
+                    correction_queue.append((tactic, error_msg, 1))
                 continue
 
             new_goals = result.get("goals", [])
@@ -186,13 +199,63 @@ class ProofSearchTree:
             )
 
             node.children.append(child)
-            node.visits += 1
             children.append(child)
 
             # If proof is complete, don't add more children
             if child.is_complete:
                 logger.info("Proof complete at depth %d: %s", child.depth, child.path)
                 return [child]
+
+        # Error-conditioned correction loop (Goedel-V2 style)
+        seen_corrections: set[str] = set()
+        while correction_queue:
+            failed_tactic, error_msg, round_num = correction_queue.pop(0)
+            if round_num > max_corrections:
+                continue
+
+            repairs = generate_correction_candidates(failed_tactic, error_msg, node.goals)
+            for repair in repairs:
+                if repair in seen_corrections:
+                    continue
+                seen_corrections.add(repair)
+
+                result = await lean_tactic(
+                    goal=self.theorem,
+                    tactic=repair,
+                    proof_state=node.proof_state,
+                    session=self.session,
+                )
+                self._explored += 1
+
+                if not result.get("success"):
+                    # Queue for another correction round if allowed
+                    if round_num < max_corrections:
+                        repair_error = result.get("error", "")
+                        if repair_error and repair_error != error_msg:
+                            correction_queue.append((repair, repair_error, round_num + 1))
+                    continue
+
+                new_goals = result.get("goals", [])
+                new_ps = result.get("proofState", node.proof_state)
+
+                if self._novelty_tracker.has_seen(new_goals) and new_goals:
+                    continue
+
+                child = ProofNode(
+                    proof_state=new_ps,
+                    goals=new_goals,
+                    tactic_history=node.tactic_history + [repair],
+                    parent=node,
+                    score=score_proof_state(new_goals, node.depth + 1, self._novelty_tracker),
+                    depth=node.depth + 1,
+                    tactic=repair,
+                )
+                node.children.append(child)
+                children.append(child)
+
+                if child.is_complete:
+                    logger.info("Proof complete via correction at depth %d: %s", child.depth, child.path)
+                    return [child]
 
         return children
 
@@ -243,6 +306,14 @@ class ProofSearchTree:
 
             # Pop the most promising node
             node = heapq.heappop(self._frontier)
+
+            # Increment visits on this node (selected for expansion)
+            node.visits += 1
+            # Propagate visit count up to ancestors for UCB
+            ancestor = node.parent
+            while ancestor is not None:
+                ancestor.visits += 1
+                ancestor = ancestor.parent
 
             # Skip if too deep
             if node.depth >= self.max_depth:
