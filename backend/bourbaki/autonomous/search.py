@@ -60,6 +60,8 @@ class AutonomousSearchConfig:
         multi_agent_timeout: float = 120.0,
         multi_agent_retries: int = 3,
         use_ensemble: bool = False,
+        # LSP tactic completions (5th candidate source in search tree)
+        use_lsp: bool = False,
     ):
         self.max_iterations = max_iterations
         self.max_hours = max_hours
@@ -83,6 +85,7 @@ class AutonomousSearchConfig:
         self.multi_agent_timeout = multi_agent_timeout
         self.multi_agent_retries = multi_agent_retries
         self.use_ensemble = use_ensemble
+        self.use_lsp = use_lsp
 
 
 class AutonomousSearch:
@@ -353,6 +356,7 @@ class AutonomousSearch:
                 timeout=self._config.max_hours * 3600,
                 max_depth=self._config.search_tree_max_depth,
                 use_mathlib=True,
+                use_lsp=self._config.use_lsp,
             )
 
             self._iteration += 1

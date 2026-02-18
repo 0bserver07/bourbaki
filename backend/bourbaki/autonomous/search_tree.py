@@ -12,6 +12,7 @@ Reference architectures:
 
 from __future__ import annotations
 
+import asyncio
 import heapq
 import logging
 import math
@@ -25,6 +26,7 @@ from bourbaki.autonomous.tactics import (
     generate_correction_candidates,
     generate_mathlib_queries,
 )
+from bourbaki.tools.lean_lsp_tools import lsp_suggest_tactics
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession, lean_tactic, stop_session
 from bourbaki.tools.mathlib_search import mathlib_search
@@ -259,11 +261,53 @@ class ProofSearchTree:
 
         return children
 
+    async def _fetch_lsp_tactics(
+        self,
+        node: ProofNode,
+        existing: set[str],
+        timeout: float = 5.0,
+    ) -> list[str]:
+        """Fetch tactic suggestions from the Lean LSP, deduped against *existing*.
+
+        Constructs a Lean source with the current tactic history ending in
+        ``sorry``, then asks the LSP for completions at the sorry position.
+
+        Args:
+            node: Current proof node (uses tactic_history for context).
+            existing: Set of tactic strings already in the candidate list.
+            timeout: Maximum seconds to wait for the LSP response.
+
+        Returns:
+            New tactic strings not already in *existing* (may be empty).
+        """
+        # Build Lean code: theorem statement + tactics so far + sorry
+        tactic_lines = node.tactic_history + ["sorry"]
+        tactic_block = "\n  ".join(tactic_lines)
+        code = f"{self.theorem} := by\n  {tactic_block}"
+
+        try:
+            suggestions = await asyncio.wait_for(
+                lsp_suggest_tactics(theorem=code),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.debug("LSP tactic fetch failed (depth=%d): %s", node.depth, exc)
+            return []
+
+        # Deduplicate against what we already have
+        new_tactics: list[str] = []
+        for s in suggestions:
+            s = s.strip()
+            if s and s not in existing:
+                new_tactics.append(s)
+        return new_tactics
+
     async def best_first_search(
         self,
         budget: int = 100,
         timeout: float = 300.0,
         use_mathlib: bool = True,
+        use_lsp: bool = False,
     ) -> SearchResult:
         """Run best-first search to find a proof.
 
@@ -272,6 +316,8 @@ class ProofSearchTree:
                     all candidate tactics for one proof state).
             timeout: Maximum time in seconds.
             use_mathlib: Whether to query mathlib_search for candidates.
+            use_lsp: Whether to query the Lean LSP for tactic completions
+                     at shallow depths (depth < 3).
 
         Returns:
             SearchResult with success/failure details.
@@ -335,6 +381,19 @@ class ProofSearchTree:
                         goals=node.goals,
                         depth=node.depth,
                         mathlib_results=mathlib_results,
+                    )
+
+            # Optionally fetch LSP tactic completions (shallow depths only)
+            if use_lsp and node.depth < 3:
+                existing = set(candidates)
+                lsp_tactics = await self._fetch_lsp_tactics(
+                    node, existing, timeout=5.0,
+                )
+                if lsp_tactics:
+                    candidates.extend(lsp_tactics)
+                    logger.debug(
+                        "LSP added %d tactics at depth %d",
+                        len(lsp_tactics), node.depth,
                     )
 
             # Expand the node
@@ -420,6 +479,7 @@ async def prove_with_search(
     timeout: float = 300.0,
     max_depth: int = 30,
     use_mathlib: bool = True,
+    use_lsp: bool = False,
     session: LeanREPLSession | None = None,
 ) -> SearchResult:
     """High-level API: prove a theorem using best-first search.
@@ -430,6 +490,7 @@ async def prove_with_search(
         timeout: Maximum seconds.
         max_depth: Maximum proof depth.
         use_mathlib: Whether to search Mathlib for lemmas.
+        use_lsp: Whether to use Lean LSP tactic completions at shallow depths.
         session: Optional pre-initialized REPL session. If None, creates and
                  manages a singleton session (which is stopped on completion).
 
@@ -444,6 +505,7 @@ async def prove_with_search(
             budget=budget,
             timeout=timeout,
             use_mathlib=use_mathlib,
+            use_lsp=use_lsp,
         )
     finally:
         # Only clean up if we created the session ourselves
