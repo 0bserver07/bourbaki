@@ -50,6 +50,11 @@ class AutonomousSearchConfig:
         decomposition_max_depth: int = 2,
         decomposition_max_sketches: int = 3,
         decomposition_subgoal_budget: int = 50,
+        # Phase 2.5: Multi-agent coordination
+        use_multi_agent: bool = False,
+        multi_agent_timeout: float = 120.0,
+        multi_agent_retries: int = 3,
+        use_ensemble: bool = False,
     ):
         self.max_iterations = max_iterations
         self.max_hours = max_hours
@@ -64,6 +69,10 @@ class AutonomousSearchConfig:
         self.decomposition_max_depth = decomposition_max_depth
         self.decomposition_max_sketches = decomposition_max_sketches
         self.decomposition_subgoal_budget = decomposition_subgoal_budget
+        self.use_multi_agent = use_multi_agent
+        self.multi_agent_timeout = multi_agent_timeout
+        self.multi_agent_retries = multi_agent_retries
+        self.use_ensemble = use_ensemble
 
 
 class AutonomousSearch:
@@ -358,6 +367,63 @@ class AutonomousSearch:
                     "strategy": "best-first-search",
                     "success": False,
                     "insight": f"Explored {search_result.nodes_explored} proof states without finding a proof",
+                })
+
+        # Phase 2.5: Multi-agent coordination (if enabled)
+        if (
+            self._config.use_multi_agent
+            and self._problem
+            and self._problem.get("lean_statement")
+        ):
+            from bourbaki.agent.coordinator import ProofCoordinator
+
+            self._emit({
+                "type": "strategy_attempt",
+                "strategy": "multi-agent",
+                "approach": "Coordinated multi-agent proof construction",
+            })
+
+            coordinator = ProofCoordinator(model=settings.default_model)
+
+            if self._config.use_ensemble:
+                coord_result = await coordinator.ensemble_prove(
+                    theorem=self._problem["lean_statement"],
+                    timeout=self._config.multi_agent_timeout,
+                )
+            else:
+                coord_result = await coordinator.prove(
+                    theorem=self._problem["lean_statement"],
+                    timeout=self._config.multi_agent_timeout,
+                    max_retries=self._config.multi_agent_retries,
+                )
+
+            self._iteration += 1
+
+            if coord_result.success and coord_result.proof_code:
+                self._proof_state = {
+                    "complete": True,
+                    "proof_code": coord_result.proof_code,
+                }
+                self._insights.append(
+                    f"Multi-agent proof found: {coord_result.agent_stats}"
+                )
+                self._emit({
+                    "type": "completed",
+                    "success": True,
+                    "result": coord_result.proof_code,
+                })
+                self._status = "completed"
+                return
+            else:
+                self._insights.append(
+                    f"Multi-agent failed: {coord_result.error} "
+                    f"(stats: {coord_result.agent_stats})"
+                )
+                self._emit({
+                    "type": "strategy_result",
+                    "strategy": "multi-agent",
+                    "success": False,
+                    "insight": coord_result.error or "Multi-agent approach failed",
                 })
 
         # Phase 2: Strategy rotation (original approach)
