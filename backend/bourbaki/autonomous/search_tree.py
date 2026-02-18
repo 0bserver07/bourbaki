@@ -35,6 +35,7 @@ from bourbaki.tools.lean_repl import (
     lean_tactic,
     stop_session,
 )
+from bourbaki.tools.lemma_library import LemmaEntry, get_lemma_library
 from bourbaki.tools.mathlib_search import mathlib_search
 
 logger = logging.getLogger(__name__)
@@ -826,6 +827,21 @@ async def prove_with_search(
             "Proof found: %d tactics, %d nodes explored, %.1fs",
             len(result.proof_tactics), result.nodes_explored, result.total_time,
         )
+
+        # Save discovered tactic sequence to the persistent lemma library
+        if result.proof_tactics:
+            try:
+                library = get_lemma_library()
+                goal_pattern = tree.root.goals[0] if tree.root and tree.root.goals else theorem
+                library.add(LemmaEntry(
+                    goal_pattern=goal_pattern,
+                    tactics=result.proof_tactics,
+                    source="search_tree",
+                    theorem_context=theorem,
+                ))
+                library.save_if_dirty()
+            except Exception as exc:
+                logger.debug("Failed to save lemma to library: %s", exc)
     else:
         logger.info(
             "Proof not found: %d nodes explored, %.1fs — %s",

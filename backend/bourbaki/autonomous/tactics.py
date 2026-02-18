@@ -119,6 +119,18 @@ def generate_candidates(
 
     primary_goal = goals[0]
 
+    # 0. Check the persistent lemma library for previously-discovered tactics
+    try:
+        from bourbaki.tools.lemma_library import get_lemma_library
+
+        library = get_lemma_library()
+        hits = library.search(primary_goal, max_results=3)
+        for hit in hits:
+            for tactic in hit.tactics:
+                _add(tactic)
+    except Exception:
+        pass  # Library not available — no problem, continue with other sources
+
     # 1. Goal-aware tactics (highest priority — targeted at the goal structure)
     for pattern, tactics in _COMPILED_PATTERNS:
         if pattern.search(primary_goal):
