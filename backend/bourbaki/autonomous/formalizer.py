@@ -26,6 +26,7 @@ class Subgoal:
     label: str                      # e.g., "step_0", "step_1"
     lean_type: str                  # The type of the have statement
     lean_context: str = ""          # Lean code preceding this subgoal
+    depends_on: list[str] = field(default_factory=list)  # Labels of dependencies
     proof_state_id: int | None = None  # REPL proof state ID (set later)
 
 
@@ -34,6 +35,7 @@ class FormalizedSkeleton:
     """Result of formalizing a proof sketch."""
     code: str                       # Full Lean code with sorry placeholders
     subgoals: list[Subgoal]         # Extracted subgoals to solve
+    final_step: str | None = None   # The closing tactic after all haves
     compilation_ok: bool = False    # Whether the skeleton type-checks in Lean
     errors: list[str] = field(default_factory=list)
 
@@ -60,9 +62,12 @@ def build_skeleton_code(theorem: str, sketch: ProofSketch) -> str:
             lines.append(f"  -- Step {i}: {step.statement}")
             lines.append(f"  have {label} : sorry := by sorry")
 
-    # Final step: try to close the proof using the intermediate steps
+    # Final step: use the sketch's final_step if provided, otherwise try closers
     step_labels = [f"step_{i}" for i in range(len(sketch.steps))]
-    if step_labels:
+    if sketch.final_step:
+        lines.append(f"  {sketch.final_step}")
+    elif step_labels:
+        # Try multiple closing strategies as a cascade
         lines.append(f"  exact?")
     else:
         lines.append("  sorry")
@@ -73,8 +78,11 @@ def build_skeleton_code(theorem: str, sketch: ProofSketch) -> str:
 def extract_subgoals_from_code(code: str) -> list[Subgoal]:
     """Extract subgoals (have ... := by sorry) from skeleton code.
 
+    Also detects inter-subgoal dependencies by checking if a subgoal's
+    type references earlier step labels.
+
     Returns:
-        List of Subgoal objects with label and lean_type populated.
+        List of Subgoal objects with label, lean_type, and depends_on populated.
     """
     subgoals: list[Subgoal] = []
 
@@ -85,21 +93,53 @@ def extract_subgoals_from_code(code: str) -> list[Subgoal]:
 
     lines = code.split("\n")
     context_lines: list[str] = []
+    all_labels: list[str] = []
 
     for line in lines:
         match = pattern.search(line)
         if match:
             label = match.group(1)
             lean_type = match.group(2).strip()
+            # Detect dependencies: does this step's type reference earlier labels?
+            depends_on = [
+                prev_label for prev_label in all_labels
+                if prev_label in lean_type
+            ]
             subgoals.append(Subgoal(
                 index=len(subgoals),
                 label=label,
                 lean_type=lean_type,
                 lean_context="\n".join(context_lines),
+                depends_on=depends_on,
             ))
+            all_labels.append(label)
         context_lines.append(line)
 
     return subgoals
+
+
+def extract_final_step(code: str) -> str | None:
+    """Extract the final closing tactic from skeleton code.
+
+    The final step is the last non-sorry, non-have line in the proof body.
+    Returns None if not found or if it's just sorry/exact?.
+    """
+    lines = code.strip().split("\n")
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip if it's a have/sorry line or comment
+        if "have " in stripped and "sorry" in stripped:
+            continue
+        if stripped.startswith("--"):
+            continue
+        if stripped in ("sorry", "exact?"):
+            return None
+        if stripped.startswith(":= by"):
+            continue
+        return stripped
+    return None
 
 
 def stitch_proofs(
@@ -149,10 +189,16 @@ Proof sketch:
 {sketch_text}
 
 Key Mathlib lemmas that may be useful: {lemmas}
+{final_step_hint}
 
-Output ONLY the Lean 4 code, no explanation. The code should type-check
-except for the `sorry` placeholders. Use `have step_0`, `step_1`, etc.
-as labels.
+REQUIREMENTS:
+1. Output ONLY the Lean 4 code, no explanation or markdown wrapping.
+2. Each `have` must have an explicit, well-typed Lean 4 proposition.
+3. Use labels `step_0`, `step_1`, etc.
+4. The skeleton must type-check with sorry placeholders.
+5. Each subgoal should be independently provable — avoid coupling between steps.
+6. Include necessary `import Mathlib` at the top if using Mathlib lemmas.
+7. The final closing tactic should reference the step labels.
 """
 
 
@@ -177,13 +223,17 @@ async def formalize_sketch(
         FormalizedSkeleton with code, subgoals, and compilation status.
     """
     from pydantic_ai import Agent
+    from bourbaki.agent.core import _resolve_model_object
 
     # First attempt: build from sketch directly
     code = build_skeleton_code(theorem, sketch)
     subgoals = extract_subgoals_from_code(code)
+    final_step = extract_final_step(code)
 
     # Try to compile and get REPL feedback
-    skeleton = FormalizedSkeleton(code=code, subgoals=subgoals)
+    skeleton = FormalizedSkeleton(
+        code=code, subgoals=subgoals, final_step=final_step,
+    )
 
     try:
         from bourbaki.tools.lean_repl import lean_tactic
@@ -200,14 +250,19 @@ async def formalize_sketch(
         for i, s in enumerate(sketch.steps)
     )
     lemmas = ", ".join(sketch.key_lemmas) if sketch.key_lemmas else "none specified"
+    final_step_hint = ""
+    if sketch.final_step:
+        final_step_hint = f"Suggested closing tactic: {sketch.final_step}"
     prompt = FORMALIZE_PROMPT.format(
         theorem=theorem, sketch_text=sketch_text, lemmas=lemmas,
+        final_step_hint=final_step_hint,
     )
 
     errors: list[str] = []
+    resolved_model = _resolve_model_object(model)
     for attempt in range(max_retries + 1):
         try:
-            agent: Agent[None, str] = Agent(model, system_prompt=(
+            agent: Agent[None, str] = Agent(resolved_model, system_prompt=(
                 "You are a Lean 4 formalization assistant. Output only valid Lean 4 code."
             ))
 
@@ -221,7 +276,10 @@ async def formalize_sketch(
                 code = generated_code
 
             subgoals = extract_subgoals_from_code(code)
-            skeleton = FormalizedSkeleton(code=code, subgoals=subgoals)
+            final_step = extract_final_step(code)
+            skeleton = FormalizedSkeleton(
+                code=code, subgoals=subgoals, final_step=final_step,
+            )
 
             # Try to compile
             try:

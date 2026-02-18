@@ -45,11 +45,16 @@ class AutonomousSearchConfig:
         use_search_tree: bool = False,
         search_tree_budget: int = 100,
         search_tree_max_depth: int = 30,
-        # Phase 0: Recursive decomposition
+        # Phase 0: Recursive decomposition (HILBERT-style)
         use_decomposition: bool = True,
-        decomposition_max_depth: int = 2,
+        decomposition_max_depth: int = 3,
         decomposition_max_sketches: int = 3,
         decomposition_subgoal_budget: int = 50,
+        decomposition_subgoal_timeout: float = 60.0,
+        decomposition_budget_decay: float = 0.7,
+        decomposition_timeout_decay: float = 0.7,
+        decomposition_verify_stitched: bool = True,
+        decomposition_parallel: bool = True,
         # Phase 2.5: Multi-agent coordination
         use_multi_agent: bool = False,
         multi_agent_timeout: float = 120.0,
@@ -69,6 +74,11 @@ class AutonomousSearchConfig:
         self.decomposition_max_depth = decomposition_max_depth
         self.decomposition_max_sketches = decomposition_max_sketches
         self.decomposition_subgoal_budget = decomposition_subgoal_budget
+        self.decomposition_subgoal_timeout = decomposition_subgoal_timeout
+        self.decomposition_budget_decay = decomposition_budget_decay
+        self.decomposition_timeout_decay = decomposition_timeout_decay
+        self.decomposition_verify_stitched = decomposition_verify_stitched
+        self.decomposition_parallel = decomposition_parallel
         self.use_multi_agent = use_multi_agent
         self.multi_agent_timeout = multi_agent_timeout
         self.multi_agent_retries = multi_agent_retries
@@ -274,9 +284,14 @@ class AutonomousSearch:
             })
 
             decomp_config = DecompositionConfig(
-                max_recursion_depth=self._config.decomposition_max_depth,
+                max_decomposition_depth=self._config.decomposition_max_depth,
                 max_sketches=self._config.decomposition_max_sketches,
                 subgoal_search_budget=self._config.decomposition_subgoal_budget,
+                subgoal_search_timeout=self._config.decomposition_subgoal_timeout,
+                budget_decay_factor=self._config.decomposition_budget_decay,
+                timeout_decay_factor=self._config.decomposition_timeout_decay,
+                verify_stitched=self._config.decomposition_verify_stitched,
+                parallel_subgoals=self._config.decomposition_parallel,
                 model=settings.default_model,
             )
 
@@ -291,11 +306,13 @@ class AutonomousSearch:
                 self._proof_state = {
                     "complete": True,
                     "proof_code": decomp_result.proof_code,
+                    "verified": decomp_result.verified,
                 }
                 self._insights.append(
                     f"Decomposition found proof: {decomp_result.subgoals_solved} subgoals, "
                     f"{decomp_result.sketches_tried} sketches tried, "
-                    f"depth={decomp_result.recursion_depth_reached}"
+                    f"depth={decomp_result.recursion_depth_reached}, "
+                    f"verified={decomp_result.verified}"
                 )
                 self._emit({
                     "type": "completed",

@@ -33,6 +33,7 @@ class ProofSketch:
     strategy: str               # e.g., "induction", "contradiction", "direct"
     steps: list[SketchStep]     # Ordered informal steps
     key_lemmas: list[str] = field(default_factory=list)  # Expected Mathlib lemmas
+    final_step: str | None = None  # Optional tactic to close after all haves
 
 
 @dataclass
@@ -45,35 +46,79 @@ class SketchContext:
 
 
 SKETCH_PROMPT = """\
-You are a mathematical proof planner. Given a Lean 4 theorem statement, produce
-an informal proof sketch broken into small, verifiable steps.
+You are a mathematical proof planner specializing in Lean 4 formalization.
+Given a theorem statement, decompose the proof into small, independently provable steps.
 
 Theorem:
 {theorem}
 
 {context_section}
 
+CRITICAL REQUIREMENTS for each step:
+1. Every step MUST have a "formal_type" — the exact Lean 4 type for a `have` statement.
+   Use fully explicit types with all necessary type annotations.
+2. Each step should be INDEPENDENTLY PROVABLE — it should be possible to prove it
+   using only standard Mathlib tactics (simp, ring, omega, norm_num, linarith, etc.)
+   or a few lines of tactic proof, without needing the proofs of other steps.
+3. Steps should build INTERMEDIATE LEMMAS toward the conclusion. The final step
+   should follow easily from the intermediate results.
+4. Use EXPLICIT type annotations — prefer `(n : Nat)` over implicit arguments.
+5. Each formal_type must be a well-formed Lean 4 proposition that type-checks.
+
 Respond with a JSON object (no markdown wrapping) containing a "sketches" array.
 Each sketch has:
-- "strategy": proof technique name (e.g., "induction", "contradiction", "direct", "cases")
+- "strategy": proof technique name (e.g., "induction", "contradiction", "direct",
+  "cases", "calc", "have_chain")
 - "steps": array of steps, each with:
   - "statement": natural language description of what this step proves
-  - "formal_type": (optional) the Lean 4 type this step would have as a `have` statement
+  - "formal_type": REQUIRED — the Lean 4 type for `have step_N : <formal_type>`
   - "depends_on": (optional) array of 0-indexed step indices this depends on
 - "key_lemmas": array of Mathlib lemma names expected to be useful
+- "final_step": (optional) the Lean tactic to close the proof after all `have` steps
+  (e.g., "exact step_0.trans step_1", "linarith [step_0, step_1]")
 
-Generate 1-3 sketches with different strategies when possible.
-Keep each sketch to 2-6 steps. Prefer smaller decompositions.
+Generate 2-3 diverse sketches using different proof strategies.
+Keep each sketch to 2-5 steps. Fewer, cleaner steps are better than many.
 
-Example response:
+GOOD decomposition example — each step is self-contained:
 {{"sketches": [{{
-  "strategy": "induction",
+  "strategy": "have_chain",
   "steps": [
-    {{"statement": "Base case: show P(0)", "formal_type": "P 0"}},
-    {{"statement": "Inductive step: assuming P(n), show P(n+1)", "formal_type": "P n → P (n + 1)", "depends_on": [0]}}
+    {{"statement": "Establish base inequality", "formal_type": "0 ≤ n * n"}},
+    {{"statement": "Use base to derive main result", "formal_type": "n * n + 1 > 0", "depends_on": [0]}}
   ],
-  "key_lemmas": ["Nat.succ_eq_add_one"]
+  "key_lemmas": ["Nat.zero_le", "Nat.succ_pos"],
+  "final_step": "linarith [step_0, step_1]"
 }}]}}
+
+BAD decomposition (avoid): steps that restate the goal, steps without formal types,
+steps that are not independently provable, overly complex single steps.
+"""
+
+
+SUBGOAL_SKETCH_PROMPT = """\
+You are decomposing a SUBGOAL that arose from a larger proof decomposition.
+The original proof was split into parts, and this particular subgoal could not
+be proved directly. Decompose it into even simpler pieces.
+
+Subgoal to decompose:
+{theorem}
+
+{context_section}
+
+Since this is a subgoal (recursion depth {depth}), keep the decomposition MINIMAL:
+- Use 1-3 steps at most
+- Each step must have an explicit formal_type
+- Prefer using automation-friendly lemmas (things provable by simp, omega, norm_num, ring)
+- If the subgoal looks atomic (directly provable by a single tactic), return an empty
+  sketches array: {{"sketches": []}}
+
+Respond with a JSON object (no markdown wrapping) containing a "sketches" array.
+Each sketch has:
+- "strategy": proof technique name
+- "steps": array with "statement", "formal_type" (REQUIRED), "depends_on"
+- "key_lemmas": Mathlib lemma names
+- "final_step": tactic to close proof after have steps
 """
 
 
@@ -101,22 +146,35 @@ def parse_sketch_response(response: str) -> list[ProofSketch]:
     for s in data.get("sketches", []):
         steps = []
         for step_data in s.get("steps", []):
+            formal_type = step_data.get("formal_type")
+            # Skip steps without formal types — they can't be formalized
+            if not formal_type:
+                logger.debug(
+                    "Skipping step without formal_type: %s",
+                    step_data.get("statement", ""),
+                )
+                continue
             steps.append(SketchStep(
                 statement=step_data.get("statement", ""),
-                formal_type=step_data.get("formal_type"),
+                formal_type=formal_type,
                 depends_on=step_data.get("depends_on", []),
             ))
         sketches.append(ProofSketch(
             strategy=s.get("strategy", "unknown"),
             steps=steps,
             key_lemmas=s.get("key_lemmas", []),
+            final_step=s.get("final_step"),
         ))
 
     return sketches
 
 
 def build_sketch_prompt(context: SketchContext) -> str:
-    """Build the prompt for sketch generation."""
+    """Build the prompt for sketch generation.
+
+    Uses the subgoal-specific prompt at depth > 0, which emphasizes
+    minimal decomposition and atomic steps.
+    """
     context_parts = []
     if context.mathlib_results:
         lemma_names = [r.get("name", "") for r in context.mathlib_results[:5]]
@@ -124,15 +182,25 @@ def build_sketch_prompt(context: SketchContext) -> str:
     if context.previous_attempts:
         context_parts.append(
             "Previous failed approaches (avoid these):\n"
-            + "\n".join(f"- {a}" for a in context.previous_attempts)
+            + "\n".join(f"- {a}" for a in context.previous_attempts[-5:])
         )
-    if context.depth > 0:
+    if context.depth > 0 and context.depth <= 1:
         context_parts.append(
             f"This is a subgoal at recursion depth {context.depth}. "
-            "Keep decomposition minimal (1-3 steps)."
+            "Prefer 1-3 simple steps. If the goal looks directly provable, "
+            "return empty sketches."
         )
 
     context_section = "\n".join(context_parts) if context_parts else ""
+
+    # Use the subgoal-specific prompt for deeper recursion
+    if context.depth >= 2:
+        return SUBGOAL_SKETCH_PROMPT.format(
+            theorem=context.theorem,
+            context_section=context_section,
+            depth=context.depth,
+        )
+
     return SKETCH_PROMPT.format(theorem=context.theorem, context_section=context_section)
 
 
@@ -152,17 +220,25 @@ class LLMSketchGenerator:
         self.model = model
 
     async def generate(self, context: SketchContext) -> list[ProofSketch]:
-        """Generate proof sketches by prompting the LLM."""
+        """Generate proof sketches by prompting the LLM.
+
+        Uses _resolve_model_object for custom provider support.
+        """
         from pydantic_ai import Agent
+        from bourbaki.agent.core import _resolve_model_object
 
         prompt = build_sketch_prompt(context)
-        agent: Agent[None, str] = Agent(self.model, system_prompt=(
-            "You are a proof planning assistant. Output valid JSON only."
+        resolved_model = _resolve_model_object(self.model)
+        agent: Agent[None, str] = Agent(resolved_model, system_prompt=(
+            "You are a proof planning assistant for Lean 4 formalization. "
+            "Output valid JSON only. Every step MUST have a formal_type field."
         ))
 
         try:
             result = await agent.run(prompt)
-            return parse_sketch_response(result.output)
+            sketches = parse_sketch_response(result.output)
+            # Filter out sketches with no usable steps
+            return [s for s in sketches if s.steps]
         except Exception as e:
             logger.error("Sketch generation failed: %s", e)
             return []
