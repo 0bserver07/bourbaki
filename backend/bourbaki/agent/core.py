@@ -49,6 +49,7 @@ from bourbaki.agent.scratchpad import Scratchpad
 from bourbaki.config import settings
 from bourbaki.events import AgentEvent
 from bourbaki.tools.lean_errors import classify_lean_error, classify_lean_errors, format_error_guidance
+from bourbaki.tools.autoformalize import autoformalize
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import lean_tactic
 from bourbaki.tools.mathlib_search import mathlib_search
@@ -264,6 +265,22 @@ def _create_agent(model: str) -> Agent[AgentDependencies, str]:
         result = await web_search(query=query, num_results=num_results, category=category)
         result_str = json.dumps(result, default=str)
         _record_call(ctx, "web_search", {"query": query, "category": category}, result_str, query)
+        return result_str
+
+    @agent.tool(strict=False)
+    async def tool_autoformalize(
+        ctx: RunContext[AgentDependencies],
+        input_text: str,
+        mode: str = "statement",
+        context: str | None = None,
+    ) -> str:
+        """Convert natural language math to Lean 4 code. mode='statement' for theorem declarations, 'proof_step' for tactics."""
+        blocked = _check_scratchpad(ctx, "autoformalize", input_text[:100])
+        if blocked:
+            return blocked
+        result = await autoformalize(input_text=input_text, mode=mode, context=context)
+        result_str = json.dumps(result, default=str)
+        _record_call(ctx, "autoformalize", {"mode": mode, "input_text": input_text[:80]}, result_str, input_text[:100])
         return result_str
 
     @agent.tool(strict=False)
