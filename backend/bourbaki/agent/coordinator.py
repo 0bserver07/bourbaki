@@ -46,7 +46,8 @@ class ProofCoordinator:
         model: str,
         pool: Any = None,  # Optional REPLSessionPool
     ) -> None:
-        self.model = model
+        from bourbaki.agent.core import _resolve_model_object
+        self.model = _resolve_model_object(model)
         self.pool = pool
         self.bus = MessageBus()
         self._stats: dict[str, int] = {
