@@ -20,6 +20,12 @@ Usage:
     # Include answer-sorry problems (excluded by default)
     python -m bourbaki.benchmarks.putnam --include-answer
 
+    # Attempt to solve answer-type problems via the answer generation pipeline
+    python -m bourbaki.benchmarks.putnam --attempt-answers
+
+    # Attempt answers with a specific LLM model
+    python -m bourbaki.benchmarks.putnam --attempt-answers --answer-model glm:glm-5
+
     # Specific problems
     python -m bourbaki.benchmarks.putnam --problems putnam_2023_a1 putnam_2024_a1
 """
@@ -200,6 +206,8 @@ class PutnamBenchmarkResult:
     theorem_only_solved: int = 0
     answer_total: int = 0
     answer_skipped: int = 0
+    answer_attempted: int = 0
+    answer_solved: int = 0
     verified_count: int = 0
     tactic_filtered_count: int = 0
     results: list[ProblemResult] = field(default_factory=list)
@@ -228,6 +236,8 @@ class PutnamBenchmarkResult:
             "theorem_only_pass_rate": round(theorem_only_rate, 4),
             "answer_total": self.answer_total,
             "answer_skipped": self.answer_skipped,
+            "answer_attempted": self.answer_attempted,
+            "answer_solved": self.answer_solved,
             "verified_count": self.verified_count,
             "tactic_filtered_count": self.tactic_filtered_count,
             "total_time_seconds": round(self.total_time_seconds, 2),
@@ -488,6 +498,9 @@ async def run_putnam(
     exclude_answer: bool = True,
     verify_proofs: bool = True,
     verify_timeout: int = 30,
+    attempt_answers: bool = False,
+    answer_model: str = "glm:glm-5",
+    answer_max_attempts: int = 3,
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
 
@@ -503,11 +516,19 @@ async def run_putnam(
         year_range: Filter by year range (inclusive).
         exclude_answer: Skip problems where has_answer=True and answer is
             still ``sorry`` (default True).  These can't be validly solved
-            without filling the answer placeholder.
+            without filling the answer placeholder.  Ignored when
+            ``attempt_answers`` is True.
         verify_proofs: After REPL/search finds a proof, verify it with
             whole-file lean_prover compilation (default True).
         verify_timeout: Timeout in seconds for whole-file verification
             (default 30).
+        attempt_answers: When True, run the answer generation pipeline on
+            answer-sorry problems instead of skipping them.  Overrides
+            ``exclude_answer`` for answer-sorry problems.
+        answer_model: LLM model string for answer generation (default
+            "glm:glm-5").
+        answer_max_attempts: Maximum LLM answer attempts per problem
+            (default 3).
 
     Returns:
         PutnamBenchmarkResult with aggregate and per-problem results.
@@ -537,10 +558,19 @@ async def run_putnam(
     answer_sorry_problems = [p for p in problems if p.answer_is_sorry]
     answer_sorry_count = len(answer_sorry_problems)
 
-    if exclude_answer and answer_sorry_count > 0:
+    # When attempt_answers is set, override exclude_answer for answer-sorry problems
+    effective_exclude_answer = exclude_answer and not attempt_answers
+
+    if effective_exclude_answer and answer_sorry_count > 0:
         logger.info(
             "Excluding %d answer-sorry problems (answer placeholder is sorry)",
             answer_sorry_count,
+        )
+    elif attempt_answers and answer_sorry_count > 0:
+        logger.info(
+            "Will attempt answer generation for %d answer-sorry problems "
+            "(model=%s, max_attempts=%d)",
+            answer_sorry_count, answer_model, answer_max_attempts,
         )
 
     logger.info(
@@ -549,7 +579,9 @@ async def run_putnam(
         stats["year_range"][0],
         stats["year_range"][1],
         answer_sorry_count,
-        " (excluded)" if exclude_answer else "",
+        " (attempting)" if attempt_answers else (
+            " (excluded)" if effective_exclude_answer else ""
+        ),
     )
 
     overall_start = time.monotonic()
@@ -587,22 +619,97 @@ async def run_putnam(
                 ),
             )
 
-            # Skip answer-sorry problems when exclude_answer is set
-            if exclude_answer and problem.answer_is_sorry:
-                result = ProblemResult(
-                    problem_id=problem.id,
-                    year=problem.year,
-                    section=problem.section,
-                    has_answer=problem.has_answer,
-                    solved=False,
-                    skipped=True,
-                    skip_reason="answer_is_sorry",
-                    error="Skipped: answer placeholder is sorry",
-                    duration_seconds=0.0,
-                )
-                results.append(result)
-                logger.info("  SKIPPED (answer-sorry)")
-                continue
+            # Handle answer-sorry problems
+            if problem.answer_is_sorry:
+                if attempt_answers:
+                    # Run the answer generation pipeline
+                    from bourbaki.benchmarks.answer_generator import generate_answer
+
+                    logger.info("  Running answer generation pipeline...")
+                    answer_start = time.monotonic()
+                    try:
+                        answer_result = await generate_answer(
+                            problem=problem,
+                            model=answer_model,
+                            max_attempts=answer_max_attempts,
+                            prove_timeout=timeout,
+                            search_budget=search_budget,
+                            verify_timeout=verify_timeout,
+                        )
+                    except Exception as e:
+                        logger.error("  Answer generation failed: %s", e)
+                        answer_result = None
+
+                    answer_duration = time.monotonic() - answer_start
+
+                    if answer_result is not None and answer_result.verified:
+                        result = ProblemResult(
+                            problem_id=problem.id,
+                            year=problem.year,
+                            section=problem.section,
+                            has_answer=problem.has_answer,
+                            solved=True,
+                            verified=True,
+                            proof_code=(
+                                f"-- answer: {answer_result.answer_code}\n"
+                                + (answer_result.proof_tactics[0] if answer_result.proof_tactics else "")
+                            ),
+                            tactics_used=len(answer_result.proof_tactics),
+                            duration_seconds=answer_duration,
+                        )
+                    elif answer_result is not None and answer_result.theorem_solved:
+                        result = ProblemResult(
+                            problem_id=problem.id,
+                            year=problem.year,
+                            section=problem.section,
+                            has_answer=problem.has_answer,
+                            solved=True,
+                            verified=False,
+                            proof_code=f"-- answer: {answer_result.answer_code}",
+                            tactics_used=len(answer_result.proof_tactics),
+                            duration_seconds=answer_duration,
+                            error="Answer found but verification failed",
+                        )
+                    else:
+                        error_msg = (
+                            answer_result.error
+                            if answer_result is not None
+                            else "Answer generation returned None"
+                        )
+                        result = ProblemResult(
+                            problem_id=problem.id,
+                            year=problem.year,
+                            section=problem.section,
+                            has_answer=problem.has_answer,
+                            solved=False,
+                            error=f"Answer pipeline: {error_msg}",
+                            duration_seconds=answer_duration,
+                        )
+
+                    results.append(result)
+                    status = "SOLVED" if result.solved else "FAILED"
+                    verified_tag = " (verified)" if result.verified else ""
+                    logger.info(
+                        "  ANSWER %s%s (%.2fs)",
+                        status, verified_tag, result.duration_seconds,
+                    )
+                    continue
+
+                elif effective_exclude_answer:
+                    result = ProblemResult(
+                        problem_id=problem.id,
+                        year=problem.year,
+                        section=problem.section,
+                        has_answer=problem.has_answer,
+                        solved=False,
+                        skipped=True,
+                        skip_reason="answer_is_sorry",
+                        error="Skipped: answer placeholder is sorry",
+                        duration_seconds=0.0,
+                    )
+                    results.append(result)
+                    logger.info("  SKIPPED (answer-sorry)")
+                    continue
 
             if use_search:
                 result = await attempt_putnam_search(
@@ -691,6 +798,10 @@ async def run_putnam(
         if r.solved:
             by_decade[decade]["solved"] += 1
 
+    # Answer-specific accounting
+    answer_attempted_results = [r for r in non_skipped if r.has_answer]
+    answer_solved_results = [r for r in answer_attempted_results if r.solved]
+
     non_skipped_count = len(non_skipped)
     benchmark = PutnamBenchmarkResult(
         total=non_skipped_count,
@@ -698,8 +809,10 @@ async def run_putnam(
         pass_rate=solved_count / non_skipped_count if non_skipped_count else 0.0,
         theorem_only_total=len(theorem_only),
         theorem_only_solved=len(theorem_only_solved),
-        answer_total=len(answer_attempted) + len(answer_skipped),
+        answer_total=len(answer_attempted_results) + len(answer_skipped),
         answer_skipped=len(answer_skipped),
+        answer_attempted=len(answer_attempted_results),
+        answer_solved=len(answer_solved_results),
         verified_count=verified_count,
         tactic_filtered_count=tactic_filtered,
         results=results,
@@ -721,6 +834,9 @@ async def run_putnam(
             "search_budget": search_budget if use_search else None,
             "use_mathlib_search": use_mathlib_search if use_search else None,
             "exclude_answer": exclude_answer,
+            "attempt_answers": attempt_answers,
+            "answer_model": answer_model if attempt_answers else None,
+            "answer_max_attempts": answer_max_attempts if attempt_answers else None,
             "verify_proofs": verify_proofs,
             "verify_timeout": verify_timeout,
         },
@@ -744,11 +860,11 @@ async def run_putnam(
         len(theorem_only),
         len(theorem_only_solved) / len(theorem_only) * 100 if theorem_only else 0,
     )
-    if answer_attempted:
+    if answer_attempted_results:
         logger.info(
             "Answer problems attempted: %d (solved: %d)",
-            len(answer_attempted),
-            sum(1 for r in answer_attempted if r.solved),
+            len(answer_attempted_results),
+            len(answer_solved_results),
         )
     if answer_skipped:
         logger.info(
@@ -870,6 +986,23 @@ def main() -> None:
         default=30,
         help="Timeout for whole-file verification (seconds, default 30)",
     )
+    parser.add_argument(
+        "--attempt-answers",
+        action="store_true",
+        help="Run the answer generation pipeline on answer-sorry problems",
+    )
+    parser.add_argument(
+        "--answer-model",
+        type=str,
+        default="glm:glm-5",
+        help="LLM model for answer generation (default: glm:glm-5)",
+    )
+    parser.add_argument(
+        "--answer-max-attempts",
+        type=int,
+        default=3,
+        help="Max LLM attempts per answer problem (default: 3)",
+    )
     args = parser.parse_args()
 
     # Determine problem IDs
@@ -895,6 +1028,9 @@ def main() -> None:
             exclude_answer=not args.include_answer,
             verify_proofs=not args.no_verify,
             verify_timeout=args.verify_timeout,
+            attempt_answers=args.attempt_answers,
+            answer_model=args.answer_model,
+            answer_max_attempts=args.answer_max_attempts,
         )
     )
 
