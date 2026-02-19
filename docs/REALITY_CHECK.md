@@ -89,4 +89,66 @@ coordination gets you surprisingly far.
 
 ---
 
+## 2026-02-19 — PutnamBench Audit (0% verified)
+
+### What happened
+
+We ran PutnamBench (672 Putnam competition problems). The initial run reported
+95.4% (641/672). Audit revealed this was entirely inflated:
+
+- **224 answer-sorry problems** had `abbrev ... := sorry` placeholders. With an
+  unconstrained answer, theorems are trivially satisfiable. Not valid solves.
+- **49 suspicious tactics** like `exact Lean.defaultMaxRecDepth` — Lean internals,
+  not mathematical proofs.
+- **All 317 remaining "proofs" failed lean_prover verification.**
+
+### The REPL false positive problem
+
+Our search tree uses the Lean REPL to detect proof completion. The REPL reported
+"no remaining goals" for tactics like `simp`, `exact mem_of`, `norm_num` on
+PutnamBench problems. But when the same code was compiled as a standalone Lean
+file via `lean_prover`, every single proof was rejected.
+
+This is a **systematic false positive** specific to PutnamBench's more complex
+formulations. The REPL's sorry-initialized proof states have different elaboration
+context than standalone compilation. Tactics that appear to close goals in the
+REPL don't actually produce valid proof terms.
+
+### Verified results
+
+| Benchmark | REPL-reported | lean_prover verified | Status |
+|-----------|--------------|---------------------|--------|
+| miniF2F valid | 224/244 (91.8%) | **Pending verification** | Spot checks pass |
+| miniF2F test | 230/244 (94.3%) | **Pending verification** | Spot checks pass |
+| PutnamBench (theorem-only) | 317/326 | **0/326 (0%)** | All false positives |
+| PutnamBench (answer-sorry) | 224/346 | Excluded | Need answer generation |
+
+### Why miniF2F is probably fine but PutnamBench isn't
+
+miniF2F problems are simpler — standard competition math with straightforward
+type signatures. The REPL detection works correctly for these. Spot-checked
+`norm_num` proofs verified successfully with lean_prover.
+
+PutnamBench problems use deeper Mathlib types (MeasureTheory, Topology,
+EuclideanSpace), complex dependent types, and longer theorem statements. The
+gap between REPL elaboration and standalone compilation is wider for these.
+
+### Lessons learned
+
+1. **Always verify with lean_prover.** REPL-based detection is an approximation.
+2. **Set verification timeout to 150s+.** Mathlib import alone takes 75-100s.
+3. **Answer-sorry problems need answer generation.** Can't just skip them.
+4. **Filter non-proof tactics.** Lean internals aren't mathematical proofs.
+5. **PutnamBench is genuinely harder.** HILBERT's 70% with a trained 32B model
+   puts our 0% in context — these problems are beyond tactic automation.
+
+### What this means for claimed results
+
+The miniF2F numbers (91.8% valid, 94.3% test) should be re-verified with
+lean_prover to produce bulletproof numbers. Until then, they should be treated
+as "REPL-reported" with the caveat that REPL detection has known false positive
+issues on complex problems.
+
+---
+
 *This document exists to keep us honest. Update it whenever results change.*
