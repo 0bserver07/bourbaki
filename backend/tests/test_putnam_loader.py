@@ -1,4 +1,4 @@
-"""Tests for the PutnamBench loader."""
+"""Tests for the PutnamBench loader and benchmark runner utilities."""
 
 from __future__ import annotations
 
@@ -13,6 +13,12 @@ from bourbaki.benchmarks.putnam_loader import (
     get_putnam_stats,
     load_putnam_problems,
     DEFAULT_PUTNAM_DIR,
+)
+from bourbaki.benchmarks.putnam import (
+    INVALID_TACTICS,
+    _contains_invalid_tactic,
+    ProblemResult,
+    PutnamBenchmarkResult,
 )
 
 
@@ -110,6 +116,7 @@ class TestParseFile:
         assert problem.section == "a"
         assert problem.problem_number == "a1"
         assert not problem.has_answer
+        assert not problem.answer_is_sorry
         assert problem.answer_name is None
         assert "theorem putnam_1962_a1" in problem.statement
         assert "MeasureTheory" in problem.preamble
@@ -124,6 +131,7 @@ class TestParseFile:
         assert problem.id == "putnam_2023_a1"
         assert problem.year == 2023
         assert problem.has_answer
+        assert problem.answer_is_sorry  # answer is := sorry
         assert problem.answer_name == "putnam_2023_a1_solution"
         assert "putnam_2023_a1_solution" in problem.setup_block
 
@@ -132,6 +140,7 @@ class TestParseFile:
         problem = _parse_lean_file(path)
         assert problem is not None
         assert problem.has_answer
+        assert problem.answer_is_sorry  # noncomputable abbrev := sorry
         assert problem.answer_name == "putnam_2024_a1_solution"
 
     def test_def_helper(self, tmp_putnam_dir: Path) -> None:
@@ -202,10 +211,145 @@ class TestStats:
         stats = get_putnam_stats(problems)
         assert stats["total"] == 4
         assert stats["with_answer"] == 2
+        assert stats["answer_sorry"] == 2
         assert stats["pure_theorem"] == 2
         assert "a" in stats["by_section"]
         assert "b" in stats["by_section"]
         assert stats["year_range"] == (1962, 2024)
+
+
+class TestAnswerIsSorry:
+    """Tests for answer_is_sorry detection."""
+
+    def test_answer_sorry_detected(self, tmp_putnam_dir: Path) -> None:
+        """Answer problems with := sorry should have answer_is_sorry=True."""
+        problems = load_putnam_problems(putnam_dir=tmp_putnam_dir)
+        answer_problems = [p for p in problems if p.has_answer]
+        assert len(answer_problems) == 2
+        for p in answer_problems:
+            assert p.answer_is_sorry, f"{p.id} should have answer_is_sorry=True"
+
+    def test_filled_answer_not_sorry(self, tmp_path: Path) -> None:
+        """An answer problem with a concrete value should NOT be answer_is_sorry."""
+        src = tmp_path / "lean4" / "src"
+        src.mkdir(parents=True)
+        (src / "putnam_2023_b2.lean").write_text(textwrap.dedent("""\
+            import Mathlib
+
+            abbrev putnam_2023_b2_solution : ℕ := 42
+
+            theorem putnam_2023_b2 : putnam_2023_b2_solution = 42 :=
+            sorry
+        """))
+        problem = _parse_lean_file(src / "putnam_2023_b2.lean")
+        assert problem is not None
+        assert problem.has_answer
+        assert not problem.answer_is_sorry  # answer is 42, not sorry
+        assert problem.answer_name == "putnam_2023_b2_solution"
+
+    def test_answer_is_sorry_in_to_dict(self, tmp_putnam_dir: Path) -> None:
+        """answer_is_sorry should appear in to_dict output."""
+        path = tmp_putnam_dir / "lean4" / "src" / "putnam_2023_a1.lean"
+        problem = _parse_lean_file(path)
+        assert problem is not None
+        d = problem.to_dict()
+        assert "answer_is_sorry" in d
+        assert d["answer_is_sorry"] is True
+
+    def test_non_answer_not_sorry(self, tmp_putnam_dir: Path) -> None:
+        """Non-answer problems should have answer_is_sorry=False."""
+        path = tmp_putnam_dir / "lean4" / "src" / "putnam_1962_a1.lean"
+        problem = _parse_lean_file(path)
+        assert problem is not None
+        assert not problem.answer_is_sorry
+
+
+class TestTacticFiltering:
+    """Tests for the invalid tactic filter."""
+
+    def test_clean_proof_passes(self) -> None:
+        code = "theorem foo : True := by simp"
+        assert _contains_invalid_tactic(code) is None
+
+    def test_invalid_tactic_detected(self) -> None:
+        code = "theorem foo : Nat := by exact Lean.defaultMaxRecDepth"
+        result = _contains_invalid_tactic(code)
+        assert result == "exact Lean.defaultMaxRecDepth"
+
+    def test_each_invalid_tactic(self) -> None:
+        for tactic in INVALID_TACTICS:
+            code = f"theorem foo := by {tactic}"
+            result = _contains_invalid_tactic(code)
+            assert result == tactic, f"Failed to detect: {tactic}"
+
+    def test_partial_match_not_triggered(self) -> None:
+        # "exact Real.instAdd" should match, but "exact Real.instAddition" should too
+        # because it contains "exact Real.instAdd" as a substring
+        code = "theorem foo := by exact Real.add_comm"
+        assert _contains_invalid_tactic(code) is None
+
+
+class TestProblemResultSerialization:
+    """Tests for ProblemResult.to_dict with new fields."""
+
+    def test_verified_field(self) -> None:
+        r = ProblemResult(
+            problem_id="putnam_2024_a1",
+            year=2024,
+            section="a",
+            solved=True,
+            has_answer=False,
+            verified=True,
+            proof_code="theorem foo := by simp",
+        )
+        d = r.to_dict()
+        assert d["verified"] is True
+        assert d["has_answer"] is False
+        assert "skipped" not in d  # not skipped
+
+    def test_skipped_field(self) -> None:
+        r = ProblemResult(
+            problem_id="putnam_2023_a1",
+            year=2023,
+            section="a",
+            solved=False,
+            has_answer=True,
+            skipped=True,
+            skip_reason="answer_is_sorry",
+        )
+        d = r.to_dict()
+        assert d["skipped"] is True
+        assert d["skip_reason"] == "answer_is_sorry"
+
+
+class TestBenchmarkResultSerialization:
+    """Tests for PutnamBenchmarkResult.to_dict with new fields."""
+
+    def test_new_fields_present(self) -> None:
+        b = PutnamBenchmarkResult(
+            total=10,
+            solved=2,
+            pass_rate=0.2,
+            theorem_only_total=8,
+            theorem_only_solved=2,
+            answer_total=5,
+            answer_skipped=3,
+            verified_count=2,
+            tactic_filtered_count=1,
+        )
+        d = b.to_dict()
+        assert d["theorem_only_total"] == 8
+        assert d["theorem_only_solved"] == 2
+        assert d["theorem_only_pass_rate"] == 0.25
+        assert d["answer_total"] == 5
+        assert d["answer_skipped"] == 3
+        assert d["verified_count"] == 2
+        assert d["tactic_filtered_count"] == 1
+
+    def test_zero_theorem_rate(self) -> None:
+        b = PutnamBenchmarkResult(theorem_only_total=0, theorem_only_solved=0)
+        d = b.to_dict()
+        assert d["theorem_only_pass_rate"] == 0.0
 
 
 class TestRealPutnamBench:

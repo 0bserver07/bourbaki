@@ -78,6 +78,7 @@ class PutnamProblem:
     file_path: str  # Absolute path to source file
     full_lean_code: str  # Complete code for verification (preamble + setup + theorem + sorry)
     has_answer: bool = False  # Whether the problem has an abbrev solution
+    answer_is_sorry: bool = False  # True if the answer abbrev is still := sorry
     answer_name: str | None = None  # e.g. "putnam_2023_a1_solution"
     docstring: str | None = None  # Informal problem statement
 
@@ -102,6 +103,7 @@ class PutnamProblem:
             "imports": self.imports,
             "file_path": self.file_path,
             "has_answer": self.has_answer,
+            "answer_is_sorry": self.answer_is_sorry,
             "answer_name": self.answer_name,
             "docstring": self.docstring,
         }
@@ -257,6 +259,7 @@ def _parse_lean_file(path: Path) -> PutnamProblem | None:
 
     # Detect answer abbreviations
     has_answer = False
+    answer_is_sorry = False
     answer_name = None
     abbrev_match = re.search(
         r"(?:noncomputable\s+)?abbrev\s+(putnam_\w+_solution)\b", content
@@ -264,6 +267,16 @@ def _parse_lean_file(path: Path) -> PutnamProblem | None:
     if abbrev_match:
         has_answer = True
         answer_name = abbrev_match.group(1)
+        # Check if the answer is still := sorry (unfilled placeholder)
+        # The abbrev line looks like:
+        #   abbrev putnam_XXXX_solution : Type := sorry
+        #   noncomputable abbrev putnam_XXXX_solution : Type := sorry
+        # We need to match past the type annotation (which contains `:`)
+        answer_sorry_re = re.search(
+            r"(?:noncomputable\s+)?abbrev\s+" + re.escape(answer_name) + r"\b.*?:=\s*sorry",
+            content,
+        )
+        answer_is_sorry = answer_sorry_re is not None
 
     # Extract theorem statement
     m = _THEOREM_SIMPLE_RE.search(content)
@@ -295,6 +308,7 @@ def _parse_lean_file(path: Path) -> PutnamProblem | None:
         file_path=str(path),
         full_lean_code=full_code,
         has_answer=has_answer,
+        answer_is_sorry=answer_is_sorry,
         answer_name=answer_name,
         docstring=docstring,
     )
@@ -305,12 +319,15 @@ def get_putnam_stats(problems: list[PutnamProblem]) -> dict[str, Any]:
     by_year: dict[int, int] = {}
     by_section: dict[str, int] = {}
     answer_count = 0
+    answer_sorry_count = 0
 
     for p in problems:
         by_year[p.year] = by_year.get(p.year, 0) + 1
         by_section[p.section] = by_section.get(p.section, 0) + 1
         if p.has_answer:
             answer_count += 1
+        if p.answer_is_sorry:
+            answer_sorry_count += 1
 
     # Decade breakdown
     by_decade: dict[str, int] = {}
@@ -324,6 +341,7 @@ def get_putnam_stats(problems: list[PutnamProblem]) -> dict[str, Any]:
         "by_decade": dict(sorted(by_decade.items())),
         "by_section": dict(sorted(by_section.items())),
         "with_answer": answer_count,
+        "answer_sorry": answer_sorry_count,
         "pure_theorem": len(problems) - answer_count,
         "year_range": (
             (min(by_year.keys()), max(by_year.keys())) if by_year else (0, 0)

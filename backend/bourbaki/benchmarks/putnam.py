@@ -5,7 +5,7 @@ Runs the agent on PutnamBench problems (672 Putnam competition problems,
 (HILBERT 70.0%, etc.).
 
 Usage:
-    # Quick test (5 problems)
+    # Quick test (10 problems, mix of answer and non-answer)
     python -m bourbaki.benchmarks.putnam --quick
 
     # Full run with 60s timeout
@@ -16,6 +16,9 @@ Usage:
 
     # Filter by section
     python -m bourbaki.benchmarks.putnam --section a
+
+    # Include answer-sorry problems (excluded by default)
+    python -m bourbaki.benchmarks.putnam --include-answer
 
     # Specific problems
     python -m bourbaki.benchmarks.putnam --problems putnam_2023_a1 putnam_2024_a1
@@ -39,6 +42,7 @@ from bourbaki.benchmarks.putnam_loader import (
     load_putnam_problems,
 )
 from bourbaki.autonomous.search_tree import prove_with_search
+from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession
 
 logger = logging.getLogger(__name__)
@@ -61,17 +65,89 @@ AUTOMATION_TACTICS = [
     "ring_nf",
 ]
 
+# ---------------------------------------------------------------------------
+# Tactic filtering: reject proofs that use suspicious non-proof tactics.
+# These are Lean internals, typeclass instances, or other non-mathematical
+# terms that satisfy the type checker but are not valid proofs.
+# ---------------------------------------------------------------------------
+INVALID_TACTICS = [
+    "exact Lean.defaultMaxRecDepth",
+    "exact Float.toRatParts",
+    "exact instDecidableEqRat",
+    "exact Real.commRing",
+    "exact Real.instAdd",
+    "exact trapezoidal_error",
+]
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 RESULTS_DIR = _PROJECT_ROOT / ".bourbaki" / "benchmarks" / "results"
 
-# Quick-test problems: a mix of years and difficulty levels
+# Quick-test problems: a mix of years, difficulty, and answer/non-answer types
 QUICK_TEST_IDS = [
+    "putnam_1962_a1",
     "putnam_1988_a1",
     "putnam_2000_a1",
     "putnam_2010_a1",
     "putnam_2020_a1",
-    "putnam_2024_a1",
+    "putnam_2023_a1",  # answer problem
+    "putnam_2023_b1",  # answer problem
+    "putnam_2024_a1",  # answer problem
+    "putnam_2024_b1",
+    "putnam_2024_a2",
 ]
+
+
+def _contains_invalid_tactic(proof_code: str) -> str | None:
+    """Check if proof code contains a suspicious non-proof tactic.
+
+    Returns the matched invalid tactic string, or None if clean.
+    """
+    for invalid in INVALID_TACTICS:
+        if invalid in proof_code:
+            return invalid
+    return None
+
+
+async def _verify_whole_file(
+    problem: PutnamProblem,
+    proof_code: str,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Verify a proof via whole-file compilation with lean_prover.
+
+    Builds the full Lean file (imports + preamble + setup + proved theorem)
+    and checks it compiles without errors or sorry.
+
+    Returns:
+        Dict with 'verified' (bool) and 'error' (str | None).
+    """
+    # Build the complete Lean source replacing ``sorry`` with the discovered proof.
+    # proof_code typically looks like: ``<statement> := by <tactic>``
+    parts: list[str] = ["import Mathlib"]
+    if problem.preamble:
+        parts.append(problem.preamble)
+    if problem.setup_block:
+        parts.append(problem.setup_block)
+    parts.append(proof_code)
+
+    full_code = "\n\n".join(parts)
+
+    try:
+        result = await asyncio.wait_for(
+            lean_prover(code=full_code, mode="check", timeout=timeout),
+            timeout=timeout + 5,
+        )
+        verified = result.get("proofComplete", False)
+        if not verified:
+            errors = result.get("errors") or []
+            err_msgs = [e.get("message", "") for e in errors if isinstance(e, dict)]
+            return {
+                "verified": False,
+                "error": "; ".join(err_msgs) if err_msgs else "Verification failed",
+            }
+        return {"verified": True, "error": None}
+    except (asyncio.TimeoutError, Exception) as e:
+        return {"verified": False, "error": f"Verification error: {e}"}
 
 
 @dataclass
@@ -82,24 +158,34 @@ class ProblemResult:
     year: int
     section: str
     solved: bool
+    has_answer: bool = False
+    verified: bool = False
     proof_code: str | None = None
     error: str | None = None
     tactics_used: int = 0
     duration_seconds: float = 0.0
     attempts: int = 0
+    skipped: bool = False
+    skip_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "problem_id": self.problem_id,
             "year": self.year,
             "section": self.section,
             "solved": self.solved,
+            "has_answer": self.has_answer,
+            "verified": self.verified,
             "proof_code": self.proof_code,
             "error": self.error,
             "tactics_used": self.tactics_used,
             "duration_seconds": round(self.duration_seconds, 2),
             "attempts": self.attempts,
         }
+        if self.skipped:
+            d["skipped"] = True
+            d["skip_reason"] = self.skip_reason
+        return d
 
 
 @dataclass
@@ -109,6 +195,13 @@ class PutnamBenchmarkResult:
     total: int = 0
     solved: int = 0
     pass_rate: float = 0.0
+    # Separate reporting for theorem-only vs answer problems
+    theorem_only_total: int = 0
+    theorem_only_solved: int = 0
+    answer_total: int = 0
+    answer_skipped: int = 0
+    verified_count: int = 0
+    tactic_filtered_count: int = 0
     results: list[ProblemResult] = field(default_factory=list)
     total_time_seconds: float = 0.0
     avg_duration_per_problem: float = 0.0
@@ -120,11 +213,23 @@ class PutnamBenchmarkResult:
     by_decade: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        theorem_only_rate = (
+            self.theorem_only_solved / self.theorem_only_total
+            if self.theorem_only_total
+            else 0.0
+        )
         return {
             "benchmark": "putnam",
             "total": self.total,
             "solved": self.solved,
             "pass_rate": round(self.pass_rate, 4),
+            "theorem_only_total": self.theorem_only_total,
+            "theorem_only_solved": self.theorem_only_solved,
+            "theorem_only_pass_rate": round(theorem_only_rate, 4),
+            "answer_total": self.answer_total,
+            "answer_skipped": self.answer_skipped,
+            "verified_count": self.verified_count,
+            "tactic_filtered_count": self.tactic_filtered_count,
             "total_time_seconds": round(self.total_time_seconds, 2),
             "avg_duration_per_problem": round(self.avg_duration_per_problem, 2),
             "avg_tactics_per_solve": round(self.avg_tactics_per_solve, 2),
@@ -178,6 +283,7 @@ async def attempt_putnam_repl(
             problem_id=problem.id,
             year=problem.year,
             section=problem.section,
+            has_answer=problem.has_answer,
             solved=False,
             error="Timeout setting up proof state",
             duration_seconds=time.monotonic() - start,
@@ -193,6 +299,7 @@ async def attempt_putnam_repl(
             problem_id=problem.id,
             year=problem.year,
             section=problem.section,
+            has_answer=problem.has_answer,
             solved=False,
             error=f"No proof state: {'; '.join(error_msgs) if error_msgs else 'unknown'}",
             duration_seconds=time.monotonic() - start,
@@ -225,12 +332,24 @@ async def attempt_putnam_repl(
         )
 
         if proof_complete:
+            candidate_code = f"{problem.statement} := by {tactic}"
+
+            # Filter suspicious non-proof tactics
+            bad_tactic = _contains_invalid_tactic(candidate_code)
+            if bad_tactic:
+                logger.info(
+                    "  Rejected invalid tactic for %s: %s",
+                    problem.id, bad_tactic,
+                )
+                continue
+
             return ProblemResult(
                 problem_id=problem.id,
                 year=problem.year,
                 section=problem.section,
+                has_answer=problem.has_answer,
                 solved=True,
-                proof_code=f"{problem.statement} := by {tactic}",
+                proof_code=candidate_code,
                 tactics_used=1,
                 attempts=attempts,
                 duration_seconds=time.monotonic() - start,
@@ -240,6 +359,7 @@ async def attempt_putnam_repl(
         problem_id=problem.id,
         year=problem.year,
         section=problem.section,
+        has_answer=problem.has_answer,
         solved=False,
         error="All automation tactics failed",
         attempts=attempts,
@@ -296,12 +416,34 @@ async def attempt_putnam_search(
         )
 
         if search_result.success:
+            candidate_code = search_result.proof_code
+
+            # Filter suspicious non-proof tactics
+            if candidate_code:
+                bad_tactic = _contains_invalid_tactic(candidate_code)
+                if bad_tactic:
+                    logger.info(
+                        "  Rejected invalid tactic for %s: %s",
+                        problem.id, bad_tactic,
+                    )
+                    return ProblemResult(
+                        problem_id=problem.id,
+                        year=problem.year,
+                        section=problem.section,
+                        has_answer=problem.has_answer,
+                        solved=False,
+                        error=f"Proof rejected: contains invalid tactic '{bad_tactic}'",
+                        attempts=search_result.nodes_explored,
+                        duration_seconds=time.monotonic() - start,
+                    )
+
             return ProblemResult(
                 problem_id=problem.id,
                 year=problem.year,
                 section=problem.section,
+                has_answer=problem.has_answer,
                 solved=True,
-                proof_code=search_result.proof_code,
+                proof_code=candidate_code,
                 tactics_used=len(search_result.proof_tactics),
                 attempts=search_result.nodes_explored,
                 duration_seconds=time.monotonic() - start,
@@ -312,6 +454,7 @@ async def attempt_putnam_search(
                 problem_id=problem.id,
                 year=problem.year,
                 section=problem.section,
+                has_answer=problem.has_answer,
                 solved=False,
                 error=f"Automation + search failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
                 attempts=auto_result.attempts + search_attempts,
@@ -324,6 +467,7 @@ async def attempt_putnam_search(
         problem_id=problem.id,
         year=problem.year,
         section=problem.section,
+        has_answer=problem.has_answer,
         solved=False,
         error=f"Automation + search failed ({auto_result.attempts} auto + search)",
         attempts=auto_result.attempts,
@@ -341,6 +485,9 @@ async def run_putnam(
     search_budget: int = 64,
     use_mathlib_search: bool = True,
     year_range: tuple[int, int] | None = None,
+    exclude_answer: bool = True,
+    verify_proofs: bool = True,
+    verify_timeout: int = 30,
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
 
@@ -354,6 +501,13 @@ async def run_putnam(
         search_budget: Max tactic attempts per problem for search tree.
         use_mathlib_search: Query Mathlib APIs during search tree expansion.
         year_range: Filter by year range (inclusive).
+        exclude_answer: Skip problems where has_answer=True and answer is
+            still ``sorry`` (default True).  These can't be validly solved
+            without filling the answer placeholder.
+        verify_proofs: After REPL/search finds a proof, verify it with
+            whole-file lean_prover compilation (default True).
+        verify_timeout: Timeout in seconds for whole-file verification
+            (default 30).
 
     Returns:
         PutnamBenchmarkResult with aggregate and per-problem results.
@@ -372,16 +526,30 @@ async def run_putnam(
                 "year_filter": year_filter,
                 "section_filter": section_filter,
                 "year_range": year_range,
+                "exclude_answer": exclude_answer,
             },
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
     stats = get_putnam_stats(problems)
+
+    # Count answer-sorry problems for reporting
+    answer_sorry_problems = [p for p in problems if p.answer_is_sorry]
+    answer_sorry_count = len(answer_sorry_problems)
+
+    if exclude_answer and answer_sorry_count > 0:
+        logger.info(
+            "Excluding %d answer-sorry problems (answer placeholder is sorry)",
+            answer_sorry_count,
+        )
+
     logger.info(
-        "Running PutnamBench: %d problems (%d-%d)",
+        "Running PutnamBench: %d problems total (%d-%d), %d answer-sorry%s",
         stats["total"],
         stats["year_range"][0],
         stats["year_range"][1],
+        answer_sorry_count,
+        " (excluded)" if exclude_answer else "",
     )
 
     overall_start = time.monotonic()
@@ -407,12 +575,35 @@ async def run_putnam(
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
+    tactic_filtered = 0
+
     try:
         for i, problem in enumerate(problems):
             logger.info(
-                "[%d/%d] %s (year=%d)",
+                "[%d/%d] %s (year=%d, answer=%s)",
                 i + 1, len(problems), problem.id, problem.year,
+                "sorry" if problem.answer_is_sorry else (
+                    "yes" if problem.has_answer else "no"
+                ),
             )
+
+            # Skip answer-sorry problems when exclude_answer is set
+            if exclude_answer and problem.answer_is_sorry:
+                result = ProblemResult(
+                    problem_id=problem.id,
+                    year=problem.year,
+                    section=problem.section,
+                    has_answer=problem.has_answer,
+                    solved=False,
+                    skipped=True,
+                    skip_reason="answer_is_sorry",
+                    error="Skipped: answer placeholder is sorry",
+                    duration_seconds=0.0,
+                )
+                results.append(result)
+                logger.info("  SKIPPED (answer-sorry)")
+                continue
+
             if use_search:
                 result = await attempt_putnam_search(
                     problem,
@@ -425,39 +616,74 @@ async def run_putnam(
                 result = await attempt_putnam_repl(
                     problem, repl_session, timeout=timeout,
                 )
+
+            # Whole-file verification for solved problems
+            if result.solved and verify_proofs and result.proof_code:
+                logger.info("  Verifying proof with lean_prover...")
+                vresult = await _verify_whole_file(
+                    problem, result.proof_code, timeout=verify_timeout,
+                )
+                if vresult["verified"]:
+                    result.verified = True
+                    logger.info("  Verification: PASSED")
+                else:
+                    # REPL said solved but whole-file check failed
+                    logger.info(
+                        "  Verification: FAILED (%s)", vresult["error"]
+                    )
+                    result.solved = False
+                    result.verified = False
+                    result.error = f"Verification failed: {vresult['error']}"
+
+            # Track tactic filtering (already done inside attempt_*, but count
+            # rejections visible through the error field)
+            if result.error and "invalid tactic" in (result.error or ""):
+                tactic_filtered += 1
+
             results.append(result)
             status = "SOLVED" if result.solved else "FAILED"
-            logger.info("  %s (%.2fs)", status, result.duration_seconds)
+            verified_tag = " (verified)" if result.verified else ""
+            logger.info(
+                "  %s%s (%.2fs)", status, verified_tag, result.duration_seconds,
+            )
     finally:
         if repl_session is not None:
             await repl_session.stop()
 
     # Compute aggregate stats
     total_time = time.monotonic() - overall_start
-    solved = [r for r in results if r.solved]
+    non_skipped = [r for r in results if not r.skipped]
+    solved = [r for r in non_skipped if r.solved]
     solved_count = len(solved)
+    verified_count = sum(1 for r in results if r.verified)
 
-    # Per-year breakdown
+    # Separate theorem-only vs answer reporting
+    theorem_only = [r for r in non_skipped if not r.has_answer]
+    theorem_only_solved = [r for r in theorem_only if r.solved]
+    answer_attempted = [r for r in non_skipped if r.has_answer]
+    answer_skipped = [r for r in results if r.skipped]
+
+    # Per-year breakdown (non-skipped only)
     by_year: dict[int, dict[str, int]] = {}
-    for r in results:
+    for r in non_skipped:
         if r.year not in by_year:
             by_year[r.year] = {"total": 0, "solved": 0}
         by_year[r.year]["total"] += 1
         if r.solved:
             by_year[r.year]["solved"] += 1
 
-    # Per-section breakdown
+    # Per-section breakdown (non-skipped only)
     by_section: dict[str, dict[str, int]] = {}
-    for r in results:
+    for r in non_skipped:
         if r.section not in by_section:
             by_section[r.section] = {"total": 0, "solved": 0}
         by_section[r.section]["total"] += 1
         if r.solved:
             by_section[r.section]["solved"] += 1
 
-    # Per-decade breakdown
+    # Per-decade breakdown (non-skipped only)
     by_decade: dict[str, dict[str, int]] = {}
-    for r in results:
+    for r in non_skipped:
         decade = f"{(r.year // 10) * 10}s"
         if decade not in by_decade:
             by_decade[decade] = {"total": 0, "solved": 0}
@@ -465,13 +691,22 @@ async def run_putnam(
         if r.solved:
             by_decade[decade]["solved"] += 1
 
+    non_skipped_count = len(non_skipped)
     benchmark = PutnamBenchmarkResult(
-        total=len(results),
+        total=non_skipped_count,
         solved=solved_count,
-        pass_rate=solved_count / len(results) if results else 0.0,
+        pass_rate=solved_count / non_skipped_count if non_skipped_count else 0.0,
+        theorem_only_total=len(theorem_only),
+        theorem_only_solved=len(theorem_only_solved),
+        answer_total=len(answer_attempted) + len(answer_skipped),
+        answer_skipped=len(answer_skipped),
+        verified_count=verified_count,
+        tactic_filtered_count=tactic_filtered,
         results=results,
         total_time_seconds=total_time,
-        avg_duration_per_problem=total_time / len(results) if results else 0.0,
+        avg_duration_per_problem=(
+            total_time / non_skipped_count if non_skipped_count else 0.0
+        ),
         avg_tactics_per_solve=(
             sum(r.tactics_used for r in solved) / solved_count
             if solved_count
@@ -485,6 +720,9 @@ async def run_putnam(
             "use_search": use_search,
             "search_budget": search_budget if use_search else None,
             "use_mathlib_search": use_mathlib_search if use_search else None,
+            "exclude_answer": exclude_answer,
+            "verify_proofs": verify_proofs,
+            "verify_timeout": verify_timeout,
         },
         timestamp=datetime.now(timezone.utc).isoformat(),
         by_year=by_year,
@@ -501,8 +739,30 @@ async def run_putnam(
     logger.info("PutnamBench Results")
     logger.info("=" * 60)
     logger.info(
+        "Theorem-only: %d/%d solved (%.1f%%)",
+        len(theorem_only_solved),
+        len(theorem_only),
+        len(theorem_only_solved) / len(theorem_only) * 100 if theorem_only else 0,
+    )
+    if answer_attempted:
+        logger.info(
+            "Answer problems attempted: %d (solved: %d)",
+            len(answer_attempted),
+            sum(1 for r in answer_attempted if r.solved),
+        )
+    if answer_skipped:
+        logger.info(
+            "Answer-sorry problems skipped: %d", len(answer_skipped),
+        )
+    logger.info(
+        "Verified (whole-file): %d/%d", verified_count, solved_count,
+    )
+    if tactic_filtered:
+        logger.info("Tactic-filtered (rejected): %d", tactic_filtered)
+    logger.info(
         "Total: %d/%d solved (%.1f%%) in %.1fs",
-        solved_count, len(results), benchmark.pass_rate * 100, total_time,
+        solved_count, non_skipped_count,
+        benchmark.pass_rate * 100, total_time,
     )
     logger.info("")
 
@@ -594,6 +854,22 @@ def main() -> None:
         action="store_true",
         help="Disable Mathlib search during tree expansion",
     )
+    parser.add_argument(
+        "--include-answer",
+        action="store_true",
+        help="Include answer-sorry problems (excluded by default)",
+    )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip whole-file verification of solved proofs",
+    )
+    parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=30,
+        help="Timeout for whole-file verification (seconds, default 30)",
+    )
     args = parser.parse_args()
 
     # Determine problem IDs
@@ -616,6 +892,9 @@ def main() -> None:
             search_budget=args.budget,
             use_mathlib_search=not args.no_mathlib,
             year_range=year_range,
+            exclude_answer=not args.include_answer,
+            verify_proofs=not args.no_verify,
+            verify_timeout=args.verify_timeout,
         )
     )
 
