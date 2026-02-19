@@ -73,9 +73,11 @@ async def run_enhanced_benchmark(
             use_repl=True,
             use_search=True,
             search_budget=64,
-            use_mathlib_search=True,  # NEW: semantic search enabled
+            use_mathlib_search=True,
             timeout=60,
             problem_ids=problem_ids,
+            verify=True,
+            verify_timeout=150,
         )
 
         logger.info("")

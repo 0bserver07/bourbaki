@@ -277,11 +277,13 @@ async def attempt_proof_repl(
         )
 
         if proof_complete:
+            # Build full proof code with imports/preamble for verification
+            full_proof = problem.full_lean_code.replace("sorry", tactic)
             return ProblemResult(
                 problem_id=problem.id,
                 source=problem.source,
                 solved=True,
-                proof_code=f"{problem.statement} := by {tactic}",
+                proof_code=full_proof,
                 tactics_used=1,
                 attempts=attempts,
                 duration_seconds=time.monotonic() - start,
@@ -361,11 +363,16 @@ async def attempt_proof_search(
         )
 
         if search_result.success:
+            # Build full proof code with imports/preamble
+            tactic_block = "\n  ".join(search_result.proof_tactics)
+            full_proof = problem.full_lean_code.replace(
+                "sorry", tactic_block,
+            )
             return ProblemResult(
                 problem_id=problem.id,
                 source=problem.source,
                 solved=True,
-                proof_code=search_result.proof_code,
+                proof_code=full_proof,
                 tactics_used=len(search_result.proof_tactics),
                 attempts=search_result.nodes_explored,
                 duration_seconds=time.monotonic() - start,
@@ -393,6 +400,47 @@ async def attempt_proof_search(
     )
 
 
+async def _verify_with_lean_prover(
+    result: ProblemResult,
+    verify_timeout: int = 150,
+) -> ProblemResult:
+    """Verify a solved problem with lean_prover (whole-file compilation).
+
+    If verification fails, marks the result as unsolved.
+    """
+    if not result.solved or not result.proof_code:
+        return result
+
+    try:
+        vresult = await asyncio.wait_for(
+            lean_prover(code=result.proof_code, mode="check", timeout=verify_timeout),
+            timeout=verify_timeout + 10,
+        )
+        if vresult.get("proofComplete"):
+            logger.info("  Verified with lean_prover")
+            return result
+        else:
+            errors = vresult.get("errors") or []
+            err_msg = ""
+            if errors:
+                first = errors[0]
+                err_msg = first.get("message", str(first)) if isinstance(first, dict) else str(first)
+            logger.info("  REJECTED by lean_prover: %s", err_msg[:100])
+            result.solved = False
+            result.error = f"Verification failed: {err_msg[:200]}"
+            return result
+    except asyncio.TimeoutError:
+        logger.info("  Verification TIMEOUT (%ds)", verify_timeout)
+        result.solved = False
+        result.error = f"Verification timeout ({verify_timeout}s)"
+        return result
+    except Exception as e:
+        logger.info("  Verification ERROR: %s", e)
+        result.solved = False
+        result.error = f"Verification error: {e}"
+        return result
+
+
 async def run_minif2f(
     split: str = "valid",
     source_filter: str | None = None,
@@ -405,6 +453,8 @@ async def run_minif2f(
     use_search: bool = False,
     search_budget: int = 64,
     use_mathlib_search: bool = False,
+    verify: bool = False,
+    verify_timeout: int = 150,
 ) -> BenchmarkResult:
     """Run Bourbaki on miniF2F problems and report pass rate.
 
@@ -477,6 +527,8 @@ async def run_minif2f(
                     )
                 else:
                     result = await attempt_proof(problem, prove_fn, timeout)
+                if verify and result.solved:
+                    result = await _verify_with_lean_prover(result, verify_timeout)
                 results.append(result)
                 status = "SOLVED" if result.solved else "FAILED"
                 logger.info("  %s (%.2fs)", status, result.duration_seconds)
@@ -501,6 +553,8 @@ async def run_minif2f(
                         result = await attempt_proof_repl(
                             problem, repl_session, timeout=timeout,
                         )
+                    if verify and result.solved:
+                        result = await _verify_with_lean_prover(result, verify_timeout)
                     results.append(result)
                     status = "SOLVED" if result.solved else "FAILED"
                     logger.info("  %s (%.2fs)", status, result.duration_seconds)
