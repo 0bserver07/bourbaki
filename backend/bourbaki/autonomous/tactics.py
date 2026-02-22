@@ -37,9 +37,9 @@ AUTOMATION_TACTICS = [
 _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [
     # Quantifiers
     (r"∀", ["intro", "intros"]),
-    (r"∃", ["use", "refine ⟨?_, ?_⟩", "exact ⟨_, _⟩"]),
+    (r"∃", ["use", "constructor"]),
     # Connectives
-    (r"∧", ["constructor", "exact ⟨_, _⟩", "refine ⟨?_, ?_⟩"]),
+    (r"∧", ["constructor", "And.intro"]),
     (r"∨", ["left", "right", "Or.inl", "Or.inr"]),
     (r"↔", ["constructor", "Iff.intro"]),
     (r"¬", ["intro", "push_neg"]),
@@ -53,7 +53,7 @@ _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [
                   "gcongr", "norm_cast"]),
     (r"≠", ["intro", "push_neg", "omega", "norm_num"]),
     # Membership / set operations
-    (r"∈", ["simp", "exact mem_of", "apply mem_of"]),
+    (r"∈", ["simp", "apply Set.mem_of_mem_filter", "assumption"]),
     (r"⊆", ["intro", "simp"]),
     # Natural numbers
     (r"Nat\.", ["omega", "simp [Nat.]", "norm_num", "induction", "norm_cast"]),
