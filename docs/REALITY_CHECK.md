@@ -89,6 +89,74 @@ coordination gets you surprisingly far.
 
 ---
 
+## 2026-02-22 — Verified miniF2F: 15/244 (6.2%)
+
+### The verified number
+
+Full miniF2F valid split with lean_prover verification (whole-file compilation,
+150s timeout per problem). Result: **15/244 (6.2%)**.
+
+| Category | Verified | Rate |
+|----------|---------|------|
+| algebra | 6/18 | 33% |
+| unknown (AMC/misc) | 3/48 | 6% |
+| mathd | 6/130 | 5% |
+| aime | 0/12 | 0% |
+| imo | 0/20 | 0% |
+| induction | 0/8 | 0% |
+| numbertheory | 0/8 | 0% |
+
+### What tactics actually verify
+
+Only standard Lean automation tactics produce valid proofs:
+
+| Tactic | Verified Solves |
+|--------|----------------|
+| `ring` | 5 |
+| `rfl` | 3 |
+| `simp` | 3 |
+| `norm_num` | 1 |
+| `linarith` | 1 |
+| `nlinarith` | 1 |
+| `field_simp` | 1 |
+
+### The `exact ⟨_, _⟩` problem
+
+The search tree's most common "proof" tactic — `exact ⟨_, _⟩` — is entirely
+bogus. It was used on 100+ problems and NONE verify. The REPL reports "no
+remaining goals" but lean_prover rejects with "Insufficient number of fields
+for ⟨...⟩ constructor."
+
+The anonymous constructor `⟨_, _⟩` asks Lean to infer the arguments. In the
+REPL's sorry-initialized proof state, Lean's elaborator sometimes closes the
+goal display without constructing a valid proof term. In standalone compilation,
+this correctly fails.
+
+### What this means
+
+The previous claims (91.8% valid, 94.3% test) were **entirely from REPL false
+positives**. The actual verified rate is 6.2% — only standard automation tactics
+that don't depend on the proof state context.
+
+The search tree architecture is sound but the proof detection is broken. The fix
+is to either:
+1. Stop using `exact ⟨_, _⟩` as a candidate tactic
+2. Add lean_prover verification inline during search (expensive but correct)
+3. Fix the REPL detection to match standalone compilation behavior
+
+### Revised comparison
+
+| System | miniF2F Valid | Verified? |
+|--------|-------------|-----------|
+| HILBERT | 99.2% | Yes (published, peer-reviewed) |
+| BFS-Prover-V2 | 95.08% | Yes (published) |
+| Goedel-V2 | 90.4% | Yes (published) |
+| Aristotle | 90% | Yes (published) |
+| DeepSeek-V2 | 88.9% | Yes (published) |
+| **Bourbaki** | **6.2%** | **Yes (lean_prover verified)** |
+
+---
+
 ## 2026-02-19 — PutnamBench Audit (0% verified)
 
 ### What happened
