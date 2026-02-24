@@ -53,7 +53,7 @@ _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [
                   "gcongr", "norm_cast"]),
     (r"≠", ["intro", "push_neg", "omega", "norm_num"]),
     # Membership / set operations
-    (r"∈", ["simp", "assumption", "decide"]),
+    (r"∈", ["simp", "assumption"]),
     (r"⊆", ["intro", "simp"]),
     # Natural numbers
     (r"Nat\.", ["omega", "simp [Nat.]", "norm_num", "induction", "norm_cast"]),
