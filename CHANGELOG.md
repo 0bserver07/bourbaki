@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.2.2 — 2026-03-08
+
+### REPL session corruption fix + honest benchmark numbers
+
+The verified miniF2F baseline is **63/244 (25.8%)** — not the 91.8% previously
+reported from REPL-only detection. Every solve now compiles as a standalone
+Lean file via `lean_prover`.
+
+#### What happened
+
+The REPL-reported numbers (91.8%–94.3%) included false positives: the REPL
+reported `goals=[]` for tactics that don't compile standalone. The actual
+verified number dropped to 63/244 after adding `lean_prover` verification.
+
+Additionally, a critical REPL session corruption bug was causing cascading
+failures during benchmark runs. When a tactic timed out, unconsumed response
+data remained in the stdout pipe, corrupting all subsequent commands. This
+meant problems later in the sequence failed not because they were hard, but
+because the REPL was broken.
+
+#### Fixes
+
+- **REPL pipe recovery** — After a tactic timeout, drain remaining output to
+  resync the pipe. If drain fails (tactic hung), kill session so it auto-restarts.
+  Handles both internal timeouts and external cancellation (`asyncio.wait_for`).
+
+- **Removed false-positive tactics** — `apply Set.mem_of_mem_filter` (158 false
+  positives), bogus tactic candidates, `decide` on membership goals (caused
+  timeout-induced corruption).
+
+- **Init error handling** — `lean_tactic()` now correctly reports failure when
+  `send_cmd` returns a timeout/parse error during initialization (was silently
+  returning `proofComplete=True`).
+
+#### Verified Results
+
+| Category | Verified | Rate |
+|----------|----------|------|
+| mathd | 54/130 | 42% |
+| algebra | 5/18 | 28% |
+| AMC/misc | 4/48 | 8% |
+| aime | 0/12 | 0% |
+| imo | 0/20 | 0% |
+| induction | 0/8 | 0% |
+| numbertheory | 0/8 | 0% |
+
+Top verified tactics: norm_num (23), omega (13), ring (8), linarith (7),
+decide (7), nlinarith (3), simp_all (2).
+
+#### Lessons Learned
+
+1. **Never trust REPL-reported proof completion without standalone verification.**
+   The REPL reports `goals=[]` for tactics that produce terms the type checker
+   accepts locally but that don't compile in a standalone file (missing imports,
+   universe issues, etc.).
+
+2. **Subprocess pipe protocols are fragile.** When `asyncio.wait_for` cancels a
+   read mid-stream, the remaining bytes stay in the pipe. The next read gets a
+   mix of old and new data. This is a fundamental issue with any line-delimited
+   protocol over stdin/stdout — you must drain or restart after any interruption.
+
+3. **Benchmark corruption cascades silently.** The first timeout corrupted the
+   session, but subsequent failures looked like normal tactic failures. Without
+   logging the JSON parse errors, the corruption was invisible.
+
+4. **The gap between 25.8% and SOTA (99.2%) is multi-step proofs.** The 63 verified
+   solves are all single-tactic proofs. The search tree finds multi-step proofs
+   via REPL but can't reliably translate them to standalone code.
+
+---
+
 ## v0.2.1 — 2026-02-18
 
 ### 94.3% on miniF2F test split — no fine-tuning, no custom training
