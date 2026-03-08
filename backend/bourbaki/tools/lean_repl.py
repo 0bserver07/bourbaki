@@ -140,12 +140,63 @@ class LeanREPLSession:
             else:
                 logger.warning("Failed to load %s: %s", import_cmd, result)
 
+    async def _drain_stale_output(self, drain_timeout: float = 10.0) -> bool:
+        """Drain remaining output from a timed-out REPL command.
+
+        After a timeout, the REPL may still be producing the response for
+        the previous command.  We read and discard lines until we hit the
+        blank-line separator that marks the end of that response, which
+        puts the pipe back in sync for the next command.
+
+        Returns True if successfully drained, False if drain timed out
+        (meaning the command is still computing — session should be killed).
+        """
+        if self.proc is None or self.proc.stdout is None:
+            return False
+
+        try:
+            async def _drain() -> None:
+                assert self.proc is not None and self.proc.stdout is not None
+                while True:
+                    raw = await self.proc.stdout.readline()
+                    if not raw:
+                        return  # EOF — process exited
+                    text = raw.decode()
+                    if text.strip() == "":
+                        return  # Blank line = end of stale response
+
+            await asyncio.wait_for(_drain(), timeout=drain_timeout)
+            logger.info("Drained stale REPL output — pipe back in sync")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Could not drain stale output within %.1fs — "
+                "tactic still computing, killing session",
+                drain_timeout,
+            )
+            return False
+
+    async def _handle_pipe_desync(self) -> None:
+        """Recover from a desynchronised pipe (after timeout or cancellation).
+
+        Tries to drain the remaining response; if that fails, kills the
+        session so it auto-restarts on the next call.
+        """
+        if not self.is_running:
+            return
+        drained = await self._drain_stale_output()
+        if not drained:
+            await self.stop()
+
     async def _read_response(self, timeout: float = 120) -> dict[str, Any]:
         """Read a multi-line JSON response from the REPL.
 
         The lean4-repl outputs pretty-printed JSON separated by blank lines.
         We read lines until we hit a blank line after accumulating content,
         then parse the concatenated result.
+
+        On timeout, drains the remaining output to keep the pipe in sync
+        (or kills the session if the drain also times out).
         """
         assert self.proc is not None
         assert self.proc.stdout is not None
@@ -167,7 +218,14 @@ class LeanREPLSession:
                     continue  # Skip leading blank lines
                 lines.append(text)
 
-        await asyncio.wait_for(_read_until_blank(), timeout=timeout)
+        try:
+            await asyncio.wait_for(_read_until_blank(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "REPL response timed out after %.1fs — draining pipe", timeout,
+            )
+            await self._handle_pipe_desync()
+            return {"error": "REPL timed out"}
 
         joined = "".join(lines)
         try:
@@ -200,7 +258,14 @@ class LeanREPLSession:
         self.proc.stdin.write(payload.encode())
         await self.proc.stdin.drain()
 
-        return await self._read_response(timeout=timeout)
+        try:
+            return await self._read_response(timeout=timeout)
+        except asyncio.CancelledError:
+            # External cancellation (e.g. caller's asyncio.wait_for) —
+            # the command was sent but the response wasn't fully read.
+            # Drain or kill to prevent pipe corruption.
+            await self._handle_pipe_desync()
+            raise
 
     async def send_tactic(
         self, tactic: str, proof_state: int, timeout: float = 60,
@@ -221,7 +286,14 @@ class LeanREPLSession:
         self.proc.stdin.write(payload.encode())
         await self.proc.stdin.drain()
 
-        return await self._read_response(timeout=timeout)
+        try:
+            return await self._read_response(timeout=timeout)
+        except asyncio.CancelledError:
+            # External cancellation (e.g. caller's asyncio.wait_for) —
+            # the tactic was sent but the response wasn't fully read.
+            # Drain or kill to prevent pipe corruption.
+            await self._handle_pipe_desync()
+            raise
 
     async def replay_tactics(
         self, theorem: str, tactics: list[str], timeout: float = 120,
@@ -475,6 +547,15 @@ async def lean_tactic(
             # The goal should be a theorem/lemma statement ending in `by sorry`
             stmt = goal if "sorry" in goal else goal.rstrip().rstrip(":=") + " := by sorry"
             result = await session.send_cmd(stmt)
+
+            # Check for REPL-level errors (e.g. timeout, pipe corruption)
+            if "error" in result and "sorries" not in result:
+                elapsed = int((time.monotonic() - start) * 1000)
+                return {
+                    "success": False,
+                    "error": result["error"],
+                    "duration": elapsed,
+                }
 
             if "env" in result:
                 session.env_id = result["env"]
