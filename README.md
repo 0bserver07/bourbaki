@@ -178,6 +178,12 @@ backend/bourbaki/             Python backend (owns all state)
 - **Sequences:** OEIS API
 - **Papers:** arXiv API
 
+## Blog Post
+
+Read the full writeup: **[Building Bourbaki: A Math Agent That Can Check Its Own Work](BLOG.md)**
+
+Includes the original design decisions, architecture walkthrough, and a March 2026 update on what actually compiles when you verify proofs properly (spoiler: 25.8%, not 91.8%).
+
 ## Credits
 
 Named after [Nicolas Bourbaki](https://en.wikipedia.org/wiki/Nicolas_Bourbaki), the collective pseudonym of a group of mathematicians who tried to rewrite all of mathematics from scratch using set theory.
