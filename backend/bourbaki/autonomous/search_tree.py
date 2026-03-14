@@ -130,6 +130,60 @@ class ProofSearchTree:
         self._explored: int = 0
         self._novelty_tracker = NoveltyTracker()  # For state deduplication + novelty bonus
 
+    def _build_proof_code(self, tactics: list[str]) -> str:
+        """Build a complete, standalone Lean 4 file from the tactic sequence.
+
+        The REPL session has ``import Mathlib`` loaded implicitly, but
+        standalone verification via ``lean_prover`` needs the full file.
+        This method ensures the output includes:
+        - ``import Mathlib`` (unless the theorem text already has imports)
+        - Any ``open`` / ``set_option`` / ``noncomputable section``
+          directives already present in ``self.theorem``
+        - The theorem declaration with the tactic proof
+        """
+        tactic_block = "\n  ".join(tactics)
+
+        # Split self.theorem into preamble lines and the actual theorem decl.
+        # Callers (e.g. benchmark runners) may prepend open/set_option lines
+        # to self.theorem before the ``theorem``/``lemma`` keyword.
+        lines = self.theorem.split("\n")
+        preamble_lines: list[str] = []
+        theorem_lines: list[str] = []
+        found_theorem = False
+        has_import = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import "):
+                has_import = True
+            if not found_theorem and not stripped.startswith(("theorem ", "lemma ", "noncomputable theorem ", "noncomputable lemma ")):
+                preamble_lines.append(line)
+            else:
+                found_theorem = True
+                theorem_lines.append(line)
+
+        # If nothing looked like a theorem keyword, treat the whole thing as
+        # the theorem (backward compat with plain ``theorem foo : T`` input).
+        if not theorem_lines:
+            theorem_lines = lines
+            preamble_lines = []
+
+        theorem_decl = "\n".join(theorem_lines).rstrip()
+
+        # Assemble the file
+        parts: list[str] = []
+
+        if not has_import:
+            parts.append("import Mathlib")
+
+        preamble = "\n".join(preamble_lines).strip()
+        if preamble:
+            parts.append(preamble)
+
+        parts.append(f"{theorem_decl} := by\n  {tactic_block}")
+
+        return "\n\n".join(parts)
+
     async def initialize(self) -> ProofNode | None:
         """Initialize the search tree by stating the theorem with sorry.
 
@@ -625,12 +679,10 @@ class ProofSearchTree:
 
                 for child in children:
                     if child.is_complete:
-                        tactic_block = "\n  ".join(child.path)
-                        proof_code = f"{self.theorem} := by\n  {tactic_block}"
                         return SearchResult(
                             success=True,
                             proof_tactics=child.path,
-                            proof_code=proof_code,
+                            proof_code=self._build_proof_code(child.path),
                             nodes_explored=self._explored,
                             max_depth=child.depth,
                             total_time=time.monotonic() - start,
@@ -706,12 +758,10 @@ class ProofSearchTree:
                 for children in all_children:
                     for child in children:
                         if child.is_complete:
-                            tactic_block = "\n  ".join(child.path)
-                            proof_code = f"{self.theorem} := by\n  {tactic_block}"
                             return SearchResult(
                                 success=True,
                                 proof_tactics=child.path,
-                                proof_code=proof_code,
+                                proof_code=self._build_proof_code(child.path),
                                 nodes_explored=self._explored,
                                 max_depth=child.depth,
                                 total_time=time.monotonic() - start,
@@ -754,8 +804,7 @@ class ProofSearchTree:
 
     async def _verify_proof(self, tactics: list[str]) -> str | None:
         """Verify a complete proof by reconstructing the full Lean code."""
-        tactic_block = "\n  ".join(tactics)
-        proof_code = f"{self.theorem} := by\n  {tactic_block}"
+        proof_code = self._build_proof_code(tactics)
 
         result = await lean_prover(code=proof_code, mode="check")
         if result.get("proofComplete"):
