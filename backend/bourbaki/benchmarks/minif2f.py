@@ -22,6 +22,7 @@ from bourbaki.benchmarks.loader import (
     load_minif2f_problems,
 )
 from bourbaki.autonomous.search_tree import prove_with_search
+from bourbaki.autonomous.tactics import contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession, stop_session
 
@@ -55,6 +56,8 @@ class ProblemResult:
     problem_id: str
     source: str
     solved: bool
+    repl_reported: bool = False   # REPL said solved (before verification)
+    verified: bool = False        # lean_prover confirmed the proof
     proof_code: str | None = None
     error: str | None = None
     tactics_used: int = 0
@@ -66,6 +69,8 @@ class ProblemResult:
             "problem_id": self.problem_id,
             "source": self.source,
             "solved": self.solved,
+            "repl_reported": self.repl_reported,
+            "verified": self.verified,
             "proof_code": self.proof_code,
             "error": self.error,
             "tactics_used": self.tactics_used,
@@ -80,6 +85,10 @@ class BenchmarkResult:
     total: int = 0
     solved: int = 0
     pass_rate: float = 0.0
+    # Verification guardrails: distinguish REPL-reported vs verified
+    repl_reported: int = 0        # Number the REPL said were solved
+    verified: int = 0             # Number lean_prover confirmed
+    false_positives: int = 0      # REPL yes but lean_prover no
     results: list[ProblemResult] = field(default_factory=list)
     total_time_seconds: float = 0.0
     avg_duration_per_problem: float = 0.0
@@ -93,6 +102,13 @@ class BenchmarkResult:
             "total": self.total,
             "solved": self.solved,
             "pass_rate": round(self.pass_rate, 4),
+            "repl_reported": self.repl_reported,
+            "verified": self.verified,
+            "false_positives": self.false_positives,
+            "false_positive_rate": (
+                round(self.false_positives / self.repl_reported, 4)
+                if self.repl_reported else 0.0
+            ),
             "total_time_seconds": round(self.total_time_seconds, 2),
             "avg_duration_per_problem": round(self.avg_duration_per_problem, 2),
             "avg_tactics_per_solve": round(self.avg_tactics_per_solve, 2),
@@ -165,6 +181,8 @@ async def attempt_proof(
                     problem_id=problem.id,
                     source=problem.source,
                     solved=True,
+                    repl_reported=False,  # Used lean_prover, not REPL
+                    verified=True,        # lean_prover = whole-file verified
                     proof_code=proof_code,
                     tactics_used=1,
                     attempts=attempts,
@@ -279,10 +297,21 @@ async def attempt_proof_repl(
         if proof_complete:
             # Build full proof code with imports/preamble for verification
             full_proof = problem.full_lean_code.replace("sorry", tactic)
+
+            # Check tactic blocklist before accepting
+            blocked = contains_blocklisted_tactic(full_proof)
+            if blocked:
+                logger.info(
+                    "  Rejected blocklisted tactic for %s: %s",
+                    problem.id, blocked,
+                )
+                continue
+
             return ProblemResult(
                 problem_id=problem.id,
                 source=problem.source,
                 solved=True,
+                repl_reported=True,
                 proof_code=full_proof,
                 tactics_used=1,
                 attempts=attempts,
@@ -372,6 +401,7 @@ async def attempt_proof_search(
                 problem_id=problem.id,
                 source=problem.source,
                 solved=True,
+                repl_reported=True,
                 proof_code=full_proof,
                 tactics_used=len(search_result.proof_tactics),
                 attempts=search_result.nodes_explored,
@@ -406,7 +436,9 @@ async def _verify_with_lean_prover(
 ) -> ProblemResult:
     """Verify a solved problem with lean_prover (whole-file compilation).
 
-    If verification fails, marks the result as unsolved.
+    If verification fails, marks the result as unsolved (false positive).
+    This is a MANDATORY step in the benchmark pipeline -- it must always
+    run for any problem the REPL reports as solved.
     """
     if not result.solved or not result.proof_code:
         return result
@@ -418,6 +450,7 @@ async def _verify_with_lean_prover(
         )
         if vresult.get("proofComplete"):
             logger.info("  Verified with lean_prover")
+            result.verified = True
             return result
         else:
             errors = vresult.get("errors") or []
@@ -425,18 +458,21 @@ async def _verify_with_lean_prover(
             if errors:
                 first = errors[0]
                 err_msg = first.get("message", str(first)) if isinstance(first, dict) else str(first)
-            logger.info("  REJECTED by lean_prover: %s", err_msg[:100])
+            logger.info("  REJECTED by lean_prover (false positive): %s", err_msg[:100])
             result.solved = False
+            result.verified = False
             result.error = f"Verification failed: {err_msg[:200]}"
             return result
     except asyncio.TimeoutError:
-        logger.info("  Verification TIMEOUT (%ds)", verify_timeout)
+        logger.info("  Verification TIMEOUT (%ds) -- marking as unsolved", verify_timeout)
         result.solved = False
+        result.verified = False
         result.error = f"Verification timeout ({verify_timeout}s)"
         return result
     except Exception as e:
-        logger.info("  Verification ERROR: %s", e)
+        logger.info("  Verification ERROR: %s -- marking as unsolved", e)
         result.solved = False
+        result.verified = False
         result.error = f"Verification error: {e}"
         return result
 
@@ -453,10 +489,14 @@ async def run_minif2f(
     use_search: bool = False,
     search_budget: int = 64,
     use_mathlib_search: bool = False,
-    verify: bool = False,
+    verify: bool = True,
     verify_timeout: int = 150,
 ) -> BenchmarkResult:
     """Run Bourbaki on miniF2F problems and report pass rate.
+
+    Verification with lean_prover is MANDATORY (verify=True by default).
+    The ``verify`` parameter exists only for unit tests; production benchmark
+    runs must always verify.  When verify is False a warning is logged.
 
     Args:
         split: "valid", "test", or "all".
@@ -471,10 +511,18 @@ async def run_minif2f(
         use_search: Use best-first search tree after automation fails.
         search_budget: Max tactic attempts per problem for search tree.
         use_mathlib_search: Query Mathlib APIs during search tree expansion.
+        verify: Verify solved proofs with lean_prover (default True).
+                WARNING: setting this to False will produce unreliable numbers.
+        verify_timeout: Timeout for lean_prover verification per problem.
 
     Returns:
         BenchmarkResult with aggregate and per-problem results.
     """
+    if not verify:
+        logger.warning(
+            "VERIFICATION DISABLED -- benchmark results will be unreliable. "
+            "REPL-reported numbers are inflated by false positives."
+        )
     problems = load_minif2f_problems(
         split=split,
         source_filter=source_filter,
@@ -527,11 +575,13 @@ async def run_minif2f(
                     )
                 else:
                     result = await attempt_proof(problem, prove_fn, timeout)
-                if verify and result.solved:
+                # Mandatory verification: always verify REPL-reported solves
+                if result.solved and verify:
                     result = await _verify_with_lean_prover(result, verify_timeout)
                 results.append(result)
                 status = "SOLVED" if result.solved else "FAILED"
-                logger.info("  %s (%.2fs)", status, result.duration_seconds)
+                verified_tag = " (verified)" if result.verified else ""
+                logger.info("  %s%s (%.2fs)", status, verified_tag, result.duration_seconds)
         else:
             # Parallel execution with semaphore
             # Note: REPL is sequential (single process), so parallel only
@@ -553,17 +603,23 @@ async def run_minif2f(
                         result = await attempt_proof_repl(
                             problem, repl_session, timeout=timeout,
                         )
-                    if verify and result.solved:
+                    # Mandatory verification
+                    if result.solved and verify:
                         result = await _verify_with_lean_prover(result, verify_timeout)
                     results.append(result)
                     status = "SOLVED" if result.solved else "FAILED"
-                    logger.info("  %s (%.2fs)", status, result.duration_seconds)
+                    verified_tag = " (verified)" if result.verified else ""
+                    logger.info("  %s%s (%.2fs)", status, verified_tag, result.duration_seconds)
             else:
                 sem = asyncio.Semaphore(concurrency)
 
                 async def bounded_attempt(p: MiniF2FProblem) -> ProblemResult:
                     async with sem:
-                        return await attempt_proof(p, prove_fn, timeout)
+                        r = await attempt_proof(p, prove_fn, timeout)
+                        # Mandatory verification for parallel path too
+                        if r.solved and verify:
+                            r = await _verify_with_lean_prover(r, verify_timeout)
+                        return r
 
                 results = await asyncio.gather(
                     *(bounded_attempt(p) for p in problems)
@@ -575,7 +631,18 @@ async def run_minif2f(
 
     # Compute aggregate stats
     total_time = time.monotonic() - overall_start
-    solved = [r for r in results if r.solved]
+
+    # Verification guardrails: count REPL-reported vs verified
+    repl_reported_count = sum(1 for r in results if r.repl_reported)
+    verified_count = sum(1 for r in results if r.verified)
+    false_positive_count = repl_reported_count - verified_count
+
+    # The headline number is always `verified` (or `repl_reported` only
+    # if verification was explicitly disabled with a warning).
+    if verify:
+        solved = [r for r in results if r.verified]
+    else:
+        solved = [r for r in results if r.solved]
     solved_count = len(solved)
 
     by_source: dict[str, dict[str, int]] = {}
@@ -583,13 +650,16 @@ async def run_minif2f(
         if r.source not in by_source:
             by_source[r.source] = {"total": 0, "solved": 0}
         by_source[r.source]["total"] += 1
-        if r.solved:
+        if (r.verified if verify else r.solved):
             by_source[r.source]["solved"] += 1
 
     benchmark = BenchmarkResult(
         total=len(results),
         solved=solved_count,
         pass_rate=solved_count / len(results) if results else 0.0,
+        repl_reported=repl_reported_count,
+        verified=verified_count,
+        false_positives=false_positive_count,
         results=results,
         total_time_seconds=total_time,
         avg_duration_per_problem=total_time / len(results) if results else 0.0,
@@ -606,6 +676,8 @@ async def run_minif2f(
             "use_search": use_search,
             "search_budget": search_budget if use_search else None,
             "use_mathlib_search": use_mathlib_search if use_search else None,
+            "verify": verify,
+            "verify_timeout": verify_timeout,
             "prove_fn": prove_fn.__name__ if prove_fn and hasattr(prove_fn, "__name__") else "default",
         },
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -615,17 +687,64 @@ async def run_minif2f(
     # Save results
     _save_results(benchmark, split)
 
-    # Log summary
-    logger.info(
-        "miniF2F %s: %d/%d solved (%.1f%%) in %.1fs",
-        split, solved_count, len(results),
-        benchmark.pass_rate * 100, total_time,
-    )
+    # Log honest results summary
+    _log_results_summary(benchmark, split, by_source, total_time, verify)
+
+    return benchmark
+
+
+def _log_results_summary(
+    benchmark: BenchmarkResult,
+    split: str,
+    by_source: dict[str, dict[str, int]],
+    total_time: float,
+    verify: bool,
+) -> None:
+    """Log the results summary with honest verification reporting.
+
+    The headline number is always the verified count, never the
+    REPL-reported count. This prevents inflated numbers from being
+    reported.
+    """
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("RESULTS (miniF2F %s)%s", split,
+                "" if verify else " [UNVERIFIED -- UNRELIABLE]")
+    logger.info("=" * 60)
+
+    if verify:
+        logger.info(
+            "Verified:          %d/%d (%.1f%%)",
+            benchmark.verified, benchmark.total,
+            benchmark.verified / benchmark.total * 100 if benchmark.total else 0,
+        )
+        logger.info(
+            "REPL-reported:     %d/%d (%.1f%%)",
+            benchmark.repl_reported, benchmark.total,
+            benchmark.repl_reported / benchmark.total * 100 if benchmark.total else 0,
+        )
+        logger.info(
+            "False positives:   %d (%.1f%% of REPL-reported)",
+            benchmark.false_positives,
+            benchmark.false_positives / benchmark.repl_reported * 100
+            if benchmark.repl_reported else 0,
+        )
+    else:
+        logger.info(
+            "REPL-reported:     %d/%d (%.1f%%) [NOT VERIFIED]",
+            benchmark.repl_reported, benchmark.total,
+            benchmark.repl_reported / benchmark.total * 100 if benchmark.total else 0,
+        )
+
+    logger.info("Time:              %.1fs", total_time)
+    logger.info("")
+
+    # By-source breakdown
     for source, counts in sorted(by_source.items()):
         pct = counts["solved"] / counts["total"] * 100 if counts["total"] else 0
         logger.info("  %s: %d/%d (%.0f%%)", source, counts["solved"], counts["total"], pct)
 
-    return benchmark
+    logger.info("=" * 60)
 
 
 def _save_results(benchmark: BenchmarkResult, split: str) -> None:

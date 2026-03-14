@@ -83,6 +83,54 @@ AUTOMATION_TACTICS = [
     "simp_all",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Tactic blocklist: tactics known to produce REPL false positives.
+#
+# These are Lean internals, typeclass instances, or non-mathematical terms
+# that satisfy the REPL type checker (goals=[]) but are NOT valid proofs.
+# The REPL sometimes reports success for these because they produce a term
+# of the right type without actually proving the statement.
+#
+# Any proof containing a blocklisted tactic MUST be rejected before being
+# counted as solved.  This list is checked by:
+#   - The search tree (search_tree.py) before accepting goals=[]
+#   - Both benchmark runners (minif2f.py, putnam.py) as a safety net
+#
+# To add a new entry: append the exact tactic string that appears in the
+# proof code.  Partial/substring matching is used, so "exact Lean." will
+# match "exact Lean.defaultMaxRecDepth" and any other Lean.* abuse.
+# ---------------------------------------------------------------------------
+TACTIC_BLOCKLIST: list[str] = [
+    # Lean internals — not proofs
+    "exact Lean.defaultMaxRecDepth",
+    "exact Lean.",
+    # Typeclass instances — satisfy the type but prove nothing
+    "exact Float.toRatParts",
+    "exact instDecidableEqRat",
+    "exact Real.commRing",
+    "exact Real.instAdd",
+    # Application-specific non-proofs
+    "exact trapezoidal_error",
+    # Set membership false positives
+    "apply Set.mem_of_mem_filter",
+    # Placeholder/anonymous constructor abuse
+    "exact \u27e8_, _\u27e9",
+]
+
+
+def contains_blocklisted_tactic(proof_code: str) -> str | None:
+    """Check if proof code contains a blocklisted tactic.
+
+    Returns the matched blocklisted tactic string, or None if clean.
+    This is the canonical check used by benchmark runners and the search
+    tree to reject REPL false positives.
+    """
+    for blocked in TACTIC_BLOCKLIST:
+        if blocked in proof_code:
+            return blocked
+    return None
+
 # Goal pattern → candidate tactics
 # Patterns are checked against the goal string
 _GOAL_TACTIC_MAP: list[tuple[str, list[str]]] = [

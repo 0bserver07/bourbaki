@@ -57,6 +57,7 @@ async def run_enhanced_benchmark(
         ProblemResult,
         BenchmarkResult,
         _save_results,
+        _verify_with_lean_prover,
     )
     from bourbaki.benchmarks.loader import load_minif2f_problems
 
@@ -133,11 +134,19 @@ async def run_enhanced_benchmark(
                         problem_id=problem.id,
                         source=problem.source,
                         solved=True,
+                        repl_reported=True,
                         proof_code=result.proof_code,
                         duration_seconds=time.monotonic() - start,
                         attempts=sum(result.agent_stats.values()),
                     )
-                    logger.info("  SOLVED by multi-agent! (%.1fs)", pr.duration_seconds)
+                    # Mandatory verification for multi-agent results too
+                    pr = await _verify_with_lean_prover(pr, verify_timeout=150)
+                    if pr.verified:
+                        logger.info("  SOLVED by multi-agent (verified)! (%.1fs)", pr.duration_seconds)
+                    elif pr.solved:
+                        logger.info("  SOLVED by multi-agent (unverified)! (%.1fs)", pr.duration_seconds)
+                    else:
+                        logger.info("  Multi-agent false positive (%.1fs): %s", pr.duration_seconds, pr.error)
                 else:
                     pr = ProblemResult(
                         problem_id=problem.id,
@@ -181,22 +190,47 @@ async def run_enhanced_benchmark(
     else:
         multi_agent_results = []
 
-    # Final summary
+    # Final summary with honest verification reporting
     total_time = time.monotonic() - overall_start
-    baseline_solved = len(solved_ids) if baseline else 0
-    ma_solved_count = len([r for r in multi_agent_results if r.solved])
+
+    # Baseline: use verified count (the headline number from run_minif2f)
+    baseline_verified = baseline.verified if baseline else 0
+    baseline_repl = baseline.repl_reported if baseline else 0
+    baseline_fp = baseline.false_positives if baseline else 0
+
+    # Multi-agent: count verified and REPL-reported separately
+    ma_verified_count = len([r for r in multi_agent_results if r.verified])
+    ma_repl_count = len([r for r in multi_agent_results if r.repl_reported])
+    ma_fp_count = ma_repl_count - ma_verified_count
+
     total_problems = (baseline.total if baseline else len(failed_ids))
-    total_solved = baseline_solved + ma_solved_count
+    total_verified = baseline_verified + ma_verified_count
+    total_repl = baseline_repl + ma_repl_count
+    total_fp = baseline_fp + ma_fp_count
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("FINAL RESULTS")
+    logger.info("RESULTS (enhanced miniF2F)")
     logger.info("=" * 60)
-    logger.info("Total problems:    %d", total_problems)
-    logger.info("Baseline solved:   %d (%.1f%%)", baseline_solved, baseline_solved / total_problems * 100 if total_problems else 0)
-    logger.info("Multi-agent solved: %d additional", ma_solved_count)
-    logger.info("Total solved:      %d (%.1f%%)", total_solved, total_solved / total_problems * 100 if total_problems else 0)
-    logger.info("Total time:        %.1fs", total_time)
+    logger.info(
+        "Verified:          %d/%d (%.1f%%)",
+        total_verified, total_problems,
+        total_verified / total_problems * 100 if total_problems else 0,
+    )
+    logger.info(
+        "REPL-reported:     %d/%d (%.1f%%)",
+        total_repl, total_problems,
+        total_repl / total_problems * 100 if total_problems else 0,
+    )
+    logger.info(
+        "False positives:   %d (%.1f%% of REPL-reported)",
+        total_fp,
+        total_fp / total_repl * 100 if total_repl else 0,
+    )
+    logger.info("")
+    logger.info("  Baseline verified:     %d", baseline_verified)
+    logger.info("  Multi-agent verified:  %d additional", ma_verified_count)
+    logger.info("Time:              %.1fs", total_time)
     logger.info("=" * 60)
 
     # Save combined results
@@ -204,10 +238,17 @@ async def run_enhanced_benchmark(
     date_str = datetime.now().strftime("%Y-%m-%d_%H%M")
     result_data = {
         "total": total_problems,
-        "baseline_solved": baseline_solved,
-        "multi_agent_solved": ma_solved_count,
-        "total_solved": total_solved,
-        "pass_rate": total_solved / total_problems if total_problems else 0,
+        "verified": total_verified,
+        "repl_reported": total_repl,
+        "false_positives": total_fp,
+        "false_positive_rate": (
+            round(total_fp / total_repl, 4) if total_repl else 0.0
+        ),
+        "pass_rate": total_verified / total_problems if total_problems else 0,
+        "baseline_verified": baseline_verified,
+        "baseline_repl_reported": baseline_repl,
+        "multi_agent_verified": ma_verified_count,
+        "multi_agent_repl_reported": ma_repl_count,
         "total_time_seconds": total_time,
         "model": model,
         "config": {
