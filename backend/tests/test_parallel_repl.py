@@ -452,6 +452,7 @@ class TestBestFirstSearchParallel:
                 ):
                     result = await tree.best_first_search(
                         budget=10, timeout=60, use_mathlib=False, parallel=1,
+                        verify_proofs=False,
                     )
 
             assert result.success is True
@@ -493,6 +494,7 @@ class TestBestFirstSearchParallel:
                 ):
                     result = await tree.best_first_search(
                         budget=10, timeout=60, use_mathlib=False, parallel=4,
+                        verify_proofs=False,
                     )
 
             assert result.success is True
@@ -530,6 +532,7 @@ class TestBestFirstSearchParallel:
                 ):
                     result = await tree.best_first_search(
                         budget=100, timeout=60, use_mathlib=False, parallel=4,
+                        verify_proofs=False,
                     )
 
             assert result.success is False

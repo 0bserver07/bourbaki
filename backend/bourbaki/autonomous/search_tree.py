@@ -79,6 +79,8 @@ class SearchResult:
     max_depth: int = 0
     total_time: float = 0.0
     error: str | None = None
+    false_positives: int = 0
+    false_positive_tactics: list[list[str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +91,8 @@ class SearchResult:
             "max_depth": self.max_depth,
             "total_time": round(self.total_time, 2),
             "error": self.error,
+            "false_positives": self.false_positives,
+            "false_positive_tactics": self.false_positive_tactics,
         }
 
 
@@ -129,6 +133,10 @@ class ProofSearchTree:
         self._frontier: list[ProofNode] = []  # Min-heap by score
         self._explored: int = 0
         self._novelty_tracker = NoveltyTracker()  # For state deduplication + novelty bonus
+
+        # False positive tracking: REPL said goals=[] but lean_prover rejected
+        self._false_positives: int = 0
+        self._false_positive_tactics: list[list[str]] = []
 
     async def initialize(self) -> ProofNode | None:
         """Initialize the search tree by stating the theorem with sorry.
@@ -485,6 +493,65 @@ class ProofSearchTree:
                 out.append(r)
         return out
 
+    async def _inline_verify(
+        self,
+        child: ProofNode,
+        verify_timeout: int = 150,
+    ) -> bool:
+        """Verify a completed proof node using lean_prover (full compilation).
+
+        When the REPL reports goals=[], this method does a full Lean 4
+        compilation to catch false positives (e.g. unsound tactic interactions,
+        REPL state bugs). This is the key defense against the 91.8% claimed
+        vs 6.2% verified gap.
+
+        Args:
+            child: A proof node where ``is_complete`` is True.
+            verify_timeout: Timeout in seconds for the lean_prover call.
+                            Defaults to 150s because Mathlib imports are slow.
+
+        Returns:
+            True if the proof is genuinely complete, False if it's a
+            false positive (REPL lied).
+        """
+        tactic_block = "\n  ".join(child.path)
+        proof_code = f"{self.theorem} := by\n  {tactic_block}"
+
+        logger.info(
+            "Inline verification: checking REPL-complete proof at depth %d (%d tactics)",
+            child.depth, len(child.path),
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                lean_prover(code=proof_code, mode="check", timeout=verify_timeout),
+                timeout=verify_timeout + 10,  # asyncio guard above lean_prover's own timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Inline verification timed out after %ds — treating as unverified (false positive)",
+                verify_timeout,
+            )
+            self._false_positives += 1
+            self._false_positive_tactics.append(list(child.path))
+            return False
+
+        if result.get("proofComplete"):
+            logger.info("Inline verification PASSED — proof is genuine")
+            return True
+
+        # False positive: REPL said done, but lean_prover disagrees
+        self._false_positives += 1
+        self._false_positive_tactics.append(list(child.path))
+        errors = result.get("errors") or result.get("rawOutput", "")
+        logger.warning(
+            "Inline verification FAILED (false positive #%d) — "
+            "REPL claimed goals=[] but lean_prover rejected. "
+            "Tactics: %s | Errors: %s",
+            self._false_positives, child.path, errors,
+        )
+        return False
+
     async def _fetch_lsp_tactics(
         self,
         node: ProofNode,
@@ -533,6 +600,8 @@ class ProofSearchTree:
         use_mathlib: bool = True,
         use_lsp: bool = False,
         parallel: int = 1,
+        verify_proofs: bool = True,
+        verify_timeout: int = 150,
     ) -> SearchResult:
         """Run best-first search to find a proof.
 
@@ -547,6 +616,15 @@ class ProofSearchTree:
                       When 1 (default), behaves identically to the original
                       sequential algorithm.  When >1, uses the
                       ``REPLSessionPool`` to expand multiple nodes at once.
+            verify_proofs: When True (default), call lean_prover to verify
+                           any proof the REPL claims is complete (goals=[]).
+                           This catches false positives at the cost of ~150s
+                           per verification. Set to False for faster iteration
+                           during development.
+            verify_timeout: Timeout in seconds for each lean_prover
+                            verification call (default 150). Mathlib imports
+                            make compilation slow; a future warm Lean server
+                            could reduce this to <5s.
 
         Returns:
             SearchResult with success/failure details.
@@ -625,6 +703,17 @@ class ProofSearchTree:
 
                 for child in children:
                     if child.is_complete:
+                        # Inline verification: confirm REPL result with lean_prover
+                        if verify_proofs:
+                            verified = await self._inline_verify(child, verify_timeout)
+                            if not verified:
+                                # False positive — do not return success, continue searching
+                                logger.info(
+                                    "False positive at depth %d — continuing search "
+                                    "(total false positives: %d)",
+                                    child.depth, self._false_positives,
+                                )
+                                continue
                         tactic_block = "\n  ".join(child.path)
                         proof_code = f"{self.theorem} := by\n  {tactic_block}"
                         return SearchResult(
@@ -634,6 +723,8 @@ class ProofSearchTree:
                             nodes_explored=self._explored,
                             max_depth=child.depth,
                             total_time=time.monotonic() - start,
+                            false_positives=self._false_positives,
+                            false_positive_tactics=self._false_positive_tactics,
                         )
                     child.score = ucb_adjusted_score(child)
                     heapq.heappush(self._frontier, child)
@@ -706,6 +797,16 @@ class ProofSearchTree:
                 for children in all_children:
                     for child in children:
                         if child.is_complete:
+                            # Inline verification: confirm REPL result with lean_prover
+                            if verify_proofs:
+                                verified = await self._inline_verify(child, verify_timeout)
+                                if not verified:
+                                    logger.info(
+                                        "False positive (parallel) at depth %d — "
+                                        "continuing search (total false positives: %d)",
+                                        child.depth, self._false_positives,
+                                    )
+                                    continue
                             tactic_block = "\n  ".join(child.path)
                             proof_code = f"{self.theorem} := by\n  {tactic_block}"
                             return SearchResult(
@@ -715,17 +816,28 @@ class ProofSearchTree:
                                 nodes_explored=self._explored,
                                 max_depth=child.depth,
                                 total_time=time.monotonic() - start,
+                                false_positives=self._false_positives,
+                                false_positive_tactics=self._false_positive_tactics,
                             )
                         child.score = ucb_adjusted_score(child)
                         heapq.heappush(self._frontier, child)
 
         # Search exhausted
+        if self._false_positives > 0:
+            logger.warning(
+                "Search finished with %d false positive(s) detected by inline verification. "
+                "Tactic sequences that were rejected: %s",
+                self._false_positives, self._false_positive_tactics,
+            )
+
         return SearchResult(
             success=False,
             nodes_explored=self._explored,
             max_depth=max_depth_seen,
             total_time=time.monotonic() - start,
             error=f"Search exhausted after {attempts} attempts, {self._explored} nodes explored",
+            false_positives=self._false_positives,
+            false_positive_tactics=self._false_positive_tactics,
         )
 
     async def _search_mathlib(self, goals: list[str]) -> list[dict[str, Any]]:
@@ -771,6 +883,7 @@ class ProofSearchTree:
             "nodes_explored": self._explored,
             "frontier_size": len(self._frontier),
             "seen_states": self._novelty_tracker.seen_count,
+            "false_positives": self._false_positives,
         }
 
 
@@ -784,6 +897,8 @@ async def prove_with_search(
     session: LeanREPLSession | None = None,
     parallel: int = 1,
     pool: REPLSessionPool | None = None,
+    verify_proofs: bool = True,
+    verify_timeout: int = 150,
 ) -> SearchResult:
     """High-level API: prove a theorem using best-first search.
 
@@ -800,6 +915,11 @@ async def prove_with_search(
                   for backward-compatible sequential behaviour).
         pool: Optional pre-initialized ``REPLSessionPool``.  When *parallel* > 1
               and no pool is given, one is created automatically via ``get_pool()``.
+        verify_proofs: When True (default), verify REPL-complete proofs with
+                       lean_prover to catch false positives. Set to False for
+                       faster iteration during development.
+        verify_timeout: Timeout in seconds for each lean_prover verification
+                        call (default 150).
 
     Returns:
         SearchResult with proof details.
@@ -816,6 +936,8 @@ async def prove_with_search(
             use_mathlib=use_mathlib,
             use_lsp=use_lsp,
             parallel=parallel,
+            verify_proofs=verify_proofs,
+            verify_timeout=verify_timeout,
         )
     finally:
         # Only clean up if we created the session ourselves (sequential mode)
@@ -823,9 +945,12 @@ async def prove_with_search(
             await stop_session()
 
     if result.success:
+        fp_msg = ""
+        if result.false_positives > 0:
+            fp_msg = f", {result.false_positives} false positive(s) filtered"
         logger.info(
-            "Proof found: %d tactics, %d nodes explored, %.1fs",
-            len(result.proof_tactics), result.nodes_explored, result.total_time,
+            "Proof found: %d tactics, %d nodes explored, %.1fs%s",
+            len(result.proof_tactics), result.nodes_explored, result.total_time, fp_msg,
         )
 
         # Save discovered tactic sequence to the persistent lemma library
