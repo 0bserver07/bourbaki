@@ -48,6 +48,7 @@ from bourbaki.benchmarks.putnam_loader import (
     load_putnam_problems,
 )
 from bourbaki.autonomous.search_tree import prove_with_search
+from bourbaki.autonomous.tactics import TACTIC_BLOCKLIST, contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession
 
@@ -72,18 +73,11 @@ AUTOMATION_TACTICS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Tactic filtering: reject proofs that use suspicious non-proof tactics.
-# These are Lean internals, typeclass instances, or other non-mathematical
-# terms that satisfy the type checker but are not valid proofs.
+# Tactic filtering: use the shared blocklist from tactics.py.
+# The canonical list lives in bourbaki.autonomous.tactics.TACTIC_BLOCKLIST.
+# For backward compatibility, keep the old name as an alias.
 # ---------------------------------------------------------------------------
-INVALID_TACTICS = [
-    "exact Lean.defaultMaxRecDepth",
-    "exact Float.toRatParts",
-    "exact instDecidableEqRat",
-    "exact Real.commRing",
-    "exact Real.instAdd",
-    "exact trapezoidal_error",
-]
+INVALID_TACTICS = TACTIC_BLOCKLIST
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 RESULTS_DIR = _PROJECT_ROOT / ".bourbaki" / "benchmarks" / "results"
@@ -107,11 +101,9 @@ def _contains_invalid_tactic(proof_code: str) -> str | None:
     """Check if proof code contains a suspicious non-proof tactic.
 
     Returns the matched invalid tactic string, or None if clean.
+    Delegates to the canonical shared blocklist in tactics.py.
     """
-    for invalid in INVALID_TACTICS:
-        if invalid in proof_code:
-            return invalid
-    return None
+    return contains_blocklisted_tactic(proof_code)
 
 
 async def _verify_whole_file(
@@ -164,8 +156,9 @@ class ProblemResult:
     year: int
     section: str
     solved: bool
+    repl_reported: bool = False   # REPL said solved (before verification)
     has_answer: bool = False
-    verified: bool = False
+    verified: bool = False        # lean_prover confirmed the proof
     proof_code: str | None = None
     error: str | None = None
     tactics_used: int = 0
@@ -180,6 +173,7 @@ class ProblemResult:
             "year": self.year,
             "section": self.section,
             "solved": self.solved,
+            "repl_reported": self.repl_reported,
             "has_answer": self.has_answer,
             "verified": self.verified,
             "proof_code": self.proof_code,
@@ -201,6 +195,9 @@ class PutnamBenchmarkResult:
     total: int = 0
     solved: int = 0
     pass_rate: float = 0.0
+    # Verification guardrails: distinguish REPL-reported vs verified
+    repl_reported: int = 0        # Number the REPL said were solved
+    false_positives: int = 0      # REPL yes but lean_prover no
     # Separate reporting for theorem-only vs answer problems
     theorem_only_total: int = 0
     theorem_only_solved: int = 0
@@ -231,6 +228,13 @@ class PutnamBenchmarkResult:
             "total": self.total,
             "solved": self.solved,
             "pass_rate": round(self.pass_rate, 4),
+            "repl_reported": self.repl_reported,
+            "verified_count": self.verified_count,
+            "false_positives": self.false_positives,
+            "false_positive_rate": (
+                round(self.false_positives / self.repl_reported, 4)
+                if self.repl_reported else 0.0
+            ),
             "theorem_only_total": self.theorem_only_total,
             "theorem_only_solved": self.theorem_only_solved,
             "theorem_only_pass_rate": round(theorem_only_rate, 4),
@@ -238,7 +242,6 @@ class PutnamBenchmarkResult:
             "answer_skipped": self.answer_skipped,
             "answer_attempted": self.answer_attempted,
             "answer_solved": self.answer_solved,
-            "verified_count": self.verified_count,
             "tactic_filtered_count": self.tactic_filtered_count,
             "total_time_seconds": round(self.total_time_seconds, 2),
             "avg_duration_per_problem": round(self.avg_duration_per_problem, 2),
@@ -359,6 +362,7 @@ async def attempt_putnam_repl(
                 section=problem.section,
                 has_answer=problem.has_answer,
                 solved=True,
+                repl_reported=True,
                 proof_code=candidate_code,
                 tactics_used=1,
                 attempts=attempts,
@@ -453,6 +457,7 @@ async def attempt_putnam_search(
                 section=problem.section,
                 has_answer=problem.has_answer,
                 solved=True,
+                repl_reported=True,
                 proof_code=candidate_code,
                 tactics_used=len(search_result.proof_tactics),
                 attempts=search_result.nodes_explored,
@@ -504,6 +509,11 @@ async def run_putnam(
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
 
+    Verification with lean_prover is MANDATORY (verify_proofs=True by
+    default). The ``verify_proofs`` parameter exists only for unit tests;
+    production benchmark runs must always verify. When verify_proofs is
+    False a warning is logged and results are marked as unreliable.
+
     Args:
         year_filter: Filter by specific year.
         section_filter: Filter by section ("a" or "b").
@@ -520,6 +530,7 @@ async def run_putnam(
             ``attempt_answers`` is True.
         verify_proofs: After REPL/search finds a proof, verify it with
             whole-file lean_prover compilation (default True).
+            WARNING: setting this to False will produce unreliable numbers.
         verify_timeout: Timeout in seconds for whole-file verification
             (default 30).
         attempt_answers: When True, run the answer generation pipeline on
@@ -533,6 +544,11 @@ async def run_putnam(
     Returns:
         PutnamBenchmarkResult with aggregate and per-problem results.
     """
+    if not verify_proofs:
+        logger.warning(
+            "VERIFICATION DISABLED -- benchmark results will be unreliable. "
+            "REPL-reported numbers are inflated by false positives."
+        )
     problems = load_putnam_problems(
         year_filter=year_filter,
         section_filter=section_filter,
@@ -760,13 +776,22 @@ async def run_putnam(
     # Compute aggregate stats
     total_time = time.monotonic() - overall_start
     non_skipped = [r for r in results if not r.skipped]
-    solved = [r for r in non_skipped if r.solved]
-    solved_count = len(solved)
+
+    # Verification guardrails: count REPL-reported vs verified
+    repl_reported_count = sum(1 for r in non_skipped if r.repl_reported)
     verified_count = sum(1 for r in results if r.verified)
+    false_positive_count = repl_reported_count - verified_count
+
+    # The headline number is always `verified` when verification is on.
+    if verify_proofs:
+        solved = [r for r in non_skipped if r.verified]
+    else:
+        solved = [r for r in non_skipped if r.solved]
+    solved_count = len(solved)
 
     # Separate theorem-only vs answer reporting
     theorem_only = [r for r in non_skipped if not r.has_answer]
-    theorem_only_solved = [r for r in theorem_only if r.solved]
+    theorem_only_solved = [r for r in theorem_only if (r.verified if verify_proofs else r.solved)]
     answer_attempted = [r for r in non_skipped if r.has_answer]
     answer_skipped = [r for r in results if r.skipped]
 
@@ -776,7 +801,7 @@ async def run_putnam(
         if r.year not in by_year:
             by_year[r.year] = {"total": 0, "solved": 0}
         by_year[r.year]["total"] += 1
-        if r.solved:
+        if (r.verified if verify_proofs else r.solved):
             by_year[r.year]["solved"] += 1
 
     # Per-section breakdown (non-skipped only)
@@ -785,7 +810,7 @@ async def run_putnam(
         if r.section not in by_section:
             by_section[r.section] = {"total": 0, "solved": 0}
         by_section[r.section]["total"] += 1
-        if r.solved:
+        if (r.verified if verify_proofs else r.solved):
             by_section[r.section]["solved"] += 1
 
     # Per-decade breakdown (non-skipped only)
@@ -795,18 +820,20 @@ async def run_putnam(
         if decade not in by_decade:
             by_decade[decade] = {"total": 0, "solved": 0}
         by_decade[decade]["total"] += 1
-        if r.solved:
+        if (r.verified if verify_proofs else r.solved):
             by_decade[decade]["solved"] += 1
 
     # Answer-specific accounting
     answer_attempted_results = [r for r in non_skipped if r.has_answer]
-    answer_solved_results = [r for r in answer_attempted_results if r.solved]
+    answer_solved_results = [r for r in answer_attempted_results if (r.verified if verify_proofs else r.solved)]
 
     non_skipped_count = len(non_skipped)
     benchmark = PutnamBenchmarkResult(
         total=non_skipped_count,
         solved=solved_count,
         pass_rate=solved_count / non_skipped_count if non_skipped_count else 0.0,
+        repl_reported=repl_reported_count,
+        false_positives=false_positive_count,
         theorem_only_total=len(theorem_only),
         theorem_only_solved=len(theorem_only_solved),
         answer_total=len(answer_attempted_results) + len(answer_skipped),
@@ -849,37 +876,88 @@ async def run_putnam(
     # Save results
     _save_results(benchmark)
 
-    # Log summary
+    # Log honest results summary
+    _log_putnam_results_summary(
+        benchmark, non_skipped_count, theorem_only, theorem_only_solved,
+        answer_attempted_results, answer_solved_results, answer_skipped,
+        tactic_filtered, by_decade, by_section, total_time, verify_proofs,
+    )
+
+    return benchmark
+
+
+def _log_putnam_results_summary(
+    benchmark: PutnamBenchmarkResult,
+    non_skipped_count: int,
+    theorem_only: list,
+    theorem_only_solved: list,
+    answer_attempted_results: list,
+    answer_solved_results: list,
+    answer_skipped: list,
+    tactic_filtered: int,
+    by_decade: dict,
+    by_section: dict,
+    total_time: float,
+    verify_proofs: bool,
+) -> None:
+    """Log the results summary with honest verification reporting.
+
+    The headline number is always the verified count, never the
+    REPL-reported count.
+    """
     logger.info("")
     logger.info("=" * 60)
-    logger.info("PutnamBench Results")
+    logger.info("RESULTS (PutnamBench)%s",
+                "" if verify_proofs else " [UNVERIFIED -- UNRELIABLE]")
     logger.info("=" * 60)
+
+    if verify_proofs:
+        logger.info(
+            "Verified:          %d/%d (%.1f%%)",
+            benchmark.verified_count, non_skipped_count,
+            benchmark.verified_count / non_skipped_count * 100
+            if non_skipped_count else 0,
+        )
+        logger.info(
+            "REPL-reported:     %d/%d (%.1f%%)",
+            benchmark.repl_reported, non_skipped_count,
+            benchmark.repl_reported / non_skipped_count * 100
+            if non_skipped_count else 0,
+        )
+        logger.info(
+            "False positives:   %d (%.1f%% of REPL-reported)",
+            benchmark.false_positives,
+            benchmark.false_positives / benchmark.repl_reported * 100
+            if benchmark.repl_reported else 0,
+        )
+    else:
+        logger.info(
+            "REPL-reported:     %d/%d (%.1f%%) [NOT VERIFIED]",
+            benchmark.repl_reported, non_skipped_count,
+            benchmark.repl_reported / non_skipped_count * 100
+            if non_skipped_count else 0,
+        )
+
+    logger.info("")
     logger.info(
-        "Theorem-only: %d/%d solved (%.1f%%)",
+        "Theorem-only:      %d/%d (%.1f%%)",
         len(theorem_only_solved),
         len(theorem_only),
         len(theorem_only_solved) / len(theorem_only) * 100 if theorem_only else 0,
     )
     if answer_attempted_results:
         logger.info(
-            "Answer problems attempted: %d (solved: %d)",
+            "Answer problems:   %d attempted, %d solved",
             len(answer_attempted_results),
             len(answer_solved_results),
         )
     if answer_skipped:
         logger.info(
-            "Answer-sorry problems skipped: %d", len(answer_skipped),
+            "Answer-sorry:      %d skipped", len(answer_skipped),
         )
-    logger.info(
-        "Verified (whole-file): %d/%d", verified_count, solved_count,
-    )
     if tactic_filtered:
-        logger.info("Tactic-filtered (rejected): %d", tactic_filtered)
-    logger.info(
-        "Total: %d/%d solved (%.1f%%) in %.1fs",
-        solved_count, non_skipped_count,
-        benchmark.pass_rate * 100, total_time,
-    )
+        logger.info("Tactic-filtered:   %d rejected", tactic_filtered)
+    logger.info("Time:              %.1fs", total_time)
     logger.info("")
 
     # Decade breakdown
@@ -902,8 +980,6 @@ async def run_putnam(
         )
 
     logger.info("=" * 60)
-
-    return benchmark
 
 
 def _save_results(benchmark: PutnamBenchmarkResult) -> None:
@@ -978,7 +1054,7 @@ def main() -> None:
     parser.add_argument(
         "--no-verify",
         action="store_true",
-        help="Skip whole-file verification of solved proofs",
+        help="Skip whole-file verification (WARNING: produces unreliable numbers)",
     )
     parser.add_argument(
         "--verify-timeout",

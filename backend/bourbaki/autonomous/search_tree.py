@@ -22,6 +22,8 @@ from typing import Any
 
 from bourbaki.autonomous.scoring import NoveltyTracker, score_proof_state
 from bourbaki.autonomous.tactics import (
+    TACTIC_BLOCKLIST,
+    contains_blocklisted_tactic,
     generate_candidates,
     generate_correction_candidates,
     generate_mathlib_queries,
@@ -216,8 +218,17 @@ class ProofSearchTree:
             node.children.append(child)
             children.append(child)
 
-            # If proof is complete, don't add more children
+            # If proof is complete, check blocklist before accepting
             if child.is_complete:
+                blocked = contains_blocklisted_tactic(tactic)
+                if blocked:
+                    logger.info(
+                        "Rejecting blocklisted tactic at depth %d: %s",
+                        child.depth, blocked,
+                    )
+                    child.error = f"Blocklisted tactic: {blocked}"
+                    child.goals = ["REJECTED"]  # Mark as incomplete
+                    continue
                 logger.info("Proof complete at depth %d: %s", child.depth, child.path)
                 return [child]
 
@@ -269,6 +280,15 @@ class ProofSearchTree:
                 children.append(child)
 
                 if child.is_complete:
+                    blocked = contains_blocklisted_tactic(repair)
+                    if blocked:
+                        logger.info(
+                            "Rejecting blocklisted correction at depth %d: %s",
+                            child.depth, blocked,
+                        )
+                        child.error = f"Blocklisted tactic: {blocked}"
+                        child.goals = ["REJECTED"]
+                        continue
                     logger.info("Proof complete via correction at depth %d: %s", child.depth, child.path)
                     return [child]
 
@@ -351,6 +371,15 @@ class ProofSearchTree:
                 children.append(child)
 
                 if child.is_complete:
+                    blocked = contains_blocklisted_tactic(tactic)
+                    if blocked:
+                        logger.info(
+                            "Rejecting blocklisted tactic (parallel) at depth %d: %s",
+                            child.depth, blocked,
+                        )
+                        child.error = f"Blocklisted tactic: {blocked}"
+                        child.goals = ["REJECTED"]
+                        continue
                     logger.info(
                         "Proof complete (parallel) at depth %d: %s",
                         child.depth, child.path,
@@ -410,6 +439,15 @@ class ProofSearchTree:
                     children.append(child)
 
                     if child.is_complete:
+                        blocked = contains_blocklisted_tactic(repair)
+                        if blocked:
+                            logger.info(
+                                "Rejecting blocklisted correction (parallel) at depth %d: %s",
+                                child.depth, blocked,
+                            )
+                            child.error = f"Blocklisted tactic: {blocked}"
+                            child.goals = ["REJECTED"]
+                            continue
                         logger.info(
                             "Proof complete via correction (parallel) at depth %d: %s",
                             child.depth, child.path,

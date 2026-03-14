@@ -298,12 +298,14 @@ class TestProblemResultSerialization:
             year=2024,
             section="a",
             solved=True,
+            repl_reported=True,
             has_answer=False,
             verified=True,
             proof_code="theorem foo := by simp",
         )
         d = r.to_dict()
         assert d["verified"] is True
+        assert d["repl_reported"] is True
         assert d["has_answer"] is False
         assert "skipped" not in d  # not skipped
 
@@ -330,6 +332,8 @@ class TestBenchmarkResultSerialization:
             total=10,
             solved=2,
             pass_rate=0.2,
+            repl_reported=5,
+            false_positives=3,
             theorem_only_total=8,
             theorem_only_solved=2,
             answer_total=5,
@@ -345,6 +349,10 @@ class TestBenchmarkResultSerialization:
         assert d["answer_skipped"] == 3
         assert d["verified_count"] == 2
         assert d["tactic_filtered_count"] == 1
+        # Verification guardrail fields
+        assert d["repl_reported"] == 5
+        assert d["false_positives"] == 3
+        assert d["false_positive_rate"] == 0.6  # 3/5
 
     def test_zero_theorem_rate(self) -> None:
         b = PutnamBenchmarkResult(theorem_only_total=0, theorem_only_solved=0)
