@@ -10,6 +10,57 @@ import re
 from typing import Any
 
 
+# ---------------------------------------------------------------------------
+# Tactic blocklist: patterns that the REPL reports as closing goals (goals=[])
+# but that lean_prover rejects because they don't produce valid proof terms.
+#
+# These caused 100+ false positives in benchmark runs (see issue #3).
+# The blocklist is applied to ALL candidate sources (static list, lemma
+# library, LSP suggestions, Mathlib search results) via filter_blocked_tactics().
+# ---------------------------------------------------------------------------
+
+# Exact strings that are blocked outright
+_BLOCKED_TACTICS: set[str] = {
+    "exact ⟨_, _⟩",
+    "exact ⟨_⟩",
+    "exact ⟨_, _, _⟩",
+    "exact ⟨_, _, _, _⟩",
+    "refine ⟨?_, ?_⟩",
+    "refine ⟨?_, ?_, ?_⟩",
+    "exact mem_of",
+    "apply Set.mem_of_mem_filter",
+}
+
+# Regex patterns that catch broader families of bogus tactics.
+# A tactic matches if any of these patterns match.
+_BLOCKED_PATTERNS: list[re.Pattern[str]] = [
+    # Anonymous constructor with only underscores / placeholders:
+    # exact ⟨_, _, ...⟩  or  exact ⟨?_, ?_, ...⟩
+    re.compile(r"^exact\s+⟨[\s_?,]*⟩$"),
+    re.compile(r"^refine\s+⟨[\s_?,]*⟩$"),
+    # Lean internal / typeclass instances that satisfy the type checker
+    # but are not valid mathematical proofs
+    re.compile(r"^exact\s+(?:inst|Lean\.default|Float\.|Real\.comm|Real\.inst)"),
+]
+
+
+def is_blocked_tactic(tactic: str) -> bool:
+    """Return True if *tactic* is a known false-positive pattern."""
+    stripped = tactic.strip()
+    if stripped in _BLOCKED_TACTICS:
+        return True
+    return any(p.search(stripped) for p in _BLOCKED_PATTERNS)
+
+
+def filter_blocked_tactics(tactics: list[str]) -> list[str]:
+    """Remove blocked tactics from a candidate list.
+
+    This should be called on every tactic list before it reaches the REPL,
+    regardless of its source (static generation, lemma library, LSP, etc.).
+    """
+    return [t for t in tactics if not is_blocked_tactic(t)]
+
+
 # Standard automation tactics — always worth trying
 AUTOMATION_TACTICS = [
     "simp",
@@ -186,7 +237,9 @@ def generate_candidates(
             _add(f"simp at {h}")
             _add(f"rw [{h}]")
 
-    return candidates
+    # Final safety pass: strip any blocked false-positive patterns that
+    # may have entered via the lemma library or other dynamic sources.
+    return filter_blocked_tactics(candidates)
 
 
 def generate_correction_candidates(

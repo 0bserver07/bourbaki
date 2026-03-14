@@ -166,3 +166,28 @@ async def test_fetch_lsp_tactics_strips_whitespace():
     assert "" not in result
     assert "ring" in result
     assert "omega" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_lsp_tactics_filters_blocked():
+    """LSP suggestions containing blocked false-positive tactics should be excluded."""
+    tree = ProofSearchTree("theorem foo : 1 + 1 = 2")
+    node = ProofNode(
+        proof_state=0,
+        goals=["⊢ 1 + 1 = 2"],
+        tactic_history=[],
+        depth=0,
+    )
+
+    with patch(
+        "bourbaki.autonomous.search_tree.lsp_suggest_tactics",
+        new_callable=AsyncMock,
+        return_value=["ring", "exact ⟨_, _⟩", "omega", "refine ⟨?_, ?_⟩"],
+    ):
+        result = await tree._fetch_lsp_tactics(node, set(), timeout=5.0)
+
+    # Blocked tactics should be filtered out
+    assert "ring" in result
+    assert "omega" in result
+    assert "exact ⟨_, _⟩" not in result
+    assert "refine ⟨?_, ?_⟩" not in result

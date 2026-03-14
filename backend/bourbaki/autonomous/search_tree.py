@@ -22,9 +22,11 @@ from typing import Any
 
 from bourbaki.autonomous.scoring import NoveltyTracker, score_proof_state
 from bourbaki.autonomous.tactics import (
+    filter_blocked_tactics,
     generate_candidates,
     generate_correction_candidates,
     generate_mathlib_queries,
+    is_blocked_tactic,
 )
 from bourbaki.tools.lean_lsp_tools import lsp_suggest_tactics
 from bourbaki.tools.lean_prover import lean_prover
@@ -179,6 +181,9 @@ class ProofSearchTree:
         children: list[ProofNode] = []
         correction_queue: list[tuple[str, str, int]] = []  # (tactic, error, round)
 
+        # Pre-filter: strip blocked tactics before sending to the REPL
+        candidates = filter_blocked_tactics(candidates)
+
         for tactic in candidates:
             result = await lean_tactic(
                 goal=self.theorem,
@@ -314,6 +319,9 @@ class ProofSearchTree:
             # Now try each candidate tactic against the replayed proof state
             children: list[ProofNode] = []
             correction_queue: list[tuple[str, str, int]] = []
+
+            # Pre-filter: strip blocked tactics before sending to the REPL
+            candidates = filter_blocked_tactics(candidates)
 
             for tactic in candidates:
                 result = await lean_tactic(
@@ -518,11 +526,11 @@ class ProofSearchTree:
             logger.debug("LSP tactic fetch failed (depth=%d): %s", node.depth, exc)
             return []
 
-        # Deduplicate against what we already have
+        # Deduplicate against what we already have and filter blocked tactics
         new_tactics: list[str] = []
         for s in suggestions:
             s = s.strip()
-            if s and s not in existing:
+            if s and s not in existing and not is_blocked_tactic(s):
                 new_tactics.append(s)
         return new_tactics
 
