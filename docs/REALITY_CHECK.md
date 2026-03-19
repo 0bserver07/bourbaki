@@ -89,6 +89,65 @@ coordination gets you surprisingly far.
 
 ---
 
+## 2026-03-18 — Post-fix verified run: 10/35 sample (28.6%)
+
+### What was run
+
+35-problem stratified sample across all miniF2F valid categories, with all
+correctness fixes applied: `_build_proof_code` (#2), tactic blocklist (#3),
+inline `lean_prover` verification (#6), benchmark guardrails (#9), and
+`expand()` early-return fix.
+
+### Results
+
+| Category | Verified | Rate |
+|----------|---------|------|
+| mathd | 8/15 | 53% |
+| algebra | 1/5 | 20% |
+| unknown (AMC) | 1/5 | 20% |
+| aime | 0/3 | 0% |
+| imo | 0/3 | 0% |
+| induction | 0/2 | 0% |
+| numbertheory | 0/2 | 0% |
+
+### What's new
+
+- **Multi-step proofs now verify.** `mathd_algebra_192` (4 tactics:
+  `aesop → field_simp → ring → norm_num`) and `mathd_algebra_234`
+  (2 tactics: `simp [pow_succ] → nlinarith`) both verified. Previously
+  all 63 verified solves were single-tactic.
+
+- **Inline verification catches false positives during search.** The
+  `induction n with | zero => simp | succ n ih => simp_all` pattern
+  triggered 18 false positives on a single problem. All caught and rejected
+  before reaching results.
+
+- **Zero false positives in final results.** REPL-reported == verified
+  for the first time.
+
+### What's still broken
+
+- **`induction...simp_all` is a false positive factory.** Every problem
+  with an induction-shaped goal gets poisoned. Each verification costs ~6s.
+  Needs blocklisting (#10).
+
+- **The overall rate (28.6%) is not meaningfully different from 25.8%.**
+  The fixes improved correctness and caught a new solve (`mathd_algebra_547`),
+  but the verified rate didn't jump. The 63/244 baseline was already accurate.
+
+### Current honest comparison
+
+| System | miniF2F Valid | Verified? |
+|--------|-------------|-----------|
+| HILBERT | 99.2% | Yes (published) |
+| BFS-Prover-V2 | 95.08% | Yes (published) |
+| Goedel-V2 | 90.4% | Yes (published) |
+| Aristotle | 90% | Yes (published) |
+| DeepSeek-V2 | 88.9% | Yes (published) |
+| **Bourbaki** | **~26-29%** | **Yes (lean_prover verified)** |
+
+---
+
 ## 2026-02-22 — Verified miniF2F: 15/244 (6.2%)
 
 ### The verified number

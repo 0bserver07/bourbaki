@@ -239,6 +239,32 @@ requires a trained proof model, which is a research project.
 
 ---
 
+## 2026-03-18 Update: Post-fix verified run
+
+After merging fixes #2, #3, #6, #9 and the `expand()` early-return fix, a
+35-problem stratified sample was run with full verification.
+
+**Result: 10/35 verified (28.6%)** — consistent with the 25.8% baseline.
+
+Key findings:
+- **Multi-step proofs now verify.** Two 2-4 tactic proofs passed lean_prover
+  for the first time. The proof_code fix (#2) was essential.
+- **Inline verification works.** Zero false positives reached final results.
+  The `induction...simp_all` pattern was caught 18 times on a single problem.
+- **The expand() early-return bug was wasting search budget.** 8/26 failed
+  problems were stuck at 1 node explored. After the fix, one of them
+  (`mathd_algebra_547`) was solved.
+- **New blocker: `induction...simp_all` needs blocklisting (#10).** This
+  pattern poisons every induction-shaped problem and wastes ~6s per
+  verification attempt.
+
+The verified rate didn't jump — the 25.8% baseline was already honest. What
+changed is that the system is now structurally correct: false positives are
+caught during search, not counted in results, and the reporting format
+distinguishes REPL-reported from verified.
+
+---
+
 ## Lessons Learned
 
 ### 1. Verify before you celebrate

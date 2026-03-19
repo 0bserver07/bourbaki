@@ -297,7 +297,9 @@ class ProofSearchTree:
                     child.goals = ["REJECTED"]  # Mark as incomplete
                     continue
                 logger.info("Proof complete at depth %d: %s", child.depth, child.path)
-                return [child]
+                # Don't return early — continue trying other tactics so the
+                # search tree has alternatives if inline verification rejects
+                # this proof.  best_first_search() handles verification.
 
         # Error-conditioned correction loop (Goedel-V2 style)
         seen_corrections: set[str] = set()
@@ -357,7 +359,6 @@ class ProofSearchTree:
                         child.goals = ["REJECTED"]
                         continue
                     logger.info("Proof complete via correction at depth %d: %s", child.depth, child.path)
-                    return [child]
 
         return children
 
@@ -454,7 +455,6 @@ class ProofSearchTree:
                         "Proof complete (parallel) at depth %d: %s",
                         child.depth, child.path,
                     )
-                    return [child]
 
             # Error-conditioned correction loop
             seen_corrections: set[str] = set()
@@ -522,7 +522,6 @@ class ProofSearchTree:
                             "Proof complete via correction (parallel) at depth %d: %s",
                             child.depth, child.path,
                         )
-                        return [child]
 
             return children
 
