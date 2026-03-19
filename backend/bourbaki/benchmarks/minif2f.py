@@ -334,11 +334,15 @@ async def attempt_proof_search(
     budget: int = 64,
     timeout: int = 60,
     use_mathlib: bool = False,
+    use_llm: bool = False,
+    llm_model: str = "glm:glm-5",
+    use_decompose: bool = False,
 ) -> ProblemResult:
-    """Attempt to prove a problem using best-first search tree.
+    """Attempt to prove a problem using automation, decomposition, and search.
 
-    First tries automation tactics via REPL (fast). If those fail, runs a
-    best-first search over tactic sequences.
+    Phase 1: Automation tactics via REPL (fast, ~27% solve rate).
+    Phase 2: HILBERT-style decomposition via LLM sketch + subgoal solving.
+    Phase 3: Flat best-first search tree (fallback).
 
     Args:
         problem: The miniF2F problem to attempt.
@@ -346,6 +350,10 @@ async def attempt_proof_search(
         budget: Max tactic attempts for the search tree.
         timeout: Timeout in seconds for the entire problem.
         use_mathlib: Whether to query Mathlib search during tree expansion.
+        use_llm: Whether to use LLM for tactic suggestions in search.
+        llm_model: Model string for LLM calls.
+        use_decompose: Whether to use HILBERT-style decomposition before
+                       falling back to flat search.
 
     Returns:
         ProblemResult with success/failure details.
@@ -359,8 +367,7 @@ async def attempt_proof_search(
     if auto_result.solved:
         return auto_result
 
-    # Phase 2: Best-first search tree
-    # Build the theorem statement for the search tree
+    # Build the theorem statement for search/decomposition
     preamble_lines = []
     for line in problem.full_lean_code.split("\n"):
         stripped = line.strip()
@@ -376,8 +383,72 @@ async def attempt_proof_search(
 
     remaining_time = timeout - (time.monotonic() - start)
     if remaining_time <= 5:
-        return auto_result  # Not enough time for search
+        return auto_result
 
+    # Phase 2: HILBERT-style decomposition (LLM sketch → subgoal solving)
+    if use_decompose:
+        try:
+            from bourbaki.autonomous.decomposer import (
+                DecompositionConfig,
+                decompose_and_prove,
+            )
+
+            decomp_timeout = min(remaining_time * 0.6, remaining_time - 10)
+            decomp_config = DecompositionConfig(
+                max_decomposition_depth=2,
+                max_sketches=2,
+                subgoal_search_budget=max(budget // 2, 20),
+                subgoal_search_timeout=min(decomp_timeout / 3, 30.0),
+                model=llm_model,
+                verify_stitched=True,
+                use_nl_reasoning=True,
+                parallel_subgoals=False,  # REPL is single-process, can't parallelize
+            )
+
+            logger.info("Phase 2: decomposition for %s (%.0fs budget)", problem.id, decomp_timeout)
+            decomp_result = await asyncio.wait_for(
+                decompose_and_prove(theorem=theorem, config=decomp_config),
+                timeout=decomp_timeout + 5,
+            )
+
+            if decomp_result.success and decomp_result.proof_code:
+                logger.info(
+                    "Decomposition solved %s: %d/%d subgoals, verified=%s",
+                    problem.id, decomp_result.subgoals_solved,
+                    decomp_result.subgoals_total, decomp_result.verified,
+                )
+                return ProblemResult(
+                    problem_id=problem.id,
+                    source=problem.source,
+                    solved=True,
+                    repl_reported=True,
+                    proof_code=decomp_result.proof_code,
+                    tactics_used=decomp_result.subgoals_solved,
+                    attempts=auto_result.attempts,
+                    duration_seconds=time.monotonic() - start,
+                )
+            else:
+                logger.info(
+                    "Decomposition partial for %s: %d/%d subgoals, falling back to search",
+                    problem.id, decomp_result.subgoals_solved, decomp_result.subgoals_total,
+                )
+        except asyncio.TimeoutError:
+            logger.info("Decomposition timed out for %s, falling back to search", problem.id)
+        except Exception as e:
+            logger.warning("Decomposition failed for %s: %s", problem.id, e)
+
+        remaining_time = timeout - (time.monotonic() - start)
+        if remaining_time <= 5:
+            return ProblemResult(
+                problem_id=problem.id,
+                source=problem.source,
+                solved=False,
+                error=f"Automation + decomposition failed, no time for search",
+                attempts=auto_result.attempts,
+                duration_seconds=time.monotonic() - start,
+            )
+
+    # Phase 3: Flat best-first search tree (fallback)
     try:
         search_result = await asyncio.wait_for(
             prove_with_search(
@@ -386,13 +457,14 @@ async def attempt_proof_search(
                 timeout=remaining_time,
                 max_depth=15,
                 use_mathlib=use_mathlib,
+                use_llm=use_llm,
+                llm_model=llm_model,
                 session=session,
             ),
             timeout=remaining_time + 5,
         )
 
         if search_result.success:
-            # Build full proof code with imports/preamble
             tactic_block = "\n  ".join(search_result.proof_tactics)
             full_proof = problem.full_lean_code.replace(
                 "sorry", tactic_block,
@@ -413,7 +485,7 @@ async def attempt_proof_search(
                 problem_id=problem.id,
                 source=problem.source,
                 solved=False,
-                error=f"Automation + search failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
+                error=f"All phases failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
                 attempts=auto_result.attempts + search_attempts,
                 duration_seconds=time.monotonic() - start,
             )
@@ -424,7 +496,7 @@ async def attempt_proof_search(
         problem_id=problem.id,
         source=problem.source,
         solved=False,
-        error=f"Automation + search failed ({auto_result.attempts} auto + search)",
+        error=f"All phases failed ({auto_result.attempts} auto + search)",
         attempts=auto_result.attempts,
         duration_seconds=time.monotonic() - start,
     )
@@ -489,6 +561,9 @@ async def run_minif2f(
     use_search: bool = False,
     search_budget: int = 64,
     use_mathlib_search: bool = False,
+    use_llm: bool = False,
+    llm_model: str = "glm:glm-5",
+    use_decompose: bool = False,
     verify: bool = True,
     verify_timeout: int = 150,
 ) -> BenchmarkResult:
@@ -568,6 +643,9 @@ async def run_minif2f(
                         budget=search_budget,
                         timeout=timeout,
                         use_mathlib=use_mathlib_search,
+                        use_llm=use_llm,
+                        llm_model=llm_model,
+                        use_decompose=use_decompose,
                     )
                 elif repl_session is not None:
                     result = await attempt_proof_repl(

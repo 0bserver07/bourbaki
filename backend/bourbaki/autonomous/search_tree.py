@@ -27,6 +27,7 @@ from bourbaki.autonomous.tactics import (
     filter_blocked_tactics,
     generate_candidates,
     generate_correction_candidates,
+    generate_llm_tactics,
     generate_mathlib_queries,
     is_blocked_tactic,
 )
@@ -698,6 +699,8 @@ class ProofSearchTree:
         timeout: float = 300.0,
         use_mathlib: bool = True,
         use_lsp: bool = False,
+        use_llm: bool = False,
+        llm_model: str = "glm:glm-5",
         parallel: int = 1,
         verify_proofs: bool = True,
         verify_timeout: int = 150,
@@ -711,6 +714,8 @@ class ProofSearchTree:
             use_mathlib: Whether to query mathlib_search for candidates.
             use_lsp: Whether to query the Lean LSP for tactic completions
                      at shallow depths (depth < 3).
+            use_llm: Whether to query an LLM for tactic suggestions.
+            llm_model: Model string for LLM tactic generation.
             parallel: Number of frontier nodes to expand concurrently.
                       When 1 (default), behaves identically to the original
                       sequential algorithm.  When >1, uses the
@@ -795,6 +800,24 @@ class ProofSearchTree:
                         logger.debug(
                             "LSP added %d tactics at depth %d",
                             len(lsp_tactics), node.depth,
+                        )
+
+                if use_llm and node.depth < 5:
+                    existing = set(candidates)
+                    llm_tactics = await generate_llm_tactics(
+                        goals=node.goals,
+                        theorem=self.theorem,
+                        model=llm_model,
+                    )
+                    for t in llm_tactics:
+                        if t not in existing:
+                            candidates.append(t)
+                            existing.add(t)
+                    if llm_tactics:
+                        logger.info(
+                            "LLM added %d new tactics at depth %d",
+                            sum(1 for t in llm_tactics if t not in existing),
+                            node.depth,
                         )
 
                 children = await self.expand(node, candidates)
@@ -987,6 +1010,8 @@ async def prove_with_search(
     max_depth: int = 30,
     use_mathlib: bool = True,
     use_lsp: bool = False,
+    use_llm: bool = False,
+    llm_model: str = "glm:glm-5",
     session: LeanREPLSession | None = None,
     parallel: int = 1,
     pool: REPLSessionPool | None = None,
@@ -1002,6 +1027,8 @@ async def prove_with_search(
         max_depth: Maximum proof depth.
         use_mathlib: Whether to search Mathlib for lemmas.
         use_lsp: Whether to use Lean LSP tactic completions at shallow depths.
+        use_llm: Whether to use LLM for tactic suggestions.
+        llm_model: Model string for LLM tactic generation.
         session: Optional pre-initialized REPL session. If None, creates and
                  manages a singleton session (which is stopped on completion).
         parallel: Number of frontier nodes to expand concurrently (default 1
@@ -1028,6 +1055,8 @@ async def prove_with_search(
             timeout=timeout,
             use_mathlib=use_mathlib,
             use_lsp=use_lsp,
+            use_llm=use_llm,
+            llm_model=llm_model,
             parallel=parallel,
             verify_proofs=verify_proofs,
             verify_timeout=verify_timeout,

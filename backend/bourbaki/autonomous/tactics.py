@@ -1,13 +1,16 @@
 """Tactic candidate generation for proof search.
 
 Generates ranked lists of candidate tactics to try at each proof state,
-based on goal structure and available Mathlib lemmas.
+based on goal structure, available Mathlib lemmas, and LLM suggestions.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -388,3 +391,100 @@ def generate_mathlib_queries(goals: list[str]) -> list[tuple[str, str]]:
         queries.append((nl_query[:100], "natural"))
 
     return queries
+
+
+# ---------------------------------------------------------------------------
+# LLM-based tactic generation
+# ---------------------------------------------------------------------------
+
+_LLM_TACTIC_PROMPT = """\
+You are a Lean 4 theorem proving assistant. Given the current proof goal, \
+suggest tactics that could make progress or close the goal.
+
+Current goal:
+{goal}
+
+{context}
+
+Respond with ONLY a JSON array of tactic strings. Each tactic should be a \
+valid Lean 4 tactic. Suggest 5-10 tactics, ordered by likelihood of success.
+Prefer concrete, specific tactics over vague ones.
+
+Examples of good responses:
+["norm_num", "ring", "simp [Nat.add_comm]", "linarith", "omega"]
+["intro h", "cases h with | inl h1 => exact h1 | inr h2 => exact h2"]
+["rw [mul_comm]", "ring_nf", "nlinarith [sq_nonneg (a - b)]"]
+
+Respond with ONLY the JSON array, nothing else."""
+
+
+async def generate_llm_tactics(
+    goals: list[str],
+    theorem: str = "",
+    model: str = "glm:glm-5",
+    timeout: float = 15.0,
+) -> list[str]:
+    """Generate tactic candidates using an LLM.
+
+    Asks the LLM to suggest tactics for the current proof state. The
+    suggestions are filtered through the blocklist before returning.
+
+    Args:
+        goals: Current remaining goals from the proof state.
+        theorem: The theorem being proved (for context).
+        model: Model string (e.g. "glm:glm-5").
+        timeout: Timeout in seconds for the LLM call.
+
+    Returns:
+        List of tactic strings (may be empty on failure/timeout).
+    """
+    import asyncio
+    import json as _json
+
+    if not goals:
+        return []
+
+    primary_goal = goals[0]
+    context = f"Theorem: {theorem[:200]}" if theorem else ""
+
+    prompt = _LLM_TACTIC_PROMPT.format(goal=primary_goal, context=context)
+
+    try:
+        from pydantic_ai import Agent
+        from bourbaki.agent.core import _resolve_model_object
+
+        resolved_model = _resolve_model_object(model)
+        agent: Agent[None, str] = Agent(
+            resolved_model,
+            system_prompt="You are a Lean 4 tactic suggestion engine. Respond only with JSON arrays of tactic strings.",
+        )
+
+        result = await asyncio.wait_for(
+            agent.run(prompt),
+            timeout=timeout,
+        )
+
+        raw = result.output.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+
+        tactics = _json.loads(raw)
+        if not isinstance(tactics, list):
+            return []
+
+        tactics = [str(t).strip() for t in tactics if isinstance(t, str) and t.strip()]
+        tactics = filter_blocked_tactics(tactics)
+
+        logger.info("LLM suggested %d tactics for goal: %s", len(tactics), primary_goal[:60])
+        return tactics
+
+    except asyncio.TimeoutError:
+        logger.warning("LLM tactic generation timed out after %.1fs", timeout)
+        return []
+    except Exception as e:
+        logger.warning("LLM tactic generation failed: %s", e)
+        return []
