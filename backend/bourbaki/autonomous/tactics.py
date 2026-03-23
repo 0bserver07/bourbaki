@@ -44,6 +44,12 @@ _BLOCKED_PATTERNS: list[re.Pattern[str]] = [
     # Lean internal / typeclass instances that satisfy the type checker
     # but are not valid mathematical proofs
     re.compile(r"^exact\s+(?:inst|Lean\.default|Float\.|Real\.comm|Real\.inst)"),
+    # induction/cases with simp_all closer — REPL reports goals=[] but
+    # lean_prover rejects with "unsolved goals" or "simp_all made no progress".
+    # This pattern generated 18 false positives on a single problem (#10).
+    # re.DOTALL because the tactic spans multiple lines.
+    re.compile(r"induction\s+\w+\s+with.*simp_all", re.DOTALL),
+    re.compile(r"cases\s+\w+\s+with.*simp_all", re.DOTALL),
 ]
 
 
@@ -274,9 +280,7 @@ def generate_candidates(
         if var_match:
             var = var_match.group(1)
             _add(f"induction {var}")
-            _add(f"induction {var} with\n| zero => simp\n| succ n ih => simp_all")
             _add(f"cases {var}")
-            _add(f"cases {var} with\n| zero => simp\n| succ n => simp_all")
         else:
             _add("induction n")
             _add("cases n")

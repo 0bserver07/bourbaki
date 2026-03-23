@@ -29,6 +29,7 @@ from bourbaki.autonomous.formalizer import (
     stitch_proofs,
 )
 from bourbaki.autonomous.search_tree import SearchResult, prove_with_search
+from bourbaki.tools.lean_repl import LeanREPLSession
 from bourbaki.autonomous.sketch import (
     LLMSketchGenerator,
     ProofSketch,
@@ -206,11 +207,22 @@ async def _solve_single_subgoal(
             )
 
     # Step 1: Try flat search (best-first tactic search)
+    # Each subgoal gets its own REPL session to avoid concurrency issues
+    # with the global singleton session.
+    try:
+        subgoal_session = LeanREPLSession(import_full_mathlib=True)
+        await subgoal_session.start()
+        await subgoal_session.ensure_initialized()
+    except Exception as e:
+        logger.warning("Failed to start REPL session for subgoal %s: %s", subgoal.label, e)
+        subgoal_session = None
+
     try:
         search_result = await prove_with_search(
             theorem=subgoal_theorem,
             budget=budget,
             timeout=timeout,
+            session=subgoal_session,
         )
 
         if search_result.success:
@@ -229,6 +241,12 @@ async def _solve_single_subgoal(
             )
     except Exception as e:
         logger.warning("Search failed for subgoal %s: %s", subgoal.label, e)
+    finally:
+        if subgoal_session is not None:
+            try:
+                await subgoal_session.stop()
+            except Exception:
+                pass
 
     # Step 2: If search failed and we have depth budget, recursively decompose
     if depth < config.max_decomposition_depth:
