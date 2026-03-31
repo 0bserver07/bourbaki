@@ -161,6 +161,7 @@ async def _solve_single_subgoal(
     previous_attempts: list[str],
     solved_siblings: dict[str, list[str]],
     lemma_cache: LemmaCache | None = None,
+    session: LeanREPLSession | None = None,
 ) -> SubgoalResult:
     """Solve a single subgoal: first try flat search, then recursive decomposition.
 
@@ -177,7 +178,11 @@ async def _solve_single_subgoal(
         SubgoalResult with success/failure and proof tactics.
     """
     start = time.monotonic()
-    subgoal_theorem = f"theorem {subgoal.label} : {subgoal.lean_type}"
+    # Use a unique label to avoid "already been declared" errors when
+    # reusing a warm REPL session across multiple problems/sketches (#12).
+    import uuid
+    unique_label = f"{subgoal.label}_{uuid.uuid4().hex[:8]}"
+    subgoal_theorem = f"theorem {unique_label} : {subgoal.lean_type}"
 
     # Compute depth-adjusted budget and timeout
     budget = _budget_for_depth(config.subgoal_search_budget, depth, config.budget_decay_factor)
@@ -207,22 +212,15 @@ async def _solve_single_subgoal(
             )
 
     # Step 1: Try flat search (best-first tactic search)
-    # Each subgoal gets its own REPL session to avoid concurrency issues
-    # with the global singleton session.
-    try:
-        subgoal_session = LeanREPLSession(import_full_mathlib=True)
-        await subgoal_session.start()
-        await subgoal_session.ensure_initialized()
-    except Exception as e:
-        logger.warning("Failed to start REPL session for subgoal %s: %s", subgoal.label, e)
-        subgoal_session = None
-
+    # Use the warm session passed from the caller if available.
+    # This avoids the ~80s Mathlib import that was causing every
+    # subgoal to timeout before search even started (#12).
     try:
         search_result = await prove_with_search(
             theorem=subgoal_theorem,
             budget=budget,
             timeout=timeout,
-            session=subgoal_session,
+            session=session,
         )
 
         if search_result.success:
@@ -241,12 +239,6 @@ async def _solve_single_subgoal(
             )
     except Exception as e:
         logger.warning("Search failed for subgoal %s: %s", subgoal.label, e)
-    finally:
-        if subgoal_session is not None:
-            try:
-                await subgoal_session.stop()
-            except Exception:
-                pass
 
     # Step 2: If search failed and we have depth budget, recursively decompose
     if depth < config.max_decomposition_depth:
@@ -270,6 +262,7 @@ async def _solve_single_subgoal(
             sketch_generator=sketch_generator,
             depth=depth + 1,
             previous_attempts=context_hints,
+            session=session,
         )
 
         elapsed = time.monotonic() - start
@@ -318,6 +311,7 @@ async def _solve_subgoals_parallel(
     depth: int,
     previous_attempts: list[str],
     lemma_cache: LemmaCache | None = None,
+    session: LeanREPLSession | None = None,
 ) -> list[SubgoalResult]:
     """Solve independent subgoals in parallel, dependent ones sequentially.
 
@@ -363,6 +357,7 @@ async def _solve_subgoals_parallel(
                         sg, config, sketch_generator, depth,
                         previous_attempts, dict(solved_proofs),
                         lemma_cache=lemma_cache,
+                        session=session,
                     )
 
             batch_results = await asyncio.gather(
@@ -393,6 +388,7 @@ async def _solve_subgoals_parallel(
                     sg, config, sketch_generator, depth,
                     previous_attempts, dict(solved_proofs),
                     lemma_cache=lemma_cache,
+                    session=session,
                 )
                 results[sg.label] = sr
                 if sr.success:
@@ -424,6 +420,7 @@ async def decompose_and_prove(
     sketch_generator: SketchGenerator | None = None,
     depth: int = 0,
     previous_attempts: list[str] | None = None,
+    session: LeanREPLSession | None = None,
 ) -> DecompositionResult:
     """Recursively decompose a theorem into subgoals and prove each.
 
@@ -514,6 +511,7 @@ async def decompose_and_prove(
             depth=depth,
             previous_attempts=previous_attempts or [],
             lemma_cache=lemma_cache,
+            session=session,
         )
 
         # Collect results

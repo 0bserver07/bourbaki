@@ -407,7 +407,7 @@ async def attempt_proof_search(
 
             logger.info("Phase 2: decomposition for %s (%.0fs budget)", problem.id, decomp_timeout)
             decomp_result = await asyncio.wait_for(
-                decompose_and_prove(theorem=theorem, config=decomp_config),
+                decompose_and_prove(theorem=theorem, config=decomp_config, session=session),
                 timeout=decomp_timeout + 5,
             )
 
