@@ -63,6 +63,9 @@ class DecompositionConfig:
     max_parallel: int = 4
     # Aletheia-style NL reasoning: let the LLM reason freely before formalization
     use_nl_reasoning: bool = True
+    # Preamble (open directives, set_option) to prepend to subgoal theorems.
+    # Without this, subgoals using Real.logb etc. fail with "Unknown constant".
+    preamble: str = ""
 
     # Legacy alias
     @property
@@ -182,7 +185,8 @@ async def _solve_single_subgoal(
     # reusing a warm REPL session across multiple problems/sketches (#12).
     import uuid
     unique_label = f"{subgoal.label}_{uuid.uuid4().hex[:8]}"
-    subgoal_theorem = f"theorem {unique_label} : {subgoal.lean_type}"
+    theorem_decl = f"theorem {unique_label} : {subgoal.lean_type}"
+    subgoal_theorem = f"{config.preamble}\n{theorem_decl}" if config.preamble else theorem_decl
 
     # Compute depth-adjusted budget and timeout
     budget = _budget_for_depth(config.subgoal_search_budget, depth, config.budget_decay_factor)
@@ -221,6 +225,7 @@ async def _solve_single_subgoal(
             budget=budget,
             timeout=timeout,
             session=session,
+            use_mathlib=False,  # Fix #2: Mathlib results produce REPL false positives
         )
 
         if search_result.success:

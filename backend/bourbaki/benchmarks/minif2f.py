@@ -396,13 +396,14 @@ async def attempt_proof_search(
             decomp_timeout = min(remaining_time * 0.6, remaining_time - 10)
             decomp_config = DecompositionConfig(
                 max_decomposition_depth=2,
-                max_sketches=2,
+                max_sketches=1,  # Fix #3: 1 sketch first pass, saves ~15s LLM time
                 subgoal_search_budget=max(budget // 2, 20),
-                subgoal_search_timeout=min(decomp_timeout / 3, 30.0),
+                subgoal_search_timeout=min(decomp_timeout / 2, 45.0),  # Fix #3: more time per subgoal
                 model=llm_model,
                 verify_stitched=True,
-                use_nl_reasoning=True,
-                parallel_subgoals=False,  # REPL is single-process, can't parallelize
+                use_nl_reasoning=False,  # Fix #3: skip NL pre-pass, saves ~15s
+                parallel_subgoals=False,
+                preamble=preamble,  # Fix #1: open directives for subgoals
             )
 
             logger.info("Phase 2: decomposition for %s (%.0fs budget)", problem.id, decomp_timeout)
