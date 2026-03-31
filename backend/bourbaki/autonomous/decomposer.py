@@ -408,6 +408,134 @@ async def _solve_subgoals_parallel(
     return [results[sg.label] for sg in subgoals if sg.label in results]
 
 
+async def _solve_subgoals_in_context(
+    skeleton: "FormalizedSkeleton",
+    config: DecompositionConfig,
+    session: LeanREPLSession,
+    lemma_cache: LemmaCache | None = None,
+) -> list[SubgoalResult]:
+    """Solve subgoals in-context by using the REPL's sorry proof states.
+
+    Instead of creating standalone theorems (which lose hypotheses),
+    this sends the full skeleton to the REPL and solves each sorry
+    in the proof context where parent hypotheses are available.
+
+    Args:
+        skeleton: Formalized skeleton with sorry placeholders.
+        config: Decomposition configuration.
+        session: Warm REPL session with Mathlib loaded.
+        lemma_cache: Optional shared cache.
+
+    Returns:
+        List of SubgoalResult, one per subgoal.
+    """
+    # Send the skeleton to the REPL to get proof states for each sorry
+    result = await session.send_cmd(skeleton.code, timeout=30)
+    sorries = result.get("sorries", [])
+
+    if not sorries or len(sorries) != len(skeleton.subgoals):
+        logger.warning(
+            "In-context solving: expected %d sorries, got %d. Falling back.",
+            len(skeleton.subgoals), len(sorries),
+        )
+        return []  # Caller will fall back to standalone approach
+
+    results: list[SubgoalResult] = []
+    for subgoal, sorry_info in zip(skeleton.subgoals, sorries):
+        start = time.monotonic()
+
+        if not isinstance(sorry_info, dict):
+            results.append(SubgoalResult(
+                label=subgoal.label, lean_type=subgoal.lean_type,
+                success=False, error="Invalid sorry info from REPL",
+            ))
+            continue
+
+        proof_state = sorry_info.get("proofState", 0)
+        goals = sorry_info.get("goals", sorry_info.get("goal", []))
+        if isinstance(goals, str):
+            goals = [goals]
+
+        budget = _budget_for_depth(
+            config.subgoal_search_budget, 0, config.budget_decay_factor,
+        )
+        timeout_s = _timeout_for_depth(
+            config.subgoal_search_timeout, 0, config.timeout_decay_factor,
+        )
+
+        logger.info(
+            "Solving subgoal %s in-context (ps=%d, budget=%d, timeout=%.0fs): %s",
+            subgoal.label, proof_state, budget, timeout_s,
+            subgoal.lean_type[:80],
+        )
+
+        # Check cache first
+        if lemma_cache is not None:
+            cached = lemma_cache.lookup(subgoal.lean_type)
+            if cached is not None:
+                results.append(SubgoalResult(
+                    label=subgoal.label, lean_type=subgoal.lean_type,
+                    success=True, tactics=cached, method="cache",
+                    time_spent=time.monotonic() - start,
+                ))
+                continue
+
+        from bourbaki.autonomous.tactics import generate_candidates, filter_blocked_tactics
+        from bourbaki.tools.lean_repl import lean_tactic
+
+        # Try automation tactics directly on this proof state
+        goal_list = goals if goals else [subgoal.lean_type]
+        candidates = generate_candidates(goals=goal_list, depth=0)
+        candidates = filter_blocked_tactics(candidates)
+
+        solved = False
+        proof_tactics: list[str] = []
+
+        for tactic in candidates:
+            try:
+                tac_result = await lean_tactic(
+                    goal=skeleton.code,
+                    tactic=tactic,
+                    proof_state=proof_state,
+                    session=session,
+                )
+            except Exception:
+                continue
+
+            if not tac_result.get("success"):
+                continue
+
+            new_goals = tac_result.get("goals", [])
+            if not new_goals:
+                # Proof complete for this subgoal
+                solved = True
+                proof_tactics = [tactic]
+                logger.info(
+                    "Subgoal %s solved in-context with '%s'",
+                    subgoal.label, tactic,
+                )
+                break
+
+        elapsed = time.monotonic() - start
+        if solved:
+            if lemma_cache is not None:
+                lemma_cache.add(subgoal.lean_type, proof_tactics)
+            results.append(SubgoalResult(
+                label=subgoal.label, lean_type=subgoal.lean_type,
+                success=True, tactics=proof_tactics, method="in_context",
+                time_spent=elapsed,
+            ))
+        else:
+            results.append(SubgoalResult(
+                label=subgoal.label, lean_type=subgoal.lean_type,
+                success=False, method="in_context",
+                time_spent=elapsed,
+                error="No tactic closed the goal in-context",
+            ))
+
+    return results
+
+
 async def _verify_proof(proof_code: str) -> bool:
     """Verify a complete proof using lean_prover."""
     try:
@@ -508,16 +636,27 @@ async def decompose_and_prove(
             result.errors.append(f"Sketch {sketch_idx}: no subgoals extracted")
             continue
 
-        # Solve subgoals (parallel for independent, sequential for dependent)
-        subgoal_results = await _solve_subgoals_parallel(
-            subgoals=skeleton.subgoals,
-            config=config,
-            sketch_generator=sketch_generator,
-            depth=depth,
-            previous_attempts=previous_attempts or [],
-            lemma_cache=lemma_cache,
-            session=session,
-        )
+        # Try in-context solving first (hypotheses in scope), fall back to standalone
+        subgoal_results: list[SubgoalResult] = []
+        if session is not None and depth == 0:
+            subgoal_results = await _solve_subgoals_in_context(
+                skeleton=skeleton,
+                config=config,
+                session=session,
+                lemma_cache=lemma_cache,
+            )
+
+        # Fall back to standalone if in-context didn't work or wasn't available
+        if not subgoal_results or not any(sr.success for sr in subgoal_results):
+            subgoal_results = await _solve_subgoals_parallel(
+                subgoals=skeleton.subgoals,
+                config=config,
+                sketch_generator=sketch_generator,
+                depth=depth,
+                previous_attempts=previous_attempts or [],
+                lemma_cache=lemma_cache,
+                session=session,
+            )
 
         # Collect results
         subgoal_proofs: dict[str, list[str]] = {}
