@@ -481,7 +481,6 @@ async def _solve_subgoals_in_context(
                 continue
 
         from bourbaki.autonomous.tactics import generate_candidates, filter_blocked_tactics
-        from bourbaki.tools.lean_repl import lean_tactic
 
         # Try automation tactics directly on this proof state
         goal_list = goals if goals else [subgoal.lean_type]
@@ -493,20 +492,20 @@ async def _solve_subgoals_in_context(
 
         for tactic in candidates:
             try:
-                tac_result = await lean_tactic(
-                    goal=skeleton.code,
-                    tactic=tactic,
-                    proof_state=proof_state,
-                    session=session,
-                )
-            except Exception:
+                # Use send_tactic directly on the session that owns the proof state.
+                # Do NOT use lean_tactic() — it may re-initialize or use a different session.
+                tac_result = await session.send_tactic(tactic, proof_state)
+            except Exception as exc:
+                logger.debug("In-context tactic '%s' raised: %s", tactic, exc)
                 continue
 
-            if not tac_result.get("success"):
+            # send_tactic returns {"goals": [...], "proofState": N} on success
+            # or {"error": "..."} on failure
+            if "error" in tac_result or "message" in tac_result:
                 continue
 
             new_goals = tac_result.get("goals", [])
-            if not new_goals:
+            if isinstance(new_goals, list) and len(new_goals) == 0:
                 # Proof complete for this subgoal
                 solved = True
                 proof_tactics = [tactic]
