@@ -429,61 +429,61 @@ async def _solve_subgoals_in_context(
     Returns:
         List of SubgoalResult, one per subgoal.
     """
-    # Send the skeleton to the REPL to get proof states for each sorry
-    result = await session.send_cmd(skeleton.code, timeout=30)
-    sorries = result.get("sorries", [])
+    # Initialize the theorem with sorry to get the root proof state.
+    # Then solve each sorry sequentially so that each subsequent sorry
+    # has the previous steps' results as hypotheses in scope.
+    from bourbaki.autonomous.tactics import generate_candidates, filter_blocked_tactics
 
-    if not sorries or len(sorries) != len(skeleton.subgoals):
-        logger.warning(
-            "In-context solving: expected %d sorries, got %d. Falling back.",
-            len(skeleton.subgoals), len(sorries),
-        )
-        return []  # Caller will fall back to standalone approach
+    theorem_stmt = skeleton.code.split(":= by")[0].strip() + " := by sorry"
+    init_result = await session.send_cmd(theorem_stmt, timeout=30)
+
+    sorries = init_result.get("sorries", [])
+    if not sorries:
+        logger.warning("In-context solving: no sorries from init. Falling back.")
+        return []
+
+    # Get the initial proof state
+    ps = sorries[0]
+    if isinstance(ps, dict):
+        proof_state = ps.get("proofState", 0)
+    else:
+        proof_state = 0
 
     results: list[SubgoalResult] = []
-    for subgoal, sorry_info in zip(skeleton.subgoals, sorries):
+    for subgoal in skeleton.subgoals:
         start = time.monotonic()
 
-        if not isinstance(sorry_info, dict):
+        # Apply the `have step_N : T := by` part to enter the sorry's proof state
+        have_cmd = f"have {subgoal.label} : {subgoal.lean_type} := by"
+        try:
+            have_result = await session.send_tactic(have_cmd, proof_state)
+        except Exception as exc:
+            logger.warning("Failed to enter subgoal %s: %s", subgoal.label, exc)
             results.append(SubgoalResult(
                 label=subgoal.label, lean_type=subgoal.lean_type,
-                success=False, error="Invalid sorry info from REPL",
+                success=False, error=f"Failed to enter subgoal: {exc}",
             ))
-            continue
+            break  # Can't continue without advancing proof state
 
-        proof_state = sorry_info.get("proofState", 0)
-        goals = sorry_info.get("goals", sorry_info.get("goal", []))
-        if isinstance(goals, str):
-            goals = [goals]
-
-        budget = _budget_for_depth(
-            config.subgoal_search_budget, 0, config.budget_decay_factor,
-        )
-        timeout_s = _timeout_for_depth(
-            config.subgoal_search_timeout, 0, config.timeout_decay_factor,
-        )
+        # The have tactic creates a new goal for the have's body
+        # and a continuation goal. We need the proof state for the body.
+        sorry_goals = have_result.get("goals", [])
+        sorry_ps = have_result.get("proofState")
+        if sorry_ps is None:
+            logger.warning("No proof state from have for %s", subgoal.label)
+            results.append(SubgoalResult(
+                label=subgoal.label, lean_type=subgoal.lean_type,
+                success=False, error="No proof state from have",
+            ))
+            break
 
         logger.info(
-            "Solving subgoal %s in-context (ps=%d, budget=%d, timeout=%.0fs): %s",
-            subgoal.label, proof_state, budget, timeout_s,
-            subgoal.lean_type[:80],
+            "Solving subgoal %s in-context (ps=%d): %s",
+            subgoal.label, sorry_ps, subgoal.lean_type[:80],
         )
 
-        # Check cache first
-        if lemma_cache is not None:
-            cached = lemma_cache.lookup(subgoal.lean_type)
-            if cached is not None:
-                results.append(SubgoalResult(
-                    label=subgoal.label, lean_type=subgoal.lean_type,
-                    success=True, tactics=cached, method="cache",
-                    time_spent=time.monotonic() - start,
-                ))
-                continue
-
-        from bourbaki.autonomous.tactics import generate_candidates, filter_blocked_tactics
-
-        # Try automation tactics directly on this proof state
-        goal_list = goals if goals else [subgoal.lean_type]
+        # Try automation tactics on this proof state
+        goal_list = sorry_goals if sorry_goals else [subgoal.lean_type]
         candidates = generate_candidates(goals=goal_list, depth=0)
         candidates = filter_blocked_tactics(candidates)
 
@@ -492,23 +492,23 @@ async def _solve_subgoals_in_context(
 
         for tactic in candidates:
             try:
-                # Use send_tactic directly on the session that owns the proof state.
-                # Do NOT use lean_tactic() — it may re-initialize or use a different session.
-                tac_result = await session.send_tactic(tactic, proof_state)
+                tac_result = await session.send_tactic(tactic, sorry_ps)
             except Exception as exc:
                 logger.debug("In-context tactic '%s' raised: %s", tactic, exc)
                 continue
 
-            # send_tactic returns {"goals": [...], "proofState": N} on success
-            # or {"error": "..."} on failure
             if "error" in tac_result or "message" in tac_result:
                 continue
 
             new_goals = tac_result.get("goals", [])
             if isinstance(new_goals, list) and len(new_goals) == 0:
-                # Proof complete for this subgoal
                 solved = True
                 proof_tactics = [tactic]
+                # Advance: the tactic closed this sorry, so the proof state
+                # advances to the continuation (next sorry or final goal).
+                next_ps = tac_result.get("proofState")
+                if next_ps is not None:
+                    proof_state = next_ps
                 logger.info(
                     "Subgoal %s solved in-context with '%s'",
                     subgoal.label, tactic,
@@ -531,6 +531,14 @@ async def _solve_subgoals_in_context(
                 time_spent=elapsed,
                 error="No tactic closed the goal in-context",
             ))
+            # Still try to advance with sorry so subsequent subgoals can attempt
+            try:
+                sorry_result = await session.send_tactic("sorry", sorry_ps)
+                next_ps = sorry_result.get("proofState")
+                if next_ps is not None:
+                    proof_state = next_ps
+            except Exception:
+                break  # Can't continue
 
     return results
 
