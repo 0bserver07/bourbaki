@@ -68,7 +68,14 @@ async def test_loop_terminates_on_review_approved(monkeypatch):
     assert r.await_count == 1
     assert state.approved is True
     assert state.verified is True
-    assert state.final_proof_code == proposal.code
+    # Regression: final_proof_code must be the assembled standalone source
+    # (preamble + proposal), NOT just proposal.code. The outer benchmark
+    # verifier checks proof_code directly; if the preamble (with
+    # set_option maxHeartbeats 0) is missing, default heartbeats can flip
+    # an honest success into a phantom false positive.
+    assert state.final_proof_code is not None
+    assert proposal.code in state.final_proof_code
+    assert "import Mathlib" in state.final_proof_code
 
 
 @pytest.mark.asyncio
@@ -277,6 +284,29 @@ def test_route_builder_failure_retries():
     state = ProverState(problem_id="x", target_theorem="t")
     state.last_feedback = fb.build_failed("err")
     assert loop._route_builder(state) == "retry"
+
+
+def test_route_builder_terminal_feedback_ends():
+    """Regression: builder issuing terminal feedback (e.g. ``max_iterations``)
+    must end the loop instead of routing back to ``retry``.
+    """
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.max_iterations(5)
+    assert loop._route_builder(state) == "end"
+
+
+def test_route_reviewer_terminal_feedback_ends():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.max_iterations(5)
+    assert loop._route_reviewer(state) == "end"
 
 
 def test_route_reviewer_approved_continues():

@@ -23,6 +23,7 @@ from bourbaki.prover.state import (
     ProposalMessage,
     ProverState,
 )
+from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 
 if TYPE_CHECKING:
     from bourbaki.benchmarks.loader import MiniF2FProblem
@@ -120,7 +121,10 @@ class ProverLoop:
             state.messages.append(build_fb)
             state.last_feedback = build_fb
 
-            if self._route_builder(state) == "retry":
+            build_route = self._route_builder(state)
+            if build_route == "end":
+                break
+            if build_route == "retry":
                 state.experience = await self._memory(state)
                 continue
 
@@ -131,12 +135,20 @@ class ProverLoop:
 
             if review_fb.kind == "review_approved":
                 state.approved = True
-                # The reviewer already invoked lean_prover when
-                # ``verify_on_approve`` is on (it always is for now); a
-                # success here implies the standalone file built clean.
+                # The reviewer already invoked lean_prover with the same
+                # standalone source we persist here, so a success implies
+                # the file builds clean. Persisting the assembled source
+                # (preamble + proposal) is critical: the outer benchmark
+                # verifier checks ``proof_code`` directly, and missing
+                # ``set_option maxHeartbeats 0`` from the preamble can
+                # turn an honest success into a phantom false positive.
                 state.verified = True
                 state.final_proof_code = (
-                    state.last_proposal.code if state.last_proposal else None
+                    assemble_standalone_proof(
+                        state.preamble, state.last_proposal.code
+                    )
+                    if state.last_proposal
+                    else None
                 )
                 break
 
@@ -173,12 +185,24 @@ class ProverLoop:
             return "retry"
         return "continue"
 
-    def _route_builder(self, state: ProverState) -> Literal["continue", "retry"]:
+    def _route_builder(
+        self, state: ProverState
+    ) -> Literal["continue", "retry", "end"]:
         last = state.last_feedback
-        return "continue" if last is not None and last.is_success else "retry"
+        if last is None:
+            return "retry"
+        if last.is_terminal:
+            return "end"
+        return "continue" if last.is_success else "retry"
 
-    def _route_reviewer(self, state: ProverState) -> Literal["continue", "retry"]:
+    def _route_reviewer(
+        self, state: ProverState
+    ) -> Literal["continue", "retry", "end"]:
         last = state.last_feedback
+        if last is None:
+            return "retry"
+        if last.is_terminal:
+            return "end"
         if isinstance(last, FeedbackMessage) and last.kind == "review_approved":
             return "continue"
         return "retry"

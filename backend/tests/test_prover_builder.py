@@ -47,9 +47,11 @@ def _make_state(code: str, *, problem_id: str = "test_thm",
 
 
 @pytest.mark.asyncio
-async def test_missing_target_returns_terminal_feedback() -> None:
+async def test_missing_target_returns_retryable_feedback() -> None:
     """If the proposal does not declare the target theorem, builder emits
-    a terminal ``missing_target_theorem`` feedback and does not call the REPL.
+    a ``missing_target_theorem`` feedback and does not call the REPL. The
+    feedback is non-terminal so the proposer can correct a single typo on
+    the next iteration (was terminal in Phase 2 — see post-A/B fix).
     """
     state = _make_state(
         code="theorem some_other_name : True := trivial",
@@ -60,7 +62,8 @@ async def test_missing_target_returns_terminal_feedback() -> None:
     fb = await run_builder(state, mock_session)
 
     assert fb.kind == "missing_target_theorem"
-    assert fb.is_terminal is True
+    assert fb.is_terminal is False
+    assert fb.is_success is False
     assert "my_target" in fb.content
     mock_session.send_cmd.assert_not_awaited()
 

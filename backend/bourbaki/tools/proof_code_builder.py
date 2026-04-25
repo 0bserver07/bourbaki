@@ -25,6 +25,32 @@ _THEOREM_KEYWORDS = (
 )
 
 
+def assemble_standalone_proof(preamble: str, proposal_code: str) -> str:
+    """Assemble a complete Lean 4 file from a preamble and a proposed theorem.
+
+    Used by the prover loop's reviewer (final ``lean_prover`` gate) and by
+    ``ProverLoop.run`` when persisting ``state.final_proof_code``. Both must
+    produce byte-identical output so the outer benchmark verification sees
+    the same source the reviewer approved — otherwise differences in
+    ``set_option maxHeartbeats`` or ``open`` declarations between the two
+    contexts produce phantom false positives.
+
+    Rules:
+    - ``import Mathlib`` is prepended only if neither the preamble nor the
+      proposal already imports.
+    - The preamble's leading/trailing whitespace is normalised.
+    - Sections are joined with a blank line.
+    """
+    parts: list[str] = []
+    has_import = "import " in preamble or "import " in proposal_code
+    if not has_import:
+        parts.append("import Mathlib")
+    if preamble.strip():
+        parts.append(preamble.strip())
+    parts.append(proposal_code)
+    return "\n\n".join(parts)
+
+
 def build_proof_code(theorem: str, tactics: list[str]) -> str:
     """Assemble a complete Lean 4 file from ``theorem`` and ``tactics``."""
 

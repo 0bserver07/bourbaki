@@ -69,15 +69,18 @@ def search_tactics_detected(count: int, locations: str) -> FeedbackMessage:
 
 
 def missing_target_theorem(name: str) -> FeedbackMessage:
+    """The proposer typoed the theorem name (or omitted it). The loop should
+    let the proposer try again with this feedback in scope so it can correct
+    the name — terminal would burn the budget on a single character mistake.
+    """
     content = (
         "<feedback>\n"
         f"The proposed code does not declare the target theorem `{name}`. "
-        "Make sure your output includes the full theorem declaration with the original signature.\n"
+        "Make sure your output includes the full theorem declaration with the original signature, "
+        "spelled exactly. Re-emit with the correct name on the next iteration.\n"
         "</feedback>"
     )
-    return FeedbackMessage(
-        kind="missing_target_theorem", content=content, is_terminal=True
-    )
+    return FeedbackMessage(kind="missing_target_theorem", content=content)
 
 
 def review_approved(comments: str = "") -> FeedbackMessage:

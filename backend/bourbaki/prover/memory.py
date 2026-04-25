@@ -10,6 +10,7 @@ Three policies, mirroring ax-prover:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -137,12 +138,12 @@ class ExperienceMemory(BaseMemory):
                 output_type=str,
                 system_prompt=prompts.EXPERIENCE_SYSTEM_PROMPT,
             )
-            result = await agent.run(user_prompt)
+            result = await asyncio.wait_for(agent.run(user_prompt), timeout=60.0)
             summary = result.output
-        except Exception as e:  # noqa: BLE001
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             logger.exception("ExperienceMemory LLM call failed; keeping prior experience")
             # Fall back to whatever experience we already had so the loop
-            # doesn't lose context due to a transient API hiccup.
+            # doesn't lose context due to a transient API hiccup or hang.
             return state.experience
 
         return f"<experience>\n{summary}\n</experience>"

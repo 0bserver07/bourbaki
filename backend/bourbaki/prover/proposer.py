@@ -12,6 +12,7 @@ directly — no LangChain plumbing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -92,10 +93,14 @@ def _build_user_message(state: ProverState) -> str:
     return "\n\n".join(parts)
 
 
+_PROPOSER_LLM_TIMEOUT = 90.0  # seconds — per-call cap to prevent hung iterations
+
+
 async def run_proposer(
     state: ProverState,
     model: str = "glm:glm-5.1",
     proposer_tools: list | None = None,
+    llm_timeout: float = _PROPOSER_LLM_TIMEOUT,
 ) -> ProposalMessage | FeedbackMessage:
     """Run one proposer step.
 
@@ -149,10 +154,17 @@ async def run_proposer(
         retries=2,
     )
 
-    # 6. Call the LLM and validate.
+    # 6. Call the LLM and validate. Per-call timeout prevents one slow
+    # proposal from consuming the whole per-problem budget (we saw
+    # mathd_algebra_31 hang for 300s with attempts=0).
     try:
-        result = await agent.run(user_msg)
+        result = await asyncio.wait_for(agent.run(user_msg), timeout=llm_timeout)
         output: ProverResult = result.output
+    except asyncio.TimeoutError:
+        logger.error("Proposer LLM call exceeded %.0fs timeout", llm_timeout)
+        return feedback.structured_output_parsing_failed(
+            f"LLM call timed out after {llm_timeout:.0f}s"
+        )
     except ValidationError as exc:
         logger.error("Proposer structured output validation failed: %s", exc)
         return feedback.structured_output_parsing_failed(str(exc))

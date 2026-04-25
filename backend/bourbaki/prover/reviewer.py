@@ -14,6 +14,7 @@ already paid for elsewhere in the codebase).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -28,6 +29,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from bourbaki.prover import feedback, prompts
 from bourbaki.prover.state import FeedbackMessage, ProverState, ReviewDecision
 from bourbaki.tools.lean_prover import lean_prover
+from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +82,13 @@ def _summarize_lean_errors(result: dict) -> str:
     return "unknown error"
 
 
+_REVIEWER_LLM_TIMEOUT = 60.0  # seconds — per-call cap
+
+
 async def run_reviewer(
-    state: ProverState, model: str = "glm:glm-5.1"
+    state: ProverState,
+    model: str = "glm:glm-5.1",
+    llm_timeout: float = _REVIEWER_LLM_TIMEOUT,
 ) -> FeedbackMessage:
     """Run the reviewer node and return a typed feedback message.
 
@@ -107,8 +114,15 @@ async def run_reviewer(
             output_type=ReviewDecision,
             system_prompt=prompts.REVIEWER_SYSTEM_PROMPT,
         )
-        result = await agent.run(user_prompt)
+        result = await asyncio.wait_for(
+            agent.run(user_prompt), timeout=llm_timeout
+        )
         decision: ReviewDecision = result.output
+    except asyncio.TimeoutError:
+        logger.warning("Reviewer LLM call exceeded %.0fs timeout", llm_timeout)
+        return feedback.review_rejected(
+            f"reviewer LLM call timed out after {llm_timeout:.0f}s"
+        )
     except ValidationError as e:
         logger.warning("Reviewer structured output failed validation: %s", e)
         return feedback.review_rejected(f"reviewer LLM error: {e}")
@@ -127,16 +141,11 @@ async def run_reviewer(
         return feedback.review_rejected(decision.reasoning)
 
     # Final ground-truth gate: standalone lean_prover compile.
-    parts: list[str] = []
-    has_import = (
-        "import " in state.last_proposal.code or "import " in state.preamble
+    # Use the shared assembler so the outer benchmark verifier sees
+    # byte-identical source (preamble + set_option + open + proposal).
+    full_source = assemble_standalone_proof(
+        state.preamble, state.last_proposal.code
     )
-    if not has_import:
-        parts.append("import Mathlib")
-    if state.preamble.strip():
-        parts.append(state.preamble.strip())
-    parts.append(state.last_proposal.code)
-    full_source = "\n\n".join(parts)
 
     try:
         verify_result = await lean_prover(code=full_source, mode="check")

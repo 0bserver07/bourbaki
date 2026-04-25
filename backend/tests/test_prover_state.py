@@ -170,10 +170,14 @@ def test_search_tactics_detected_factory():
     assert "exact?" in m.content or "apply?" in m.content
 
 
-def test_missing_target_theorem_is_terminal():
+def test_missing_target_theorem_is_retry_not_terminal():
+    """missing_target_theorem must NOT be terminal — a single character
+    typo in a long theorem name shouldn't kill the loop. The proposer
+    sees the feedback and corrects on the next iteration.
+    """
     m = fb.missing_target_theorem("mathd_algebra_116")
     assert m.kind == "missing_target_theorem"
-    assert m.is_terminal is True
+    assert m.is_terminal is False
     assert "mathd_algebra_116" in m.content
 
 
@@ -231,7 +235,7 @@ def test_factory_kinds_are_unique():
 
 
 def test_only_terminal_factories_are_terminal():
-    terminal_kinds = {"missing_target_theorem", "max_iterations"}
+    terminal_kinds = {"max_iterations"}
     factories = {
         "build_success": fb.build_success(),
         "build_failed": fb.build_failed("e"),
