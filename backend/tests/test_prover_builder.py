@@ -253,6 +253,35 @@ async def test_preamble_is_prepended_when_non_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_imports_in_preamble_are_stripped_before_send_cmd() -> None:
+    """Regression: miniF2F files start with ``import Mathlib`` which the
+    loader copies into ``state.preamble``. The REPL session has Mathlib
+    pre-loaded and rejects re-imports with "invalid 'import' command, it
+    must be used in the beginning of the file" — so the builder must
+    strip imports from the preamble too, not just from the proposal.
+    """
+    state = _make_state(
+        code="theorem my_target : True := trivial",
+        problem_id="my_target",
+        preamble=(
+            "import Mathlib\n"
+            "set_option maxHeartbeats 0\n"
+            "open BigOperators Real Nat Topology Rat"
+        ),
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"messages": [], "sorries": [], "env": 1}
+
+    await run_builder(state, mock_session)
+
+    sent = mock_session.send_cmd.await_args.args[0]
+    # No import lines in the REPL command, but set_option / open survive.
+    assert "import Mathlib" not in sent
+    assert "set_option maxHeartbeats 0" in sent
+    assert "open BigOperators Real Nat Topology Rat" in sent
+
+
+@pytest.mark.asyncio
 async def test_repl_level_error_is_reported_as_build_failed() -> None:
     """A ``send_cmd`` returning ``{"error": ...}`` (timeout / pipe) is
     reported as ``build_failed`` so the loop can retry rather than crash.

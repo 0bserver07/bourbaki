@@ -68,12 +68,17 @@ async def run_builder(
         )
         return feedback.missing_target_theorem(target_name)
 
-    # 2) Strip imports (REPL has Mathlib pre-loaded).
+    # 2) Strip imports (REPL has Mathlib pre-loaded — re-importing it
+    # raises "invalid 'import' command, it must be used in the beginning
+    # of the file"). This applies to BOTH the preamble (which often
+    # contains ``import Mathlib``) and the proposal code itself.
     stripped_code = _IMPORT_LINE_RE.sub("", code)
+    stripped_preamble = (
+        _IMPORT_LINE_RE.sub("", state.preamble).strip() if state.preamble else ""
+    )
 
-    # Build the REPL command. Prepend preamble if non-empty.
-    if state.preamble:
-        cmd = f"{state.preamble.rstrip()}\n\n{stripped_code.lstrip()}"
+    if stripped_preamble:
+        cmd = f"{stripped_preamble}\n\n{stripped_code.lstrip()}"
     else:
         cmd = stripped_code
 
