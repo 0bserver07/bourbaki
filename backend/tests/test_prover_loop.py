@@ -153,6 +153,80 @@ async def test_loop_state_initialized_from_problem(monkeypatch):
     assert "import Mathlib" in state.preamble
 
 
+@pytest.mark.asyncio
+async def test_loop_target_theorem_includes_sorry_placeholder(monkeypatch):
+    """``state.target_theorem`` must carry ``:= sorry`` so the proposer's
+    <target> block matches the file content. The loader strips the placeholder
+    when populating ``problem.statement``; the loop adds it back.
+    """
+    loop, _, _, _ = _make_loop(
+        monkeypatch,
+        proposer_returns=[fb.max_iterations(5)],
+        builder_returns=[],
+        reviewer_returns=[],
+    )
+
+    state = await loop.run(_make_problem())
+
+    assert ":= by" in state.target_theorem
+    assert "sorry" in state.target_theorem
+
+
+@pytest.mark.asyncio
+async def test_loop_terminates_on_repeated_parsing_failures(monkeypatch):
+    """Repeated ``structured_output_parsing_failed`` (non-terminal feedback,
+    not a ProposalMessage) must not loop forever. The driver's local attempt
+    counter has to bite even when ``state.iteration`` never advances.
+    """
+    parse_fails = [fb.structured_output_parsing_failed(f"fail {i}") for i in range(20)]
+    loop, p, b, r = _make_loop(
+        monkeypatch,
+        proposer_returns=parse_fails,
+        builder_returns=[],
+        reviewer_returns=[],
+    )
+    # max_iterations = 5 from _make_loop default.
+    state = await loop.run(_make_problem())
+
+    # Loop must have called the proposer at most max_iterations + 1 times
+    # (the +1 is the call that produces the terminal max_iterations feedback).
+    assert p.await_count <= 5
+    assert b.await_count == 0
+    assert r.await_count == 0
+    # Final state never advanced past iteration 0 (no ProposalMessage ever appended).
+    assert state.iteration == 0
+    assert state.verified is False
+    # Last feedback should be the synthetic max_iterations terminator.
+    assert state.last_feedback is not None
+    assert state.last_feedback.kind == "max_iterations"
+
+
+def test_extract_preamble_pulls_imports_and_opens():
+    from bourbaki.prover.prover import _extract_preamble
+
+    full = (
+        "import Mathlib\n"
+        "open Nat\n"
+        "set_option maxHeartbeats 400000\n"
+        "\n"
+        "theorem mathd_test_1 : 1 = 1 := by\n"
+        "  sorry\n"
+    )
+    statement = "theorem mathd_test_1 : 1 = 1"
+    pre = _extract_preamble(full, statement)
+    assert "import Mathlib" in pre
+    assert "open Nat" in pre
+    assert "set_option" in pre
+    assert "theorem" not in pre
+
+
+def test_extract_preamble_returns_empty_when_statement_missing():
+    from bourbaki.prover.prover import _extract_preamble
+
+    pre = _extract_preamble("import Mathlib\n\n", "theorem absent : True")
+    assert pre == ""
+
+
 def test_route_proposer_proposal_continues():
     cfg = ProverConfig()
     loop = ProverLoop(cfg, session=AsyncMock())

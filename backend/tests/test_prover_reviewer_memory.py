@@ -138,6 +138,35 @@ async def test_reviewer_approves_and_lean_prover_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reviewer_does_not_double_import_when_preamble_has_import(monkeypatch):
+    """Regression: previously the reviewer always prepended ``import Mathlib``
+    if the proposal didn't have one, even if ``state.preamble`` already did.
+    This produced two ``import Mathlib`` lines in the standalone file.
+    """
+    state = ProverState(
+        problem_id="p1",
+        target_theorem="theorem t : 1 = 1 := sorry",
+        preamble="import Mathlib\nopen Nat",  # preamble already imports
+    )
+    state.last_proposal = ProposalMessage(
+        reasoning="rfl",
+        code="theorem t : 1 = 1 := rfl",  # no import in proposal
+        iteration=1,
+    )
+    decision = ReviewDecision(
+        reasoning="ok", check_1=True, check_2=True, check_3=True, approved=True,
+    )
+    monkeypatch.setattr("pydantic_ai.Agent.run", _agent_run_returning(decision))
+    lean_mock = AsyncMock(return_value={"success": True, "errors": None})
+    monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
+
+    await run_reviewer(state, model="glm:glm-5.1")
+
+    src = lean_mock.await_args.kwargs.get("code") or lean_mock.await_args.args[0]
+    assert src.count("import Mathlib") == 1
+
+
+@pytest.mark.asyncio
 async def test_reviewer_rejects_when_lean_prover_fails(monkeypatch):
     state = _state_with_proposal(code="theorem t : 1 = 1 := by rfl")
     decision = ReviewDecision(

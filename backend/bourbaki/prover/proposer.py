@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -34,7 +34,7 @@ from bourbaki.prover.state import (
 logger = logging.getLogger(__name__)
 
 
-def _resolve_model_object(model_str: str) -> str | OpenAIModel | AnthropicModel:
+def _resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicModel:
     """Resolve a model string into a Pydantic AI model object.
 
     Supports the same ``glm:`` and ``ollama-cloud:`` prefixes as
@@ -50,7 +50,7 @@ def _resolve_model_object(model_str: str) -> str | OpenAIModel | AnthropicModel:
             base_url="https://ollama.com/v1",
             api_key=api_key,
         )
-        return OpenAIModel(model_name, provider=provider)
+        return OpenAIChatModel(model_name, provider=provider)
 
     if model_str.startswith("glm:"):
         model_name = model_str.removeprefix("glm:")

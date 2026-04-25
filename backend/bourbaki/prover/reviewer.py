@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -32,7 +32,7 @@ from bourbaki.tools.lean_prover import lean_prover
 logger = logging.getLogger(__name__)
 
 
-def _resolve_model_object(model: str) -> str | OpenAIModel | AnthropicModel:
+def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
     """Resolve a model string to a Pydantic AI model object.
 
     Mirrors :func:`bourbaki.agent.core._resolve_model_object` for the two
@@ -47,7 +47,7 @@ def _resolve_model_object(model: str) -> str | OpenAIModel | AnthropicModel:
             base_url="https://ollama.com/v1",
             api_key=api_key,
         )
-        return OpenAIModel(model_name, provider=provider)
+        return OpenAIChatModel(model_name, provider=provider)
 
     if model.startswith("glm:"):
         model_name = model.removeprefix("glm:")
@@ -128,7 +128,10 @@ async def run_reviewer(
 
     # Final ground-truth gate: standalone lean_prover compile.
     parts: list[str] = []
-    if "import " not in state.last_proposal.code:
+    has_import = (
+        "import " in state.last_proposal.code or "import " in state.preamble
+    )
+    if not has_import:
         parts.append("import Mathlib")
     if state.preamble.strip():
         parts.append(state.preamble.strip())

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from bourbaki.prover import memory as memory_module
 from bourbaki.prover.builder import run_builder
+from bourbaki.prover.feedback import max_iterations as max_iterations_feedback
 from bourbaki.prover.proposer import run_proposer
 from bourbaki.prover.reviewer import run_reviewer
 from bourbaki.prover.state import (
@@ -72,16 +73,32 @@ class ProverLoop:
         self.memory = _build_memory(config)
 
     async def run(self, problem: MiniF2FProblem) -> ProverState:
+        # Reconstruct the placeholder body the loader stripped so the
+        # proposer's <target> block has an explicit ``:= sorry`` to replace.
+        target_with_placeholder = f"{problem.statement} := by\n  sorry"
+
         state = ProverState(
             problem_id=problem.id,
-            target_theorem=problem.statement,
+            target_theorem=target_with_placeholder,
             preamble=_extract_preamble(problem.full_lean_code, problem.statement),
             full_file=problem.full_lean_code,
             iteration=0,
             max_iterations=self.config.max_iterations,
         )
 
+        # Loop-owned attempt counter — bumped on every proposer call so a
+        # streak of parsing failures (which never bump ``state.iteration``,
+        # since that tracks successful proposals) can't loop forever.
+        attempts = 0
+
         while True:
+            attempts += 1
+            if attempts > state.max_iterations:
+                terminal = max_iterations_feedback(state.max_iterations)
+                state.messages.append(terminal)
+                state.last_feedback = terminal
+                break
+
             # --- Proposer ---
             proposed = await self._proposer(state)
             state.messages.append(proposed)
