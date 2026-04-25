@@ -14,7 +14,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from bourbaki.prover import ProverConfig
 
 from bourbaki.benchmarks.loader import (
     MiniF2FProblem,
@@ -328,6 +331,47 @@ async def attempt_proof_repl(
     )
 
 
+async def attempt_proof_loop(
+    problem: MiniF2FProblem,
+    session: LeanREPLSession,
+    config: ProverConfig | None = None,
+    timeout: int = 600,
+) -> ProblemResult:
+    """Drive the proposer-builder-reviewer loop on one problem.
+
+    Returns a :class:`ProblemResult` with ``solved`` set from
+    ``state.verified`` (the reviewer's ``lean_prover`` final-gate result).
+    A loop timeout produces a non-solved result with ``error="loop timeout"``.
+    """
+    from bourbaki.prover import ProverConfig as _ProverConfig
+    from bourbaki.prover import ProverLoop
+
+    cfg = config or _ProverConfig()
+    loop = ProverLoop(config=cfg, session=session)
+    start = time.monotonic()
+    try:
+        state = await asyncio.wait_for(loop.run(problem), timeout=timeout)
+    except asyncio.TimeoutError:
+        return ProblemResult(
+            problem_id=problem.id,
+            source=problem.source,
+            solved=False,
+            error="loop timeout",
+            duration_seconds=time.monotonic() - start,
+        )
+    return ProblemResult(
+        problem_id=problem.id,
+        source=problem.source,
+        solved=state.verified,
+        repl_reported=state.approved,
+        verified=state.verified,
+        proof_code=state.final_proof_code,
+        tactics_used=state.iteration,
+        attempts=state.iteration,
+        duration_seconds=time.monotonic() - start,
+    )
+
+
 async def attempt_proof_search(
     problem: MiniF2FProblem,
     session: LeanREPLSession,
@@ -565,6 +609,11 @@ async def run_minif2f(
     use_llm: bool = False,
     llm_model: str = "glm:glm-5",
     use_decompose: bool = False,
+    use_loop: bool = False,
+    loop_max_iterations: int = 50,
+    loop_model: str = "glm:glm-5.1",
+    loop_memory: str = "MemorylessMemory",
+    loop_memory_k: int = 2,
     verify: bool = True,
     verify_timeout: int = 150,
 ) -> BenchmarkResult:
@@ -638,7 +687,18 @@ async def run_minif2f(
             # Sequential execution
             for i, problem in enumerate(problems):
                 logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
-                if repl_session is not None and use_search:
+                if repl_session is not None and use_loop:
+                    from bourbaki.prover import ProverConfig as _ProverConfig
+                    loop_cfg = _ProverConfig(
+                        model=loop_model,
+                        max_iterations=loop_max_iterations,
+                        memory_cls=loop_memory,
+                        memory_k=loop_memory_k,
+                    )
+                    result = await attempt_proof_loop(
+                        problem, repl_session, config=loop_cfg, timeout=timeout,
+                    )
+                elif repl_session is not None and use_search:
                     result = await attempt_proof_search(
                         problem, repl_session,
                         budget=search_budget,
@@ -671,7 +731,18 @@ async def run_minif2f(
                 )
                 for i, problem in enumerate(problems):
                     logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
-                    if use_search:
+                    if use_loop:
+                        from bourbaki.prover import ProverConfig as _ProverConfig
+                        loop_cfg = _ProverConfig(
+                            model=loop_model,
+                            max_iterations=loop_max_iterations,
+                            memory_cls=loop_memory,
+                            memory_k=loop_memory_k,
+                        )
+                        result = await attempt_proof_loop(
+                            problem, repl_session, config=loop_cfg, timeout=timeout,
+                        )
+                    elif use_search:
                         result = await attempt_proof_search(
                             problem, repl_session,
                             budget=search_budget,

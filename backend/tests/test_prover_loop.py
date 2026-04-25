@@ -1,0 +1,225 @@
+"""Integration tests for ProverLoop.run.
+
+Each node (proposer/builder/reviewer) has its own unit tests; these tests
+verify the loop driver wires them together correctly and routes per
+``proposer-builder-loop.md`` §3.
+
+All node calls are mocked — no LLM, no Lean REPL, no network.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from bourbaki.benchmarks.loader import MiniF2FProblem
+from bourbaki.prover import feedback as fb
+from bourbaki.prover.prover import ProverConfig, ProverLoop
+from bourbaki.prover.state import ProposalMessage
+
+
+def _make_problem() -> MiniF2FProblem:
+    return MiniF2FProblem(
+        id="mathd_test_1",
+        source="mathd",
+        split="valid",
+        statement="theorem mathd_test_1 : 1 = 1 := sorry",
+        imports=["Mathlib"],
+        file_path="/dev/null",
+        full_lean_code=(
+            "import Mathlib\n\ntheorem mathd_test_1 : 1 = 1 := sorry\n"
+        ),
+    )
+
+
+def _make_loop(monkeypatch, *, proposer_returns, builder_returns, reviewer_returns):
+    """Build a ProverLoop with patched node delegators."""
+    cfg = ProverConfig(memory_cls="MemorylessMemory", max_iterations=5)
+    session = AsyncMock()  # never actually called because _builder is patched
+    loop = ProverLoop(config=cfg, session=session)
+
+    proposer_mock = AsyncMock(side_effect=list(proposer_returns))
+    builder_mock = AsyncMock(side_effect=list(builder_returns))
+    reviewer_mock = AsyncMock(side_effect=list(reviewer_returns))
+
+    monkeypatch.setattr(loop, "_proposer", proposer_mock)
+    monkeypatch.setattr(loop, "_builder", builder_mock)
+    monkeypatch.setattr(loop, "_reviewer", reviewer_mock)
+    return loop, proposer_mock, builder_mock, reviewer_mock
+
+
+@pytest.mark.asyncio
+async def test_loop_terminates_on_review_approved(monkeypatch):
+    proposal = ProposalMessage(
+        reasoning="rfl works", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=1
+    )
+    loop, p, b, r = _make_loop(
+        monkeypatch,
+        proposer_returns=[proposal],
+        builder_returns=[fb.build_success()],
+        reviewer_returns=[fb.review_approved("clean")],
+    )
+
+    state = await loop.run(_make_problem())
+
+    assert p.await_count == 1
+    assert b.await_count == 1
+    assert r.await_count == 1
+    assert state.approved is True
+    assert state.verified is True
+    assert state.final_proof_code == proposal.code
+
+
+@pytest.mark.asyncio
+async def test_loop_terminates_on_proposer_terminal_feedback(monkeypatch):
+    """Proposer returning a terminal FeedbackMessage (e.g. max_iterations) ends the loop."""
+    loop, p, b, r = _make_loop(
+        monkeypatch,
+        proposer_returns=[fb.max_iterations(5)],
+        builder_returns=[],
+        reviewer_returns=[],
+    )
+
+    state = await loop.run(_make_problem())
+
+    assert p.await_count == 1
+    assert b.await_count == 0
+    assert r.await_count == 0
+    assert state.approved is False
+    assert state.verified is False
+
+
+@pytest.mark.asyncio
+async def test_loop_retries_on_build_failure_then_succeeds(monkeypatch):
+    """Build failure → memory → next proposer iteration → eventual approval."""
+    p1 = ProposalMessage(reasoning="try x", code="theorem mathd_test_1 : 1 = 1 := by sorry", iteration=1)
+    p2 = ProposalMessage(reasoning="try rfl", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=2)
+
+    loop, p, b, r = _make_loop(
+        monkeypatch,
+        proposer_returns=[p1, p2],
+        builder_returns=[fb.build_failed("type mismatch"), fb.build_success()],
+        reviewer_returns=[fb.review_approved("ok")],
+    )
+
+    state = await loop.run(_make_problem())
+
+    assert p.await_count == 2
+    assert b.await_count == 2
+    assert r.await_count == 1
+    assert state.verified is True
+    assert state.iteration == 2
+
+
+@pytest.mark.asyncio
+async def test_loop_retries_on_review_rejected(monkeypatch):
+    """Reviewer rejection → memory → next proposer iteration."""
+    p1 = ProposalMessage(reasoning="r1", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=1)
+    p2 = ProposalMessage(reasoning="r2", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=2)
+
+    loop, p, b, r = _make_loop(
+        monkeypatch,
+        proposer_returns=[p1, p2],
+        builder_returns=[fb.build_success(), fb.build_success()],
+        reviewer_returns=[fb.review_rejected("statement modified"), fb.review_approved("ok")],
+    )
+
+    state = await loop.run(_make_problem())
+
+    assert p.await_count == 2
+    assert b.await_count == 2
+    assert r.await_count == 2
+    assert state.verified is True
+
+
+@pytest.mark.asyncio
+async def test_loop_state_initialized_from_problem(monkeypatch):
+    """State.preamble extracted from full_lean_code; problem_id wired."""
+    loop, _, _, _ = _make_loop(
+        monkeypatch,
+        proposer_returns=[fb.max_iterations(5)],
+        builder_returns=[],
+        reviewer_returns=[],
+    )
+    problem = _make_problem()
+
+    state = await loop.run(problem)
+
+    assert state.problem_id == "mathd_test_1"
+    assert state.target_theorem.startswith("theorem mathd_test_1")
+    assert state.full_file == problem.full_lean_code
+    assert state.max_iterations == 5
+    assert "import Mathlib" in state.preamble
+
+
+def test_route_proposer_proposal_continues():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.messages.append(
+        ProposalMessage(reasoning="r", code="c", iteration=1)
+    )
+    assert loop._route_proposer(state) == "continue"
+
+
+def test_route_proposer_terminal_feedback_ends():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.messages.append(fb.max_iterations(5))
+    assert loop._route_proposer(state) == "end"
+
+
+def test_route_proposer_non_proposal_retries():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.messages.append(fb.structured_output_parsing_failed("e"))
+    assert loop._route_proposer(state) == "retry"
+
+
+def test_route_builder_success_continues():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.build_success()
+    assert loop._route_builder(state) == "continue"
+
+
+def test_route_builder_failure_retries():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.build_failed("err")
+    assert loop._route_builder(state) == "retry"
+
+
+def test_route_reviewer_approved_continues():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.review_approved()
+    assert loop._route_reviewer(state) == "continue"
+
+
+def test_route_reviewer_rejected_retries():
+    cfg = ProverConfig()
+    loop = ProverLoop(cfg, session=AsyncMock())
+    from bourbaki.prover.state import ProverState
+
+    state = ProverState(problem_id="x", target_theorem="t")
+    state.last_feedback = fb.review_rejected("nope")
+    assert loop._route_reviewer(state) == "retry"
