@@ -159,37 +159,15 @@ class ProofCoordinator:
         )
 
     async def _generate_nl_reasoning(self, theorem: str) -> str | None:
-        """Generate free-form NL reasoning about the theorem (Aletheia-style).
+        """Deprecated NL-reasoning pre-pass (Phase 3: legacy autonomous pipeline removed).
 
-        This pre-pass lets the LLM reason freely before any formal planning,
-        producing insights that guide the strategist and prover phases.
-
-        Returns the NL analysis string, or None on failure.
+        The original implementation lived in ``bourbaki.autonomous.sketch`` (deleted in
+        Phase 3 of the proposer-builder-reviewer refactor).  The coordinator now
+        runs without the NL pre-pass; this method is kept as a no-op so existing
+        callers and tests don't crash.  Return ``None`` so the strategist and
+        prover phases skip the reasoning context block.
         """
-        from bourbaki.autonomous.sketch import (
-            build_nl_reasoning_prompt,
-            NL_REASONING_MAX_CHARS,
-        )
-
-        try:
-            from pydantic_ai import Agent
-
-            prompt = build_nl_reasoning_prompt(theorem)
-            agent: Agent[None, str] = Agent(self.model, system_prompt=(
-                "You are a mathematician. Provide a concise but insightful "
-                "analysis. Do NOT write any Lean code or formal proofs."
-            ))
-            result = await agent.run(prompt)
-            reasoning = result.output.strip()
-            if len(reasoning) > NL_REASONING_MAX_CHARS:
-                reasoning = reasoning[:NL_REASONING_MAX_CHARS] + "..."
-            logger.info(
-                "Coordinator NL reasoning generated (%d chars)", len(reasoning),
-            )
-            return reasoning
-        except Exception as e:
-            logger.warning("Coordinator NL reasoning failed: %s", e)
-            return None
+        return None
 
     async def _run_strategist(
         self,

@@ -24,10 +24,9 @@ from bourbaki.benchmarks.loader import (
     get_problem_stats,
     load_minif2f_problems,
 )
-from bourbaki.autonomous.search_tree import prove_with_search
 from bourbaki.autonomous.tactics import contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
-from bourbaki.tools.lean_repl import LeanREPLSession, stop_session
+from bourbaki.tools.lean_repl import LeanREPLSession
 
 logger = logging.getLogger(__name__)
 
@@ -448,181 +447,6 @@ async def attempt_proof_pass_at_n(
     return last_result
 
 
-async def attempt_proof_search(
-    problem: MiniF2FProblem,
-    session: LeanREPLSession,
-    budget: int = 64,
-    timeout: int = 60,
-    use_mathlib: bool = False,
-    use_llm: bool = False,
-    llm_model: str = "glm:glm-5",
-    use_decompose: bool = False,
-) -> ProblemResult:
-    """Attempt to prove a problem using automation, decomposition, and search.
-
-    Phase 1: Automation tactics via REPL (fast, ~27% solve rate).
-    Phase 2: HILBERT-style decomposition via LLM sketch + subgoal solving.
-    Phase 3: Flat best-first search tree (fallback).
-
-    Args:
-        problem: The miniF2F problem to attempt.
-        session: Pre-initialized LeanREPLSession with Mathlib loaded.
-        budget: Max tactic attempts for the search tree.
-        timeout: Timeout in seconds for the entire problem.
-        use_mathlib: Whether to query Mathlib search during tree expansion.
-        use_llm: Whether to use LLM for tactic suggestions in search.
-        llm_model: Model string for LLM calls.
-        use_decompose: Whether to use HILBERT-style decomposition before
-                       falling back to flat search.
-
-    Returns:
-        ProblemResult with success/failure details.
-    """
-    start = time.monotonic()
-
-    # Phase 1: Try automation tactics first (instant)
-    auto_result = await attempt_proof_repl(
-        problem, session, timeout=min(timeout, 30),
-    )
-    if auto_result.solved:
-        return auto_result
-
-    # Build the theorem statement for search/decomposition
-    preamble_lines = []
-    for line in problem.full_lean_code.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("import"):
-            continue
-        if stripped.startswith("set_option") or stripped.startswith("open"):
-            preamble_lines.append(stripped)
-        elif stripped.startswith("theorem") or stripped.startswith("lemma"):
-            break
-
-    preamble = "\n".join(preamble_lines) if preamble_lines else ""
-    theorem = f"{preamble}\n{problem.statement}" if preamble else problem.statement
-
-    remaining_time = timeout - (time.monotonic() - start)
-    if remaining_time <= 5:
-        return auto_result
-
-    # Phase 2: HILBERT-style decomposition (LLM sketch → subgoal solving)
-    if use_decompose:
-        try:
-            from bourbaki.autonomous.decomposer import (
-                DecompositionConfig,
-                decompose_and_prove,
-            )
-
-            decomp_timeout = min(remaining_time * 0.6, remaining_time - 10)
-            decomp_config = DecompositionConfig(
-                max_decomposition_depth=2,
-                max_sketches=1,  # Fix #3: 1 sketch first pass, saves ~15s LLM time
-                subgoal_search_budget=max(budget // 2, 20),
-                subgoal_search_timeout=min(decomp_timeout / 2, 45.0),  # Fix #3: more time per subgoal
-                model=llm_model,
-                verify_stitched=True,
-                use_nl_reasoning=False,  # Fix #3: skip NL pre-pass, saves ~15s
-                parallel_subgoals=False,
-                preamble=preamble,  # Fix #1: open directives for subgoals
-            )
-
-            logger.info("Phase 2: decomposition for %s (%.0fs budget)", problem.id, decomp_timeout)
-            decomp_result = await asyncio.wait_for(
-                decompose_and_prove(theorem=theorem, config=decomp_config, session=session),
-                timeout=decomp_timeout + 5,
-            )
-
-            if decomp_result.success and decomp_result.proof_code:
-                logger.info(
-                    "Decomposition solved %s: %d/%d subgoals, verified=%s",
-                    problem.id, decomp_result.subgoals_solved,
-                    decomp_result.subgoals_total, decomp_result.verified,
-                )
-                return ProblemResult(
-                    problem_id=problem.id,
-                    source=problem.source,
-                    solved=True,
-                    repl_reported=True,
-                    proof_code=decomp_result.proof_code,
-                    tactics_used=decomp_result.subgoals_solved,
-                    attempts=auto_result.attempts,
-                    duration_seconds=time.monotonic() - start,
-                )
-            else:
-                logger.info(
-                    "Decomposition partial for %s: %d/%d subgoals, falling back to search",
-                    problem.id, decomp_result.subgoals_solved, decomp_result.subgoals_total,
-                )
-        except asyncio.TimeoutError:
-            logger.info("Decomposition timed out for %s, falling back to search", problem.id)
-        except Exception as e:
-            logger.warning("Decomposition failed for %s: %s", problem.id, e)
-
-        remaining_time = timeout - (time.monotonic() - start)
-        if remaining_time <= 5:
-            return ProblemResult(
-                problem_id=problem.id,
-                source=problem.source,
-                solved=False,
-                error=f"Automation + decomposition failed, no time for search",
-                attempts=auto_result.attempts,
-                duration_seconds=time.monotonic() - start,
-            )
-
-    # Phase 3: Flat best-first search tree (fallback)
-    try:
-        search_result = await asyncio.wait_for(
-            prove_with_search(
-                theorem=theorem,
-                budget=budget,
-                timeout=remaining_time,
-                max_depth=15,
-                use_mathlib=use_mathlib,
-                use_llm=use_llm,
-                llm_model=llm_model,
-                session=session,
-            ),
-            timeout=remaining_time + 5,
-        )
-
-        if search_result.success:
-            tactic_block = "\n  ".join(search_result.proof_tactics)
-            full_proof = problem.full_lean_code.replace(
-                "sorry", tactic_block,
-            )
-            return ProblemResult(
-                problem_id=problem.id,
-                source=problem.source,
-                solved=True,
-                repl_reported=True,
-                proof_code=full_proof,
-                tactics_used=len(search_result.proof_tactics),
-                attempts=search_result.nodes_explored,
-                duration_seconds=time.monotonic() - start,
-            )
-        else:
-            search_attempts = search_result.nodes_explored
-            return ProblemResult(
-                problem_id=problem.id,
-                source=problem.source,
-                solved=False,
-                error=f"All phases failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
-                attempts=auto_result.attempts + search_attempts,
-                duration_seconds=time.monotonic() - start,
-            )
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.debug("Search tree failed for %s: %s", problem.id, e)
-
-    return ProblemResult(
-        problem_id=problem.id,
-        source=problem.source,
-        solved=False,
-        error=f"All phases failed ({auto_result.attempts} auto + search)",
-        attempts=auto_result.attempts,
-        duration_seconds=time.monotonic() - start,
-    )
-
-
 async def _verify_with_lean_prover(
     result: ProblemResult,
     verify_timeout: int = 150,
@@ -679,12 +503,6 @@ async def run_minif2f(
     concurrency: int = 1,
     minif2f_dir: Path | None = None,
     use_repl: bool = True,
-    use_search: bool = False,
-    search_budget: int = 64,
-    use_mathlib_search: bool = False,
-    use_llm: bool = False,
-    llm_model: str = "glm:glm-5",
-    use_decompose: bool = False,
     use_loop: bool = False,
     loop_max_iterations: int = 50,
     loop_model: str = "glm:glm-5.1",
@@ -711,9 +529,12 @@ async def run_minif2f(
         minif2f_dir: Path to miniF2F-lean4 checkout.
         use_repl: Use REPL for automation tactics (default True, ~40x faster).
                   Falls back to lean_prover if REPL not available.
-        use_search: Use best-first search tree after automation fails.
-        search_budget: Max tactic attempts per problem for search tree.
-        use_mathlib_search: Query Mathlib APIs during search tree expansion.
+        use_loop: Drive the proposer-builder-reviewer loop (Phase 2 architecture).
+        loop_max_iterations: Max proposer-builder-reviewer iterations per problem.
+        loop_model: Model string for the proposer / reviewer.
+        loop_memory: Name of the Memory subclass driving experience.
+        loop_memory_k: Number of past experiences passed to the proposer.
+        loop_enable_mathlib_search: Wire ``mathlib_search`` as a proposer tool.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -788,16 +609,6 @@ async def run_minif2f(
                         result = await attempt_proof_loop(
                             problem, repl_session, config=loop_cfg, timeout=timeout,
                         )
-                elif repl_session is not None and use_search:
-                    result = await attempt_proof_search(
-                        problem, repl_session,
-                        budget=search_budget,
-                        timeout=timeout,
-                        use_mathlib=use_mathlib_search,
-                        use_llm=use_llm,
-                        llm_model=llm_model,
-                        use_decompose=use_decompose,
-                    )
                 elif repl_session is not None:
                     result = await attempt_proof_repl(
                         problem, repl_session, timeout=timeout,
@@ -839,13 +650,6 @@ async def run_minif2f(
                             result = await attempt_proof_loop(
                                 problem, repl_session, config=loop_cfg, timeout=timeout,
                             )
-                    elif use_search:
-                        result = await attempt_proof_search(
-                            problem, repl_session,
-                            budget=search_budget,
-                            timeout=timeout,
-                            use_mathlib=use_mathlib_search,
-                        )
                     else:
                         result = await attempt_proof_repl(
                             problem, repl_session, timeout=timeout,
@@ -920,10 +724,14 @@ async def run_minif2f(
             "timeout": timeout,
             "concurrency": concurrency,
             "use_repl": repl_session is not None,
-            "use_search": use_search,
-            "search_budget": search_budget if use_search else None,
-            "use_mathlib_search": use_mathlib_search if use_search else None,
             "use_loop": use_loop,
+            "loop_max_iterations": loop_max_iterations if use_loop else None,
+            "loop_model": loop_model if use_loop else None,
+            "loop_memory": loop_memory if use_loop else None,
+            "loop_memory_k": loop_memory_k if use_loop else None,
+            "loop_enable_mathlib_search": (
+                loop_enable_mathlib_search if use_loop else None
+            ),
             "pass_n": pass_n if use_loop else None,
             "verify": verify,
             "verify_timeout": verify_timeout,

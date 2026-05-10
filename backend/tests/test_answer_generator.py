@@ -376,6 +376,11 @@ class TestGenerateAnswer:
         result = await generate_answer(no_answer_problem)
         assert result is None
 
+    @pytest.mark.skip(
+        reason="Phase 3: patches bourbaki.autonomous.search_tree.prove_with_search "
+        "which was deleted with the legacy autonomous pipeline. Re-enable once "
+        "_try_answer is rewired to bourbaki.prover.ProverLoop.",
+    )
     @pytest.mark.asyncio
     async def test_reference_answer_tried_first(
         self, simple_problem: PutnamProblem,
@@ -409,6 +414,11 @@ class TestGenerateAnswer:
         assert result.theorem_solved is True
         assert result.verified is True
 
+    @pytest.mark.skip(
+        reason="Phase 3: patches bourbaki.autonomous.search_tree.prove_with_search "
+        "which was deleted with the legacy autonomous pipeline. Re-enable once "
+        "_try_answer is rewired to bourbaki.prover.ProverLoop.",
+    )
     @pytest.mark.asyncio
     async def test_llm_fallback_when_no_reference(
         self, tmp_path: Path,
@@ -465,6 +475,11 @@ class TestGenerateAnswer:
         assert result.source == "llm"
         assert result.theorem_solved is True
 
+    @pytest.mark.skip(
+        reason="Phase 3: patches bourbaki.autonomous.search_tree.prove_with_search "
+        "which was deleted with the legacy autonomous pipeline. Re-enable once "
+        "_try_answer is rewired to bourbaki.prover.ProverLoop.",
+    )
     @pytest.mark.asyncio
     async def test_failed_proof_search_returns_best_attempt(
         self, simple_problem: PutnamProblem,

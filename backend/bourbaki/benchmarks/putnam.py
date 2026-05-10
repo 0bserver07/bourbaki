@@ -47,7 +47,6 @@ from bourbaki.benchmarks.putnam_loader import (
     get_putnam_stats,
     load_putnam_problems,
 )
-from bourbaki.autonomous.search_tree import prove_with_search
 from bourbaki.autonomous.tactics import TACTIC_BLOCKLIST, contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession
@@ -381,124 +380,12 @@ async def attempt_putnam_repl(
     )
 
 
-async def attempt_putnam_search(
-    problem: PutnamProblem,
-    session: LeanREPLSession,
-    budget: int = 64,
-    timeout: int = 60,
-    use_mathlib: bool = False,
-) -> ProblemResult:
-    """Attempt to prove a Putnam problem using best-first search tree.
-
-    First tries automation tactics via REPL (fast). If those fail, runs a
-    best-first search over tactic sequences.
-    """
-    start = time.monotonic()
-
-    # Phase 1: Try automation tactics first (instant)
-    auto_result = await attempt_putnam_repl(
-        problem, session, timeout=min(timeout, 30),
-    )
-    if auto_result.solved:
-        return auto_result
-
-    # Phase 2: Best-first search tree
-    # Build the theorem statement for the search tree (without imports)
-    parts: list[str] = []
-    if problem.preamble:
-        parts.append(problem.preamble)
-    if problem.setup_block:
-        parts.append(problem.setup_block)
-    parts.append(problem.statement)
-    theorem = "\n".join(parts)
-
-    remaining_time = timeout - (time.monotonic() - start)
-    if remaining_time <= 5:
-        return auto_result  # Not enough time for search
-
-    try:
-        search_result = await asyncio.wait_for(
-            prove_with_search(
-                theorem=theorem,
-                budget=budget,
-                timeout=remaining_time,
-                max_depth=15,
-                use_mathlib=use_mathlib,
-                session=session,
-            ),
-            timeout=remaining_time + 5,
-        )
-
-        if search_result.success:
-            candidate_code = search_result.proof_code
-
-            # Filter suspicious non-proof tactics
-            if candidate_code:
-                bad_tactic = _contains_invalid_tactic(candidate_code)
-                if bad_tactic:
-                    logger.info(
-                        "  Rejected invalid tactic for %s: %s",
-                        problem.id, bad_tactic,
-                    )
-                    return ProblemResult(
-                        problem_id=problem.id,
-                        year=problem.year,
-                        section=problem.section,
-                        has_answer=problem.has_answer,
-                        solved=False,
-                        error=f"Proof rejected: contains invalid tactic '{bad_tactic}'",
-                        attempts=search_result.nodes_explored,
-                        duration_seconds=time.monotonic() - start,
-                    )
-
-            return ProblemResult(
-                problem_id=problem.id,
-                year=problem.year,
-                section=problem.section,
-                has_answer=problem.has_answer,
-                solved=True,
-                repl_reported=True,
-                proof_code=candidate_code,
-                tactics_used=len(search_result.proof_tactics),
-                attempts=search_result.nodes_explored,
-                duration_seconds=time.monotonic() - start,
-            )
-        else:
-            search_attempts = search_result.nodes_explored
-            return ProblemResult(
-                problem_id=problem.id,
-                year=problem.year,
-                section=problem.section,
-                has_answer=problem.has_answer,
-                solved=False,
-                error=f"Automation + search failed ({auto_result.attempts} auto + {search_attempts} search nodes)",
-                attempts=auto_result.attempts + search_attempts,
-                duration_seconds=time.monotonic() - start,
-            )
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.debug("Search tree failed for %s: %s", problem.id, e)
-
-    return ProblemResult(
-        problem_id=problem.id,
-        year=problem.year,
-        section=problem.section,
-        has_answer=problem.has_answer,
-        solved=False,
-        error=f"Automation + search failed ({auto_result.attempts} auto + search)",
-        attempts=auto_result.attempts,
-        duration_seconds=time.monotonic() - start,
-    )
-
-
 async def run_putnam(
     year_filter: int | None = None,
     section_filter: str | None = None,
     problem_ids: list[str] | None = None,
     timeout: int = 60,
     putnam_dir: Path | None = None,
-    use_search: bool = True,
-    search_budget: int = 64,
-    use_mathlib_search: bool = True,
     year_range: tuple[int, int] | None = None,
     exclude_answer: bool = True,
     verify_proofs: bool = True,
@@ -514,21 +401,24 @@ async def run_putnam(
     production benchmark runs must always verify. When verify_proofs is
     False a warning is logged and results are marked as unreliable.
 
+    Phase 3 deprecation note: the legacy ``use_search`` /
+    ``search_budget`` / ``use_mathlib_search`` knobs (best-first search tree)
+    were removed when the autonomous pipeline was deleted.  The runner now
+    uses only :func:`attempt_putnam_repl` for proof attempts.  Wiring the
+    proposer-builder-reviewer loop into ``run_putnam`` is a separate task.
+
     Args:
         year_filter: Filter by specific year.
         section_filter: Filter by section ("a" or "b").
         problem_ids: Specific problem IDs to run.
         timeout: Timeout per problem in seconds.
         putnam_dir: Path to PutnamBench checkout.
-        use_search: Use best-first search tree after automation fails.
-        search_budget: Max tactic attempts per problem for search tree.
-        use_mathlib_search: Query Mathlib APIs during search tree expansion.
         year_range: Filter by year range (inclusive).
         exclude_answer: Skip problems where has_answer=True and answer is
             still ``sorry`` (default True).  These can't be validly solved
             without filling the answer placeholder.  Ignored when
             ``attempt_answers`` is True.
-        verify_proofs: After REPL/search finds a proof, verify it with
+        verify_proofs: After REPL finds a proof, verify it with
             whole-file lean_prover compilation (default True).
             WARNING: setting this to False will produce unreliable numbers.
         verify_timeout: Timeout in seconds for whole-file verification
@@ -644,12 +534,15 @@ async def run_putnam(
                     logger.info("  Running answer generation pipeline...")
                     answer_start = time.monotonic()
                     try:
+                        # Phase 3: search_budget arg retained on generate_answer
+                        # for now but unused (proof search underneath was deleted
+                        # along with the legacy autonomous pipeline).  Keep the
+                        # default 64 so the public signature is unchanged.
                         answer_result = await generate_answer(
                             problem=problem,
                             model=answer_model,
                             max_attempts=answer_max_attempts,
                             prove_timeout=timeout,
-                            search_budget=search_budget,
                             verify_timeout=verify_timeout,
                         )
                     except Exception as e:
@@ -727,18 +620,9 @@ async def run_putnam(
                     logger.info("  SKIPPED (answer-sorry)")
                     continue
 
-            if use_search:
-                result = await attempt_putnam_search(
-                    problem,
-                    repl_session,
-                    budget=search_budget,
-                    timeout=timeout,
-                    use_mathlib=use_mathlib_search,
-                )
-            else:
-                result = await attempt_putnam_repl(
-                    problem, repl_session, timeout=timeout,
-                )
+            result = await attempt_putnam_repl(
+                problem, repl_session, timeout=timeout,
+            )
 
             # Whole-file verification for solved problems
             if result.solved and verify_proofs and result.proof_code:
@@ -857,9 +741,6 @@ async def run_putnam(
             "section_filter": section_filter,
             "year_range": year_range,
             "timeout": timeout,
-            "use_search": use_search,
-            "search_budget": search_budget if use_search else None,
-            "use_mathlib_search": use_mathlib_search if use_search else None,
             "exclude_answer": exclude_answer,
             "attempt_answers": attempt_answers,
             "answer_model": answer_model if attempt_answers else None,
@@ -1034,19 +915,6 @@ def main() -> None:
         "--timeout", type=int, default=60, help="Timeout per problem (seconds)"
     )
     parser.add_argument(
-        "--budget", type=int, default=64, help="Search tree budget per problem"
-    )
-    parser.add_argument(
-        "--no-search",
-        action="store_true",
-        help="Skip search tree (automation tactics only)",
-    )
-    parser.add_argument(
-        "--no-mathlib",
-        action="store_true",
-        help="Disable Mathlib search during tree expansion",
-    )
-    parser.add_argument(
         "--include-answer",
         action="store_true",
         help="Include answer-sorry problems (excluded by default)",
@@ -1097,9 +965,6 @@ def main() -> None:
             section_filter=args.section,
             problem_ids=problem_ids,
             timeout=args.timeout,
-            use_search=not args.no_search,
-            search_budget=args.budget,
-            use_mathlib_search=not args.no_mathlib,
             year_range=year_range,
             exclude_answer=not args.include_answer,
             verify_proofs=not args.no_verify,

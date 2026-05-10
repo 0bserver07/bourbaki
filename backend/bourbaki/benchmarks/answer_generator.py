@@ -413,102 +413,19 @@ async def _try_answer(
 ) -> AnswerAttempt:
     """Try a single answer candidate: insert, prove, verify.
 
-    Args:
-        problem: The PutnamProblem.
-        answer_expr: The Lean expression to try.
-        source: Where the answer came from ("reference" or "llm").
-        prove_timeout: Timeout for proof search.
-        search_budget: Tactic budget.
-        verify_timeout: Timeout for verification.
-
-    Returns:
-        An AnswerAttempt with the results.
+    Phase 3 deprecation: this used to call
+    ``bourbaki.autonomous.search_tree.prove_with_search`` to attempt the
+    theorem with the candidate answer substituted in.  The legacy
+    autonomous pipeline (sketch / formalizer / decomposer / search_tree /
+    scoring / strategies) was removed when the proposer-builder-reviewer
+    loop replaced it.  Until ``_try_answer`` is rewired to
+    :class:`bourbaki.prover.prover.ProverLoop`, the function raises
+    ``NotImplementedError`` so callers (currently only the
+    ``--attempt-answers`` branch in ``run_putnam``) fail loudly instead of
+    silently producing bogus AnswerAttempt results.
     """
-    # Lazy imports to avoid circular dependencies and startup cost
-    import asyncio
-    from bourbaki.autonomous.search_tree import prove_with_search
-    from bourbaki.tools.lean_prover import lean_prover
-
-    logger.info(
-        "  Trying answer (%s): %s",
-        source,
-        answer_expr[:80] + ("..." if len(answer_expr) > 80 else ""),
-    )
-
-    # Build the theorem statement with the answer substituted
-    parts: list[str] = []
-    setup = problem.setup_block
-    if problem.answer_name:
-        setup = insert_answer(setup, problem.answer_name, answer_expr)
-    if problem.preamble:
-        parts.append(problem.preamble)
-    if setup:
-        parts.append(setup)
-    parts.append(problem.statement)
-    theorem = "\n".join(parts)
-
-    # Try proof search
-    proof_tactics: list[str] = []
-    theorem_solved = False
-    proof_code: str | None = None
-
-    try:
-        search_result = await asyncio.wait_for(
-            prove_with_search(
-                theorem=theorem,
-                budget=search_budget,
-                timeout=prove_timeout,
-                max_depth=15,
-                use_mathlib=True,
-            ),
-            timeout=prove_timeout + 5,
-        )
-
-        if search_result.success:
-            theorem_solved = True
-            proof_tactics = search_result.proof_tactics
-            proof_code = search_result.proof_code
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.debug("Proof search failed for answer: %s", e)
-
-    if not theorem_solved:
-        return AnswerAttempt(
-            answer_code=answer_expr,
-            theorem_solved=False,
-            verified=False,
-            proof_tactics=proof_tactics,
-            error="Proof search failed",
-            source=source,
-        )
-
-    # Whole-file verification
-    verified = False
-    verify_error: str | None = None
-
-    if proof_code:
-        full_code = build_full_proof_code(problem, answer_expr, proof_code)
-        try:
-            result = await asyncio.wait_for(
-                lean_prover(code=full_code, mode="check", timeout=verify_timeout),
-                timeout=verify_timeout + 5,
-            )
-            verified = result.get("proofComplete", False)
-            if not verified:
-                errors = result.get("errors") or []
-                err_msgs = [
-                    e.get("message", "") for e in errors if isinstance(e, dict)
-                ]
-                verify_error = "; ".join(err_msgs) if err_msgs else "Verification failed"
-        except (asyncio.TimeoutError, Exception) as e:
-            verify_error = f"Verification error: {e}"
-
-    return AnswerAttempt(
-        answer_code=answer_expr,
-        theorem_solved=theorem_solved,
-        verified=verified,
-        proof_tactics=proof_tactics,
-        error=verify_error,
-        source=source,
+    raise NotImplementedError(
+        "search_tree was removed in Phase 3; rewire to ProverLoop if needed",
     )
 
 
