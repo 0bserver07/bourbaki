@@ -66,6 +66,9 @@ class ProblemResult:
     tactics_used: int = 0
     duration_seconds: float = 0.0
     attempts: int = 0
+    # Pass@N: which sampling round produced this result (1-indexed).
+    # Always 1 when not running under attempt_proof_pass_at_n.
+    attempts_pass_n: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +82,7 @@ class ProblemResult:
             "tactics_used": self.tactics_used,
             "duration_seconds": round(self.duration_seconds, 2),
             "attempts": self.attempts,
+            "attempts_pass_n": self.attempts_pass_n,
         }
 
 
@@ -372,6 +376,78 @@ async def attempt_proof_loop(
     )
 
 
+async def attempt_proof_pass_at_n(
+    problem: MiniF2FProblem,
+    session: LeanREPLSession,
+    config: ProverConfig | None = None,
+    n: int = 4,
+    timeout_per_attempt: int = 300,
+) -> ProblemResult:
+    """Run :func:`attempt_proof_loop` up to ``n`` times, stopping at the first
+    verified success.
+
+    Pass@N sampling: if any of the N independent loop attempts produces a
+    verified proof, return it (with ``attempts_pass_n`` set to the 1-indexed
+    attempt number that succeeded).  If all N attempts fail, return the LAST
+    attempt's :class:`ProblemResult` (so error/proof_code from the final
+    attempt is preserved) with ``attempts_pass_n=n``.
+
+    REPL session handling:
+      A single :class:`LeanREPLSession` is shared across all N attempts.
+      The Lean REPL has no ``:reset`` command, but each
+      :func:`attempt_proof_loop` invocation creates a fresh
+      :class:`ProverState` and the underlying ``send_cmd`` calls always chain
+      from ``session.env_id`` (the Mathlib-base env established at session
+      init) — they do NOT mutate ``session.env_id`` itself.  So each Pass@N
+      attempt naturally starts from the same Mathlib base environment.  The
+      one caveat: REPL pipe desyncs from a previous attempt could trigger a
+      session restart (and thus a Mathlib reload, ~16-37s) on the next
+      attempt — that's a known limitation, not a correctness bug.
+
+    Args:
+        problem: The miniF2F problem to attempt.
+        session: Pre-initialized :class:`LeanREPLSession` (Mathlib loaded).
+        config: :class:`ProverConfig` passed through to each loop attempt.
+        n: Number of independent samples (Pass@N).  ``n=1`` is the no-op
+           case and degenerates to a single :func:`attempt_proof_loop` call.
+        timeout_per_attempt: Per-attempt timeout in seconds (passed to
+            :func:`attempt_proof_loop`).
+
+    Returns:
+        :class:`ProblemResult` from the first successful attempt or, on full
+        failure, from the Nth (last) attempt.
+    """
+    if n < 1:
+        raise ValueError(f"Pass@N requires n >= 1, got n={n}")
+
+    last_result: ProblemResult | None = None
+    for i in range(1, n + 1):
+        result = await attempt_proof_loop(
+            problem,
+            session,
+            config=config,
+            timeout=timeout_per_attempt,
+        )
+        result.attempts_pass_n = i
+        last_result = result
+        if result.solved and result.verified:
+            logger.info(
+                "  Pass@N hit: %s solved on attempt %d/%d",
+                problem.id, i, n,
+            )
+            return result
+        if i < n:
+            logger.info(
+                "  Pass@N miss %d/%d for %s — retrying",
+                i, n, problem.id,
+            )
+
+    # All N attempts failed — return the last attempt's result with
+    # attempts_pass_n already set to n via the loop above.
+    assert last_result is not None  # n >= 1 guarantees one iteration
+    return last_result
+
+
 async def attempt_proof_search(
     problem: MiniF2FProblem,
     session: LeanREPLSession,
@@ -615,6 +691,7 @@ async def run_minif2f(
     loop_memory: str = "MemorylessMemory",
     loop_memory_k: int = 2,
     loop_enable_mathlib_search: bool = False,
+    pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,
 ) -> BenchmarkResult:
@@ -637,6 +714,11 @@ async def run_minif2f(
         use_search: Use best-first search tree after automation fails.
         search_budget: Max tactic attempts per problem for search tree.
         use_mathlib_search: Query Mathlib APIs during search tree expansion.
+        pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
+            :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
+            ``pass_n`` independent loop attempts via
+            :func:`attempt_proof_pass_at_n`, stopping at the first verified
+            success. Only takes effect when ``use_loop=True``.
         verify: Verify solved proofs with lean_prover (default True).
                 WARNING: setting this to False will produce unreliable numbers.
         verify_timeout: Timeout for lean_prover verification per problem.
@@ -697,9 +779,15 @@ async def run_minif2f(
                         memory_k=loop_memory_k,
                         enable_mathlib_search=loop_enable_mathlib_search,
                     )
-                    result = await attempt_proof_loop(
-                        problem, repl_session, config=loop_cfg, timeout=timeout,
-                    )
+                    if pass_n > 1:
+                        result = await attempt_proof_pass_at_n(
+                            problem, repl_session, config=loop_cfg,
+                            n=pass_n, timeout_per_attempt=timeout,
+                        )
+                    else:
+                        result = await attempt_proof_loop(
+                            problem, repl_session, config=loop_cfg, timeout=timeout,
+                        )
                 elif repl_session is not None and use_search:
                     result = await attempt_proof_search(
                         problem, repl_session,
@@ -742,9 +830,15 @@ async def run_minif2f(
                             memory_k=loop_memory_k,
                             enable_mathlib_search=loop_enable_mathlib_search,
                         )
-                        result = await attempt_proof_loop(
-                            problem, repl_session, config=loop_cfg, timeout=timeout,
-                        )
+                        if pass_n > 1:
+                            result = await attempt_proof_pass_at_n(
+                                problem, repl_session, config=loop_cfg,
+                                n=pass_n, timeout_per_attempt=timeout,
+                            )
+                        else:
+                            result = await attempt_proof_loop(
+                                problem, repl_session, config=loop_cfg, timeout=timeout,
+                            )
                     elif use_search:
                         result = await attempt_proof_search(
                             problem, repl_session,
@@ -829,6 +923,8 @@ async def run_minif2f(
             "use_search": use_search,
             "search_budget": search_budget if use_search else None,
             "use_mathlib_search": use_mathlib_search if use_search else None,
+            "use_loop": use_loop,
+            "pass_n": pass_n if use_loop else None,
             "verify": verify,
             "verify_timeout": verify_timeout,
             "prove_fn": prove_fn.__name__ if prove_fn and hasattr(prove_fn, "__name__") else "default",
