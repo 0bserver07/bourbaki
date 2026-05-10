@@ -40,6 +40,11 @@ class ProverConfig(BaseModel):
     memory_cls: str = "MemorylessMemory"
     memory_k: int = 2
     enable_tools: bool = True
+    # Phase 4: opt-in registration of the mathlib_search tool on the
+    # proposer agent. Off by default — the loop already hits 90% on the
+    # 10-problem subset without it, so enabling tool calls is an
+    # experimental dial, not a baseline.
+    enable_mathlib_search: bool = False
     verify_on_approve: bool = True
     build_timeout: float = 60.0
 
@@ -160,7 +165,11 @@ class ProverLoop:
     # ----- Node delegators -----
 
     async def _proposer(self, state: ProverState) -> ProposalMessage | FeedbackMessage:
-        return await run_proposer(state, model=self.config.model)
+        return await run_proposer(
+            state,
+            model=self.config.model,
+            enable_mathlib_search=self.config.enable_mathlib_search,
+        )
 
     async def _builder(self, state: ProverState) -> FeedbackMessage:
         return await run_builder(state, self.session)

@@ -13,6 +13,7 @@ directly — no LangChain plumbing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 
@@ -23,6 +24,7 @@ from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.tools import Tool
 
 from bourbaki.prover import feedback, prompts
 from bourbaki.prover.state import (
@@ -96,11 +98,57 @@ def _build_user_message(state: ProverState) -> str:
 _PROPOSER_LLM_TIMEOUT = 90.0  # seconds — per-call cap to prevent hung iterations
 
 
+async def _search_mathlib(
+    query: str,
+    mode: str = "name",
+    max_results: int = 5,
+) -> str:
+    """Search Mathlib for lemmas.
+
+    Use this tool to find existing lemmas by name (e.g. ``Nat.add_comm``),
+    by type signature in Loogle syntax (e.g. ``_ * (_ ^ _)``), or in plain
+    English. Modes:
+
+    - ``name`` (default): exact / partial name lookup via Loogle.
+    - ``type``: type-signature search via Loogle.
+    - ``natural``: natural-language query via LeanSearch.
+    - ``semantic``: semantic search via LeanExplore (hybrid ranking).
+    - ``local``: offline FAISS embedding index (fastest).
+
+    Returns a JSON string with ``success``, ``results`` (a list of
+    ``{name, module, type, doc}``), ``count``, ``query``, ``mode``,
+    ``duration``. On failure returns ``{success: False, error: ...}``.
+    """
+    from bourbaki.tools.mathlib_search import mathlib_search
+
+    result = await mathlib_search(query=query, mode=mode, max_results=max_results)
+    return json.dumps(result, default=str)
+
+
+def _build_proposer_tools(
+    enable_mathlib_search: bool,
+    proposer_tools: list | None,
+) -> list[Tool]:
+    """Resolve the tool list passed to the Pydantic AI agent.
+
+    When ``enable_mathlib_search`` is True, the ``mathlib_search`` tool is
+    registered unconditionally (and ``proposer_tools`` is ignored). When
+    False, fall back to ``proposer_tools``; ``None`` or empty yields no
+    tools.
+    """
+    if enable_mathlib_search:
+        return [Tool(_search_mathlib, name="mathlib_search")]
+    if proposer_tools:
+        return list(proposer_tools)
+    return []
+
+
 async def run_proposer(
     state: ProverState,
     model: str = "glm:glm-5.1",
     proposer_tools: list | None = None,
     llm_timeout: float = _PROPOSER_LLM_TIMEOUT,
+    enable_mathlib_search: bool = False,
 ) -> ProposalMessage | FeedbackMessage:
     """Run one proposer step.
 
@@ -117,8 +165,14 @@ async def run_proposer(
             ``iteration = state.iteration + 1``.
         model: Pydantic AI model string. Custom prefixes ``glm:`` and
             ``ollama-cloud:`` are resolved via :func:`_resolve_model_object`.
-        proposer_tools: Reserved for future tool wiring (e.g. ``mathlib_search``).
-            Currently ignored.
+        proposer_tools: Optional pre-built ``Tool`` list passed straight
+            to ``Agent(..., tools=...)``. Used only when
+            ``enable_mathlib_search`` is False.
+        llm_timeout: Per-LLM-call timeout in seconds.
+        enable_mathlib_search: When True, register the built-in
+            ``mathlib_search`` tool (Loogle + LeanSearch + LeanExplore +
+            local FAISS) so the proposer can look up Mathlib lemmas
+            mid-iteration. Overrides ``proposer_tools``.
     """
 
     # 1. Iteration-limit guard — never call the LLM if we're out of budget.
@@ -143,14 +197,17 @@ async def run_proposer(
         else prompts.PROPOSER_SYSTEM_PROMPT
     )
 
-    # TODO: register proposer_tools when Phase 4 lands (mathlib_search, etc.)
-    _ = proposer_tools  # silence "unused" linters until Phase 4
+    # Phase 4: optionally register mathlib_search (and any other caller-
+    # supplied tools) so the proposer can ground its proposals in real
+    # Mathlib lemmas before emitting structured output.
+    tools = _build_proposer_tools(enable_mathlib_search, proposer_tools)
 
     # 5. Create the Pydantic AI agent with strict structured output.
     agent: Agent[None, ProverResult] = Agent(
         resolved_model,
         system_prompt=sys_prompt,
         output_type=ProverResult,
+        tools=tools,
         retries=2,
     )
 

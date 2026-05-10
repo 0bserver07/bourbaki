@@ -614,6 +614,7 @@ async def run_minif2f(
     loop_model: str = "glm:glm-5.1",
     loop_memory: str = "MemorylessMemory",
     loop_memory_k: int = 2,
+    loop_enable_mathlib_search: bool = False,
     verify: bool = True,
     verify_timeout: int = 150,
 ) -> BenchmarkResult:
@@ -694,6 +695,7 @@ async def run_minif2f(
                         max_iterations=loop_max_iterations,
                         memory_cls=loop_memory,
                         memory_k=loop_memory_k,
+                        enable_mathlib_search=loop_enable_mathlib_search,
                     )
                     result = await attempt_proof_loop(
                         problem, repl_session, config=loop_cfg, timeout=timeout,
@@ -738,6 +740,7 @@ async def run_minif2f(
                             max_iterations=loop_max_iterations,
                             memory_cls=loop_memory,
                             memory_k=loop_memory_k,
+                            enable_mathlib_search=loop_enable_mathlib_search,
                         )
                         result = await attempt_proof_loop(
                             problem, repl_session, config=loop_cfg, timeout=timeout,
