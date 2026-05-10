@@ -1,0 +1,18 @@
+{
+  "include": ["backend"],
+  "exclude": [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/node_modules",
+    ".bourbaki",
+    "src",
+    "lean-project"
+  ],
+  "extraPaths": ["backend"],
+  "pythonVersion": "3.11",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none",
+  "useLibraryCodeForTypes": true,
+  "venvPath": ".",
+  "stubPath": "stubs"
+}

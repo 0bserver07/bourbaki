@@ -782,35 +782,39 @@ backend/bourbaki/benchmarks/
 
 **Current results (miniF2F valid split, 244 problems):**
 
-| Phase | Solved | Rate |
-|-------|--------|------|
-| Automation alone | 56/244 | 23% |
-| + Search tree v1 | 144/244 | 59% |
-| + Search tree v2 | 217/244 | 89% |
-| + Semantic search | 218/244 | 89.3% |
-| + Multi-agent (GLM-5) | 224/244 | 91.8% |
+**Honest verified-pass-rate history (miniF2F valid split):**
 
-**Per-category breakdown (latest):**
+| Date | Approach | Verified | Rate | Sample |
+|------|----------|----------|------|--------|
+| 2026-02-18 (v0.2.1) | Best-first search, **REPL-only** ⚠ | claimed 224/244 | claimed 91.8% | full 244 |
+| 2026-02-22 (correction) | Same code, `lean_prover` standalone verify | 15/244 | **6.2%** | full 244 |
+| 2026-03-08 (v0.2.2) | + REPL pipe-recovery + tactic blocklist | 63/244 | 25.8% | full 244 |
+| 2026-03-19 | + heuristic search | 10/35 | 28.6% | 35-problem stratified |
+| 2026-04-01 | + HILBERT decomposer + in-context solving | 5/10 | 50.0% | 10-problem subset |
+| 2026-04-25 | **Proposer-builder-reviewer loop (GLM-5.1)** | **9/10** | **90.0%** | 10-problem subset |
 
-| Category | Solved | Rate |
-|----------|--------|------|
-| imo | 20/20 | 100% |
-| induction | 8/8 | 100% |
-| mathd | 130/130 | 100% |
-| numbertheory | 8/8 | 100% |
-| aime | 8/12 | 67% |
-| algebra | 11/18 | 61% |
-| unknown | 33/48 | 69% |
+The Feb 18 91.8% was inflated ~15× by REPL false positives (the REPL reported
+`goals=[]` for tactics whose standalone Lean compile would have failed). Every
+solve since v0.2.2 is gated by `lean_prover`'s whole-file compile. See
+[`docs/REALITY_CHECK.md`](docs/REALITY_CHECK.md) for the full audit.
+
+The 90% on the 10-problem subset is preliminary. A 35-problem stratified
+re-run is in progress; full 244 hasn't been re-attempted with the new loop.
 
 ### Comparison with Reference Systems
 
-| System | Organization | miniF2F Valid | Key Technique |
+⚠ Reference systems are on the *full* 244-problem split. Bourbaki's last
+honest full-split number (25.8% from v0.2.2) trails the field; the loop's
+90% is on a 10-problem subset only.
+
+| System | Organization | miniF2F Valid (full 244) | Key Technique |
 |--------|-------------|---------------|---------------|
 | HILBERT | Apple | 99.2% | Recursive decomposition + Goedel-V2-32B + MPNet retrieval |
 | Goedel-Prover V2 | — | 90.4% | 2-round self-correction (8B matches 671B) |
 | Aristotle | Harmonic | 90% | MCGS + 200B transformer + test-time training |
-| **Bourbaki** | — | **91.8%** | Best-first search + multi-agent (GLM-5) |
 | DeepSeek-Prover V2 | DeepSeek | 88.9% | Recursive decomposition + GRPO RL |
+| **Bourbaki (v0.2.2)** | — | **25.8%** verified | Best-first search + lean_prover gate |
+| **Bourbaki (loop, partial)** | — | 9/10 on subset | Proposer-builder-reviewer + GLM-5.1 |
 
 ### Capability Matrix
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.3.0-pending — 2026-04-25
+
+### Proposer-builder-reviewer loop replaces HILBERT pipeline
+
+A complete refactor of the autonomous prover. The `sketch → formalize →
+decompose → stitch` HILBERT-style pipeline (where stitching brittleness
+was eating ~50% of the budget) is replaced with an ax-prover-style
+loop: GLM-5.1 proposes a complete proof, a warm `LeanREPLSession` runs
+it, a reviewer node gates on `check_1 (statement preserved) AND check_2
+(no sorry/admit)`, and `lean_prover` runs once at approval as the
+final ground-truth gate.
+
+**10-problem A/B (same subset as the 50% decomposer baseline):**
+
+| Approach | Verified | False positives | Wall time |
+|----------|----------|-----------------|-----------|
+| Decomposer (Apr 1) | 5/10 (50%) | 0 | ~50 min |
+| Loop, run 1 (Apr 25) | 5/10 (50%) | 2 | 21 min |
+| Loop, run 2 — after 5 follow-up fixes | **9/10 (90%)** | **0** | 22 min |
+
+The single remaining failure (`mathd_algebra_31`, an NNReal
+`Filter.Tendsto` fixed-point problem) is genuinely hard — the
+decomposer also failed it.
+
+**Status:** preliminary. **Not yet re-run on the full 244 split** —
+35-problem stratified A/B is in progress at the time of writing. Tag
+withheld until the larger run confirms the result holds.
+
+**Architecture:** `backend/bourbaki/prover/` — see
+[`.bourbaki/plans/proposer-builder-loop.md`](.bourbaki/plans/proposer-builder-loop.md)
+for the design and
+[`.bourbaki/plans/refactor-audit.md`](.bourbaki/plans/refactor-audit.md)
+for keep/reuse/drop classification.
+
+**Key fixes that turned 50% into 90%:**
+
+- Reviewer used `preamble + proposal.code` for its `lean_prover` gate;
+  `state.final_proof_code` was bare `proposal.code`. Outer benchmark
+  verifier ran without `set_option maxHeartbeats 0` from the preamble
+  → default heartbeat caps flipped honest passes into phantom false
+  positives. Shared `assemble_standalone_proof()` helper now produces
+  byte-identical source for both sites.
+- Added 90s `asyncio.wait_for` cap on every LLM call (proposer, reviewer,
+  ExperienceMemory) so a single hang can't burn the per-problem budget.
+- `missing_target_theorem` is no longer terminal — a single-character
+  typo in a 50-character theorem name no longer kills the loop.
+- `_route_builder` and `_route_reviewer` now respect `is_terminal`;
+  previously only `_route_proposer` did, so a builder-issued terminal
+  feedback was misrouted to "retry".
+- Builder now strips imports from `state.preamble` too, not just from
+  the proposal code (REPL has Mathlib pre-loaded; re-importing errors).
+
 ## v0.2.2 — 2026-03-08
 
 ### REPL session corruption fix + honest benchmark numbers
