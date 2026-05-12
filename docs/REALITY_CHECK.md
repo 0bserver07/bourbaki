@@ -245,10 +245,14 @@ REPL don't actually produce valid proof terms.
 
 | Benchmark | REPL-reported | lean_prover verified | Status |
 |-----------|--------------|---------------------|--------|
-| miniF2F valid | 224/244 (91.8%) | **Pending verification** | Spot checks pass |
-| miniF2F test | 230/244 (94.3%) | **Pending verification** | Spot checks pass |
-| PutnamBench (theorem-only) | 317/326 | **0/326 (0%)** | All false positives |
+| miniF2F valid (v0.2.1 code) | 224/244 (91.8%) | 15/244 (6.2%) | Re-verified Feb 22 — **claim was inflated ~15×** |
+| miniF2F valid (v0.2.2 code) | — | 63/244 (25.8%) | Mar 8 baseline · same code with REPL pipe-recovery + tactic blocklist |
+| miniF2F valid (35-problem stratified, post-loop) | — | 22/35 (62.9%) | May 9 · proposer-builder-reviewer loop · 0 false positives |
+| miniF2F valid (full 244, post-loop) | — | **Pending** | tracked in [#14](https://github.com/0bserver07/bourbaki/issues/14) |
+| miniF2F test (v0.2.1 code) | 230/244 (94.3%) | **Not re-verified** | claim retracted; full test re-run pending #14 |
+| PutnamBench (theorem-only, pre-Phase-3) | 317/326 | **0/326 (0%)** | All false positives |
 | PutnamBench (answer-sorry) | 224/346 | Excluded | Need answer generation |
+| PutnamBench (5-problem dry run, new loop) | — | 0/5 | Blocked on [#13](https://github.com/0bserver07/bourbaki/issues/13) — pydantic_ai/z.ai adapter bug |
 
 ### Why miniF2F is probably fine but PutnamBench isn't
 
@@ -271,10 +275,17 @@ gap between REPL elaboration and standalone compilation is wider for these.
 
 ### What this means for claimed results
 
-The miniF2F numbers (91.8% valid, 94.3% test) should be re-verified with
-lean_prover to produce bulletproof numbers. Until then, they should be treated
-as "REPL-reported" with the caveat that REPL detection has known false positive
-issues on complex problems.
+The Feb 18 v0.2.1 miniF2F numbers (91.8% valid / 94.3% test) were inflated
+~15×. The Feb 22 audit replaced them with 6.2% verified. The v0.2.2 release
+(Mar 8) lifted the honest number to 25.8% on the full 244 split. The current
+architecture (proposer-builder-reviewer loop, commits `49211ce`...`2113629`)
+is at 22/35 (62.9%) on a stratified sample as of May 9 — the full 244 re-run
+is the v0.3.0 release blocker, tracked in
+[issue #14](https://github.com/0bserver07/bourbaki/issues/14).
+
+The v0.2.1 git tag and release notes still reference the inflated numbers.
+Retraction of those release notes is tracked in
+[issue #15](https://github.com/0bserver07/bourbaki/issues/15).
 
 ---
 

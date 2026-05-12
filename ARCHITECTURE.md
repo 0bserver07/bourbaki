@@ -613,112 +613,86 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 
 ## Solver Architecture
 
-The solver is the proving engine that takes a Lean 4 theorem statement and produces a verified proof. It operates through a pipeline of phases, each progressively more expensive.
+The solver is the proving engine that takes a Lean 4 theorem statement and produces a verified proof. As of Phase 3 (commit `2113629`, May 2026), it runs a single proposer-builder-reviewer-memory loop in the style of ax-prover — no recursive decomposition, no best-first tactic search, no multi-agent coordinator. The whole pipeline is one bounded async `while` loop driven by GLM-5.1 and a warm `LeanREPLSession`.
 
-### Overview
+<p align="center">
+  <img src="assets/prover-loop.svg" alt="Proposer-Builder-Reviewer loop" width="100%">
+</p>
 
-```
-Theorem Statement (Lean 4)
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 0: Recursive Decomposition                            │
-│   LLM sketch → have/sorry skeleton → solve subgoals        │
-│   Files: decomposer.py, sketch.py, formalizer.py            │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ if unsolved
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 1: Best-First Search Tree (core engine, 89% of solves)│
-│   Tactic candidates → REPL expansion → score → repeat      │
-│   Files: search_tree.py, tactics.py, scoring.py, lean_repl  │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ if unsolved
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 2.5: Multi-Agent Coordinator                          │
-│   Strategist → Searcher → Prover → Verifier (retry loop)   │
-│   Files: coordinator.py, roles.py, messages.py              │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ if unsolved
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Phase 3: Strategy Rotation (fallback)                       │
-│   18 strategies × dead-end tracking × LLM agent             │
-│   Files: search.py, strategies.py, modal_runner.py          │
-└─────────────────────────────────────────────────────────────┘
-```
+### The loop
 
-### Phase 0: Recursive Decomposition
+One iteration per proposal. Hard cap at 50 iterations (8 in interactive / CI) — the loop owns its own attempts counter so a streak of parse failures can't run forever.
 
-An LLM generates 1-3 proof sketches for the theorem. Each sketch is formalized into a Lean skeleton with `have` subgoals and `sorry` placeholders. Subgoals are solved independently via the search tree; failed subgoals are recursively decomposed up to a configurable depth.
+1. **Proposer** (`backend/bourbaki/prover/proposer.py`) — Pydantic AI agent with `output_type=ProverResult` (4 fields: `reasoning`, `imports`, `opens`, `updated_theorem`). System prompt at `prompts.PROPOSER_SYSTEM_PROMPT`. User message bundles the target theorem, the complete file, the last attempt (proposal + feedback) if any, and the current `<experience>` block. Per-LLM-call timeout: 90s (`asyncio.wait_for`).
 
-```
-backend/bourbaki/autonomous/
-├── decomposer.py        # DecompositionConfig, decompose_and_prove()
-├── sketch.py            # LLMSketchGenerator — proof strategy generation
-└── formalizer.py         # formalize_sketch(), stitch_proofs()
-```
+2. **Builder** (`backend/bourbaki/prover/builder.py`) — sends `state.preamble + proposal.code` (with `import` lines stripped, since the REPL already has Mathlib) to `session.send_cmd(...)`. Inspects the result and emits typed feedback:
 
-Inspired by HILBERT (Apple, NeurIPS 2025) and DeepSeek-Prover V2.
+   - any compiler message with `severity == "error"` → `build_failed`
+   - `sorries` non-empty → `sorries_goal_state` carrying the inline `goal` per sorry
+   - scan for `\baxiom\b` → `axiom_detected`
+   - scan for `\b(apply|exact)\?` → `search_tactics_detected`
+   - `contains_blocklisted_tactic` from `autonomous/tactics.py` matches → `search_tactics_detected`
+   - target theorem not declared in the proposal → `missing_target_theorem` (non-terminal — the proposer retries with the correct name)
+   - else → `build_success`
 
-### Phase 1: Best-First Search Tree
+3. **Reviewer** (`backend/bourbaki/prover/reviewer.py`) — second Pydantic AI agent with `output_type=ReviewDecision`. Two real checks (`check_1`: statement signature unchanged · `check_2`: no `sorry`/`admit` in the proposed body) plus two honeypots ignored by the caller. On approval, runs `lean_prover` **once** on the assembled standalone source (`assemble_standalone_proof(preamble, proposal.code)`) — this is the ground-truth gate that catches REPL false positives.
 
-The core proving engine. Works like LeanDojo's ReProver:
+4. **Memory** (`backend/bourbaki/prover/memory.py`) — three strategies, swappable via `ProverConfig.memory_cls`:
 
-1. **Initialize** the theorem in the Lean REPL (one-time Mathlib import ~20s, then instant per tactic)
-2. **Maintain a priority queue** of proof states, each containing remaining goals
-3. **Pop** the most promising state (lowest score = most promising)
-4. **Generate candidate tactics** from four sources:
-   - Goal-aware pattern matching (36 patterns: `∀` → `intro`, `=` → `ring/simp`, `<` → `linarith`, etc.)
-   - Mathlib lemma search (Loogle, LeanSearch, LeanExplore)
-   - Standard automation (norm_num, omega, simp, nlinarith, positivity, etc.)
-   - Structural tactics (induction, cases, by_contra)
-5. **Expand** by applying each candidate via `lean_tactic()` in the REPL
-6. **Score** children: `goal_count * 10 + complexity + depth * 0.5 - novelty_bonus`
-7. If goals reach 0 → **proof found**. Otherwise loop until budget exhausted.
+   - `MemorylessMemory` — returns `""` (default).
+   - `PreviousKMemory(k)` — renders the last K (proposal, feedback) pairs verbatim, wrapped in `<previous-attempts>`.
+   - `ExperienceMemory(model)` — calls GLM-5.1 once per retry to compress prior lessons into a fresh `<experience>` block. Falls back to the prior experience on LLM error so a transient API hiccup doesn't wipe context.
+
+### Routing (mirrors ax-prover)
+
+Three `_route_*` methods, each returns `"continue" | "retry" | "end"`:
+
+- **proposer:** terminal feedback (`max_iterations`) → end · non-proposal (parsing failure) → retry · otherwise → continue
+- **builder:** `is_terminal` → end · `is_success` → continue · otherwise → retry
+- **reviewer:** `is_terminal` → end · `kind == "review_approved"` → continue · otherwise → retry
+
+A `retry` edge always goes through `Memory.process(state)` before the next proposer call.
+
+### Files
 
 ```
-backend/bourbaki/autonomous/
-├── search_tree.py       # ProofNode, ProofSearchTree, best_first_search()
-├── tactics.py           # generate_candidates(), generate_mathlib_queries()
-├── scoring.py           # NoveltyTracker, score_proof_state()
-└── novelty.py           # Goal state deduplication
+backend/bourbaki/prover/
+├── state.py         # ProverState, ProposalMessage, FeedbackMessage,
+│                    # ProverResult, ReviewDecision (all Pydantic)
+├── feedback.py      # 10 typed feedback factories (build_success,
+│                    # build_failed, sorries_goal_state, axiom_detected,
+│                    # search_tactics_detected, missing_target_theorem,
+│                    # review_approved, review_rejected, max_iterations,
+│                    # structured_output_parsing_failed)
+├── prompts.py       # PROPOSER / REVIEWER / EXPERIENCE prompts (GLM-5.1 targeted)
+├── proposer.py      # run_proposer + mathlib_search tool wiring
+├── builder.py       # run_builder + REPL response parsing
+├── reviewer.py      # run_reviewer + final lean_prover gate
+├── memory.py        # BaseMemory + 3 strategy implementations
+└── prover.py        # ProverConfig + ProverLoop (driver + routing)
 ```
 
 ```
 backend/bourbaki/tools/
-├── lean_repl.py         # LeanREPLSession, REPLSessionPool, lean_tactic()
-└── mathlib_search.py    # Loogle + LeanSearch + LeanExplore (semantic)
+├── lean_prover.py        # whole-file Lean compile (reviewer's final gate)
+├── lean_repl.py          # warm LeanREPLSession (builder backend)
+├── proof_code_builder.py # assemble_standalone_proof(preamble, code)
+└── mathlib_search.py     # Loogle + LeanSearch + LeanExplore (proposer tool)
 ```
 
-**Key insight:** Using the Lean REPL instead of `lean_prover` subprocess gives ~200x speedup (0.03s/tactic vs 90s/tactic) by amortizing Mathlib import across all tactic attempts.
+The only legacy file that survived Phase 3 is `autonomous/tactics.py` — its blocklist (`_BLOCKED_TACTICS`, `_BLOCKED_PATTERNS`, `contains_blocklisted_tactic`) is still load-bearing for catching REPL false positives in the builder.
 
-### Phase 2.5: Multi-Agent Coordinator
+### Pass@N sampling
 
-Four specialized LLM agents collaborate in a retry loop:
+`attempt_proof_pass_at_n` runs the loop up to N times per problem, returning the first verified result. Plumbed via `run_minif2f(pass_n=N)`. Default `pass_n=1` is a no-op so existing benchmark runs are unaffected. Shared REPL session across attempts — known leakage caveat documented in the function docstring (lean4-repl has no clean `:reset` primitive).
 
-| Role | Responsibility | Tools |
-|------|---------------|-------|
-| **Strategist** | Generate proof sketch + subgoals | symbolic_compute, paper_search |
-| **Searcher** | Find relevant Mathlib lemmas | mathlib_search (3 modes) |
-| **Prover** | Construct Lean proof guided by strategy + lemmas | lean_tactic |
-| **Verifier** | Validate complete proof | lean_prover |
+### Why this replaced the HILBERT pipeline
 
-On verification failure, the coordinator loops back to the Strategist with accumulated error feedback (up to `max_retries`). An `ensemble_prove()` mode launches parallel provers with different strategies, returning the first verified proof.
+The previous pipeline (sketch → formalize → decompose → search-tree → stitch) sat at 5/10 (50%) on the same 10-problem subset where the loop now hits 9/10 (90%), and on a 35-problem stratified sample it scored 10/35 (28.6%) where the loop now hits 22/35 (62.9%) — both with zero false positives.
 
-```
-backend/bourbaki/agent/
-├── coordinator.py       # ProofCoordinator, CoordinatorResult
-├── roles.py             # STRATEGIST, SEARCHER, PROVER, VERIFIER
-└── messages.py          # AgentMessage, MessageBus (async Queue routing)
-```
+Most of the win came from removing brittle stitching: the decomposer solved subgoals individually but the regex-replacement in `formalizer.stitch_proofs()` produced malformed Lean code in many cases. The loop's proposer generates a complete proof in one shot, so the stitching failure mode is gone by construction.
 
-The coordinator resolves custom model providers (e.g., `glm:glm-5` → `AnthropicModel` via Z.AI endpoint) using the same `_resolve_model_object()` as the main agent.
-
-### Phase 3: Strategy Rotation (Fallback)
-
-When all previous phases fail, the system rotates through 18 proof strategies using an LLM agent. Tracks dead ends to avoid repeating failed approaches. Supports checkpoint/resume for long-running searches.
+The full delta in code: **+118 / -6,576 lines** in commit `2113629`. See `.bourbaki/plans/refactor-audit.md` for the keep/reuse/drop classification.
 
 ### Lean Interaction
 
@@ -767,20 +741,22 @@ The standard benchmark for automated theorem proving. 488 problems (244 validati
 ```
 backend/bourbaki/benchmarks/
 ├── loader.py            # Parse Lean 4 files, extract theorem statements
-├── minif2f.py           # Baseline benchmark runner (automation + search tree)
-└── run_enhanced.py      # Enhanced runner (baseline + multi-agent fallback)
+└── minif2f.py           # Runner: attempt_proof, attempt_proof_repl,
+                         #         attempt_proof_loop, attempt_proof_pass_at_n
 ```
 
-**Benchmark runner flow:**
+**Benchmark runner flow (`use_loop=True` path, the new default):**
 
 1. Load problems from `.bourbaki/miniF2F-lean4/` Lean files
-2. Initialize REPL with full Mathlib import (~20s one-time)
-3. For each problem:
-   a. Try automation tactics via REPL (norm_num, omega, ring, simp, etc.)
-   b. If unsolved: run best-first search tree with budget
-4. (Enhanced mode) For unsolved problems: run multi-agent coordinator with LLM
+2. Initialize REPL with full Mathlib import (~80s one-time)
+3. For each problem: `attempt_proof_loop(problem, session, config, timeout)` — runs `ProverLoop.run` until `state.verified`, terminal feedback, or timeout
+4. Mandatory `_verify_with_lean_prover` post-hook on every reported solve — false-positive catcher independent of the reviewer's own `lean_prover` call
 
 **Current results (miniF2F valid split, 244 problems):**
+
+<p align="center">
+  <img src="assets/benchmark-history.svg" alt="miniF2F verified pass-rate history" width="100%">
+</p>
 
 **Honest verified-pass-rate history (miniF2F valid split):**
 
@@ -792,6 +768,7 @@ backend/bourbaki/benchmarks/
 | 2026-03-19 | + heuristic search | 10/35 | 28.6% | 35-problem stratified |
 | 2026-04-01 | + HILBERT decomposer + in-context solving | 5/10 | 50.0% | 10-problem subset |
 | 2026-04-25 | **Proposer-builder-reviewer loop (GLM-5.1)** | **9/10** | **90.0%** | 10-problem subset |
+| 2026-05-09 | Same loop, post-fix suite | **22/35** | **62.9%** | 35-problem stratified · 0 false positives |
 
 The Feb 18 91.8% was inflated ~15× by REPL false positives (the REPL reported
 `goals=[]` for tactics whose standalone Lean compile would have failed). Every

@@ -96,7 +96,31 @@ Skills can be added at three levels: built-in (`src/skills/`), user (`~/.bourbak
 
 ## Autonomous Mode
 
-Long-running proof search. The agent tries different strategies, backtracks when stuck, and remembers what worked and what didn't across iterations. Start from the TUI with `/prove <problem_id>` or via the API.
+Long-running proof search via a proposer-builder-reviewer loop driven by GLM-5.1 and a warm `LeanREPLSession`. One proposal per iteration, bounded by `max_iterations` (default 50, 8 for interactive). Every reported solve is gated by a `lean_prover` whole-file compile — no REPL-only claims.
+
+<p align="center">
+  <img src="assets/prover-loop.svg" alt="Proposer-Builder-Reviewer loop" width="100%">
+</p>
+
+Start from the TUI with `/prove <problem_id>` or via the API.
+
+## Results
+
+Verified pass rates on miniF2F valid (every solve confirmed by `lean_prover` standalone compile — see [`docs/REALITY_CHECK.md`](docs/REALITY_CHECK.md) for the audit of the earlier REPL-only era):
+
+| Date | Approach | Verified | Sample |
+|------|----------|---------:|--------|
+| 2026-02-22 (audit) | v0.2.1 code, lean_prover-gated | 6.2% (15/244) | full 244 |
+| 2026-03-08 (v0.2.2) | + REPL pipe-recovery + tactic blocklist | 25.8% (63/244) | full 244 |
+| 2026-04-01 | + HILBERT decomposer + in-context solving | 50.0% (5/10) | 10-problem |
+| 2026-04-25 | **proposer-builder-reviewer loop (GLM-5.1)** | **90.0% (9/10)** | 10-problem · 0 false positives |
+| 2026-05-09 | same loop on a wider sample | **62.9% (22/35)** | 35-problem stratified · 0 false positives |
+
+The 2026-02-18 v0.2.1 release claimed 91.8% / 94.3% on valid/test splits. Those numbers were inflated ~15× by REPL false positives and were retracted in the v0.2.2 audit. The current proposer-builder-reviewer architecture (commits `49211ce` through `2113629`) replaces the prior HILBERT-style pipeline; the full 244-problem run with the new architecture is pending (tracked in [issue #14](https://github.com/0bserver07/bourbaki/issues/14)).
+
+<p align="center">
+  <img src="assets/benchmark-history.svg" alt="miniF2F verified pass-rate history" width="100%">
+</p>
 
 ## Example Usage
 
