@@ -5,7 +5,16 @@ and what they don't. Updated as we go.
 
 ---
 
-## 2026-02-18 — v0.2.1 (94.3% miniF2F test)
+## 2026-02-18 — v0.2.1 (94.3% miniF2F test) — **RETRACTED**
+
+> **RETRACTED 2026-05-14.** The 91.8% / 94.3% numbers below were
+> inflated ~15× by REPL false positives. The v0.2.0 and v0.2.1 GitHub
+> releases now carry "RETRACTED (inflated numbers)" titles. The
+> 2026-02-22 audit further down cuts the verified rate to 6.2% on the
+> same code; the current proposer-builder-reviewer loop is at 9/10 and
+> 22/35 on smaller samples (see ARCHITECTURE.md "Benchmark" section).
+> Text below is preserved verbatim for historical context — every
+> benchmark number in this section is invalid.
 
 ### What's genuinely notable
 
@@ -252,7 +261,7 @@ REPL don't actually produce valid proof terms.
 | miniF2F test (v0.2.1 code) | 230/244 (94.3%) | **Not re-verified** | claim retracted; full test re-run pending #14 |
 | PutnamBench (theorem-only, pre-Phase-3) | 317/326 | **0/326 (0%)** | All false positives |
 | PutnamBench (answer-sorry) | 224/346 | Excluded | Need answer generation |
-| PutnamBench (5-problem dry run, new loop) | — | 0/5 | Blocked on [#13](https://github.com/0bserver07/bourbaki/issues/13) — pydantic_ai/z.ai adapter bug |
+| PutnamBench (5-problem dry run, new loop) | — | 0/5 | Was blocked on [#13](https://github.com/0bserver07/bourbaki/issues/13) (pydantic_ai/z.ai adapter bug); #13 now closed by commit `66cba4c` (`args_as_dict` shim). Re-run pending. |
 
 ### Why miniF2F is probably fine but PutnamBench isn't
 
@@ -283,9 +292,13 @@ is at 22/35 (62.9%) on a stratified sample as of May 9 — the full 244 re-run
 is the v0.3.0 release blocker, tracked in
 [issue #14](https://github.com/0bserver07/bourbaki/issues/14).
 
-The v0.2.1 git tag and release notes still reference the inflated numbers.
-Retraction of those release notes is tracked in
-[issue #15](https://github.com/0bserver07/bourbaki/issues/15).
+The v0.2.0 and v0.2.1 GitHub release titles were updated to
+"v0.2.x — RETRACTED (inflated numbers)" on 2026-05-14. The git tags
+themselves and the in-repo `CHANGELOG.md` entries also carry inline
+RETRACTED block-quotes. Tagging a clean v0.3.0 release on top of the
+new loop is tracked in
+[issue #15](https://github.com/0bserver07/bourbaki/issues/15) (open;
+blocked on the full 244-problem run, [issue #14](https://github.com/0bserver07/bourbaki/issues/14)).
 
 ---
 
