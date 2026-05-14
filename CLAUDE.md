@@ -21,6 +21,13 @@ TUI (React + Ink, Bun)  ──HTTP+SSE──→  Python Backend (FastAPI + Pydan
 
 The backend is Python (FastAPI + Pydantic AI). The TUI is TypeScript (React + Ink) and communicates with the backend via HTTP + Server-Sent Events.
 
+For long-running theorem proving the backend runs a proposer-builder-reviewer
+loop in `backend/bourbaki/prover/` (commit `2113629`, May 2026). The legacy
+HILBERT pipeline (`sketch` / `formalizer` / `decomposer` / `search_tree` /
+`scoring` / `strategies` / `search` / `modal_runner` / `progress`) was deleted
+in Phase 3; `backend/bourbaki/autonomous/` retains only `tactics.py` for its
+blocklist.
+
 ## Core Tools (Python Backend)
 
 | Tool | File | Purpose |
@@ -57,7 +64,9 @@ SKILL.md files live in `src/skills/` (builtin), `~/.bourbaki/skills/` (user), `.
 | `backend/bourbaki/tools/` | Native Python tools (SymPy, Lean, OEIS, arXiv) |
 | `backend/bourbaki/skills/` | Skill loader and registry |
 | `backend/bourbaki/sessions/` | Session persistence and context compaction |
-| `backend/bourbaki/autonomous/` | Long-running proof search with strategies |
+| `backend/bourbaki/prover/` | Proposer-builder-reviewer-memory loop (current proving engine) |
+| `backend/bourbaki/autonomous/` | Holds only `tactics.py` (blocklist still used by builder); other modules deleted in Phase 3 (commit `2113629`) |
+| `backend/bourbaki/benchmarks/` | miniF2F + PutnamBench runners (`loader.py`, `minif2f.py`, `putnam.py`) |
 | `backend/bourbaki/problems/` | Problem database (13 classic problems) |
 | `backend/bourbaki/server/routes/` | FastAPI route handlers |
 | `src/` | TypeScript TUI (React + Ink) |
@@ -99,11 +108,11 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 | GET | /problems | List problems |
 | GET | /problems/random | Random problem |
 | GET | /problems/{id} | Get problem |
-| POST | /autonomous/start | Start proof search |
-| POST | /autonomous/pause | Pause search |
-| POST | /autonomous/resume | Resume search |
-| GET | /autonomous/progress | Get progress |
-| GET | /autonomous/insights | Get insights |
+| POST | /autonomous/start | **Deprecated, returns 410 Gone** (use `/query` with `use_loop=True`; legacy pipeline deleted in commit `2113629`) |
+| POST | /autonomous/pause | **Deprecated, returns 410 Gone** |
+| POST | /autonomous/resume | **Deprecated, returns 410 Gone** |
+| GET | /autonomous/progress | **Deprecated, returns 410 Gone** |
+| GET | /autonomous/insights | **Deprecated, returns 410 Gone** |
 | GET | /skills | List proof technique skills |
 
 ## TUI Commands
@@ -118,9 +127,9 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 | `/model` | Change model/provider |
 | `/debug` | Toggle debug panel |
 | `/problems` | List available problems |
-| `/prove <id>` | Start autonomous proof search |
-| `/pause` | Pause proof search |
-| `/progress` | Show proof search progress |
+| `/prove <id>` | Start proof attempt (legacy TUI handler still POSTs to `/autonomous/start`, which now returns 410; the loop is reachable via `/query` with `use_loop=True` or the `attempt_proof_loop` driver) |
+| `/pause` | Pause proof search (legacy, 410) |
+| `/progress` | Show proof search progress (legacy, 410) |
 | `/skills` | List available proof techniques |
 | `/export [format]` | Export last proof (latex/lean/markdown) |
 
@@ -133,6 +142,9 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 | `backend/bourbaki/events.py` | AgentEvent models (SSE wire format) |
 | `backend/bourbaki/config.py` | Pydantic Settings (.env config) |
 | `backend/bourbaki/server/routes/query.py` | SSE streaming endpoint |
+| `backend/bourbaki/prover/prover.py` | `ProverLoop` driver (proposer / builder / reviewer / memory routing) |
+| `backend/bourbaki/prover/state.py` | `ProverState`, `ProposalMessage`, `FeedbackMessage`, `ProverResult`, `ReviewDecision` |
+| `backend/bourbaki/tools/proof_code_builder.py` | `assemble_standalone_proof(preamble, code)` shared by builder and reviewer |
 | `src/agent/types.ts` | Event type definitions (the contract) |
 | `src/hooks/useAgentRunner.ts` | TUI ↔ backend bridge (fetch+SSE) |
 
@@ -146,14 +158,18 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 
 ## Development Roadmap
 
-The roadmap for closing the gap with SOTA theorem provers (Axiom, Aristotle, LeanDojo,
-AlphaProof, etc.) lives in `.bourbaki/roadmap/` (gitignored). Read it for context on
-what's been done and what's planned:
+Plans for the proposer-builder-reviewer refactor live in `.bourbaki/plans/`
+(gitignored, checked in only as context for new sessions):
 
-- `.bourbaki/roadmap/README.md` — overview and reference systems
-- `.bourbaki/roadmap/tracker.md` — current task status across all phases
-- `.bourbaki/roadmap/phases/` — detailed plans for each phase
+- `.bourbaki/plans/REFACTOR_PLAN.md` — consolidated phasing
+- `.bourbaki/plans/proposer-builder-loop.md` — full design, prompts, signatures
+- `.bourbaki/plans/refactor-audit.md` — keep / reuse / drop classification
+- `.bourbaki/plans/decomposer-blockers.md` — historical failure modes (pre-refactor)
+- `.bourbaki/plans/lean-interact-eval.md` — alternative REPL library evaluation
 
-Current phases: (1) Self-correction loop, (2) Best-first proof search,
-(3) Informal-to-formal pipeline, (4) Semantic Mathlib retrieval,
-(5) miniF2F benchmark, (6) Multi-agent proving.
+Phase status (commits in chronological order): Phase 1 scaffold (`49211ce`),
+Phase 2 loop body (`9d8adbb`, `6beda20`, `fdcb76b`, `c06e006`), Phase 2 fixes
+(`aa99595`, `8bc16ec`, `ef364ee`), Phase 3 legacy delete (`2113629`),
+Phase 4 mathlib_search proposer tool (`4ef9398`) and Pass@N (`3222a07`).
+Open follow-up issues: #11 (status tracker), #14 (full 244-problem run),
+#15 (v0.3.0 release + tag), #17 (mathlib_search A/B), #18 (Pass@N A/B).
