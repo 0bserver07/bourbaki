@@ -119,12 +119,13 @@ export function CLI() {
   /model            Change model/provider
   /debug            Toggle debug panel
   /problems         List available problems
-  /prove <id>       Start autonomous proof search
-  /pause            Pause proof search
-  /progress         Show proof search progress
   /skills           List proof techniques
   /export <format>  Export last proof (latex/lean/markdown)
-  exit              Quit Bourbaki`);
+  exit              Quit Bourbaki
+
+Deprecated (removed in v0.3.0):
+  /prove <id>       Use the benchmark CLI (e.g. backend/bourbaki/benchmarks/minif2f.py)
+  /pause /progress  Bounded proposer-builder-reviewer loop replaces pause/resume`);
       return;
     }
 
@@ -222,7 +223,7 @@ export function CLI() {
           const list = problems.map((p: { id: string; title: string; difficulty?: string; domain?: string }) =>
             `  ${p.id}: ${p.title}${p.difficulty ? ` [${p.difficulty}]` : ''}${p.domain ? ` (${p.domain})` : ''}`
           ).join('\n');
-          setInfoMessage(`Problems:\n${list}\n\nUse /prove <id> to start autonomous search`);
+          setInfoMessage(`Problems:\n${list}\n\nTo run a proof search, use the benchmark CLI (e.g. \`python -m bourbaki.benchmarks.minif2f --problem-id <id>\`).`);
         }
       } catch {
         setError(`Failed to reach backend. Is it running at ${BACKEND_URL}?`);
@@ -230,76 +231,33 @@ export function CLI() {
       return;
     }
 
-    // Handle autonomous proof search
-    if (query.startsWith('/prove ')) {
+    // /prove, /pause, /progress — deprecated after Phase 3 removed the
+    // autonomous pipeline (commit 2113629). The backend stubs /autonomous/*
+    // routes to return HTTP 410 Gone. The bounded proposer-builder-reviewer
+    // loop (~50 iterations, ~5 min budget) replaces it, but is currently
+    // invoked from the Python benchmark CLI rather than over HTTP.
+    if (query.startsWith('/prove ') || query === '/prove') {
       const problemId = query.slice(7).trim();
-      try {
-        // Fetch the problem first
-        const pRes = await fetch(`${BACKEND_URL}/problems/${problemId}`);
-        if (!pRes.ok) {
-          setError(`Problem '${problemId}' not found. Use /problems to list.`);
-          return;
-        }
-        const problem = await pRes.json();
-        setInfoMessage(`Starting autonomous proof search for: ${problem.title}\nStrategies will be tried automatically. Use /progress to check status, /pause to stop.`);
-
-        // Start the search
-        const res = await fetch(`${BACKEND_URL}/autonomous/start`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ problem, max_iterations: 50, max_hours: 1.0 }),
-        });
-        const progress = await res.json();
-        setInfoMessage(
-          `Proof search started for: ${problem.title}\n` +
-          `Session: ${progress.session_id || progress.sessionId || '?'}\n` +
-          `Status: ${progress.status}\n` +
-          `Use /progress to monitor, /pause to stop.`
-        );
-      } catch {
-        setError(`Failed to start proof search. Is the backend running at ${BACKEND_URL}?`);
-      }
+      const target = problemId ? `--problem-id ${problemId}` : '<problem-id>';
+      setInfoMessage(
+        `/prove is deprecated in v0.3.0. The autonomous search pipeline was\n` +
+        `replaced by the proposer-builder-reviewer loop, which currently runs\n` +
+        `from the Python CLI rather than the TUI.\n\n` +
+        `Run a proof search with:\n` +
+        `  python -m bourbaki.benchmarks.minif2f ${target}\n` +
+        `or use the \`attempt_proof_loop\` entry point in\n` +
+        `\`backend/bourbaki/benchmarks/minif2f.py\`.`
+      );
       return;
     }
 
-    // Handle pause
-    if (query === '/pause') {
-      try {
-        await fetch(`${BACKEND_URL}/autonomous/pause`, { method: 'POST' });
-        setInfoMessage('Proof search paused.');
-      } catch {
-        setError(`Failed to reach backend. Is it running at ${BACKEND_URL}?`);
-      }
-      return;
-    }
-
-    // Handle progress
-    if (query === '/progress') {
-      try {
-        const res = await fetch(`${BACKEND_URL}/autonomous/progress`);
-        const p = await res.json();
-        const lines = [
-          `Status: ${p.status}`,
-          `Problem: ${p.problem_id || p.problemId || '?'}`,
-          `Iteration: ${p.iteration}/${p.max_iterations || p.maxIterations || '?'}`,
-          `Elapsed: ${Math.round(p.elapsed_seconds || p.elapsedSeconds || 0)}s`,
-          `Strategies tried: ${p.strategies_tried || p.strategiesTried || 0}`,
-          `Dead ends: ${p.dead_ends || p.deadEnds || 0}`,
-          `Proof found: ${p.proof_found || p.proofFound ? 'YES' : 'no'}`,
-        ];
-        if (p.current_strategy || p.currentStrategy) {
-          lines.push(`Current strategy: ${p.current_strategy || p.currentStrategy}`);
-        }
-        if ((p.insights || []).length > 0) {
-          lines.push(`\nInsights:`);
-          for (const insight of p.insights.slice(-5)) {
-            lines.push(`  - ${insight}`);
-          }
-        }
-        setInfoMessage(lines.join('\n'));
-      } catch {
-        setError(`Failed to reach backend. Is it running at ${BACKEND_URL}?`);
-      }
+    if (query === '/pause' || query === '/resume' || query === '/progress') {
+      setInfoMessage(
+        `${query} is deprecated in v0.3.0. The new proposer-builder-reviewer\n` +
+        `loop is bounded (max 50 iterations, ~5 min budget) so pause/resume/\n` +
+        `progress polling no longer apply. The loop runs to completion or\n` +
+        `fails fast; results stream back via /query.`
+      );
       return;
     }
 
