@@ -40,8 +40,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from bourbaki.benchmarks.minif2f import (
+    attempt_proof_loop,
+    attempt_proof_pass_at_n,
+)
 from bourbaki.benchmarks.putnam_loader import (
     PutnamProblem,
     get_putnam_stats,
@@ -50,6 +54,9 @@ from bourbaki.benchmarks.putnam_loader import (
 from bourbaki.autonomous.tactics import TACTIC_BLOCKLIST, contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession
+
+if TYPE_CHECKING:
+    from bourbaki.prover import ProverConfig as _ProverConfigType  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +261,34 @@ class PutnamBenchmarkResult:
         }
 
 
+def _loop_result_to_putnam(
+    problem: PutnamProblem,
+    loop_result: Any,
+) -> ProblemResult:
+    """Convert a :class:`bourbaki.benchmarks.minif2f.ProblemResult` produced
+    by :func:`attempt_proof_loop` or :func:`attempt_proof_pass_at_n` into
+    the Putnam-flavoured :class:`ProblemResult` ``run_putnam`` works with.
+
+    The two dataclasses are structurally similar; the Putnam one adds
+    ``year``, ``section``, and ``has_answer`` columns drawn from the
+    source problem (these aren't on the miniF2F result).
+    """
+    return ProblemResult(
+        problem_id=loop_result.problem_id,
+        year=problem.year,
+        section=problem.section,
+        has_answer=problem.has_answer,
+        solved=loop_result.solved,
+        repl_reported=loop_result.repl_reported,
+        verified=loop_result.verified,
+        proof_code=loop_result.proof_code,
+        error=loop_result.error,
+        tactics_used=loop_result.tactics_used,
+        duration_seconds=loop_result.duration_seconds,
+        attempts=loop_result.attempts,
+    )
+
+
 async def attempt_putnam_repl(
     problem: PutnamProblem,
     session: LeanREPLSession,
@@ -393,6 +428,13 @@ async def run_putnam(
     attempt_answers: bool = False,
     answer_model: str = "glm:glm-5",
     answer_max_attempts: int = 3,
+    use_loop: bool = False,
+    loop_max_iterations: int = 50,
+    loop_model: str = "glm:glm-5.1",
+    loop_memory: str = "MemorylessMemory",
+    loop_memory_k: int = 2,
+    loop_enable_mathlib_search: bool = False,
+    pass_n: int = 1,
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
 
@@ -403,9 +445,17 @@ async def run_putnam(
 
     Phase 3 deprecation note: the legacy ``use_search`` /
     ``search_budget`` / ``use_mathlib_search`` knobs (best-first search tree)
-    were removed when the autonomous pipeline was deleted.  The runner now
-    uses only :func:`attempt_putnam_repl` for proof attempts.  Wiring the
-    proposer-builder-reviewer loop into ``run_putnam`` is a separate task.
+    were removed when the autonomous pipeline was deleted.
+
+    When ``use_loop`` is True, each (non-answer-sorry) problem is routed
+    through the proposer-builder-reviewer loop
+    (:func:`bourbaki.benchmarks.minif2f.attempt_proof_loop` /
+    :func:`attempt_proof_pass_at_n`) instead of the REPL automation
+    fallback.  ``PutnamProblem`` is duck-compatible with
+    ``MiniF2FProblem`` on the fields the loop reads (``id``, ``source``,
+    ``statement``, ``full_lean_code``), so problems flow through unchanged.
+    ``pass_n > 1`` enables Pass@N sampling on the loop path; otherwise
+    a single :func:`attempt_proof_loop` call is made per problem.
 
     Args:
         year_filter: Filter by specific year.
@@ -430,6 +480,21 @@ async def run_putnam(
             "glm:glm-5").
         answer_max_attempts: Maximum LLM answer attempts per problem
             (default 3).
+        use_loop: Drive the proposer-builder-reviewer loop (Phase 2
+            architecture).  When False (default) the runner uses the
+            REPL automation fallback :func:`attempt_putnam_repl`.
+        loop_max_iterations: Max proposer-builder-reviewer iterations per
+            problem.
+        loop_model: Model string for the proposer / reviewer.
+        loop_memory: Name of the Memory subclass driving experience.
+        loop_memory_k: Number of past experiences passed to the proposer.
+        loop_enable_mathlib_search: Wire ``mathlib_search`` as a proposer
+            tool.
+        pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
+            :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
+            ``pass_n`` independent loop attempts via
+            :func:`attempt_proof_pass_at_n`, stopping at the first
+            verified success.  Only takes effect when ``use_loop=True``.
 
     Returns:
         PutnamBenchmarkResult with aggregate and per-problem results.
@@ -620,9 +685,30 @@ async def run_putnam(
                     logger.info("  SKIPPED (answer-sorry)")
                     continue
 
-            result = await attempt_putnam_repl(
-                problem, repl_session, timeout=timeout,
-            )
+            if use_loop:
+                from bourbaki.prover import ProverConfig as _ProverConfig
+                loop_cfg = _ProverConfig(
+                    model=loop_model,
+                    max_iterations=loop_max_iterations,
+                    memory_cls=loop_memory,
+                    memory_k=loop_memory_k,
+                    enable_mathlib_search=loop_enable_mathlib_search,
+                )
+                if pass_n > 1:
+                    loop_result = await attempt_proof_pass_at_n(
+                        problem, repl_session, config=loop_cfg,
+                        n=pass_n, timeout_per_attempt=timeout,
+                    )
+                else:
+                    loop_result = await attempt_proof_loop(
+                        problem, repl_session, config=loop_cfg,
+                        timeout=timeout,
+                    )
+                result = _loop_result_to_putnam(problem, loop_result)
+            else:
+                result = await attempt_putnam_repl(
+                    problem, repl_session, timeout=timeout,
+                )
 
             # Whole-file verification for solved problems
             if result.solved and verify_proofs and result.proof_code:
@@ -747,6 +833,15 @@ async def run_putnam(
             "answer_max_attempts": answer_max_attempts if attempt_answers else None,
             "verify_proofs": verify_proofs,
             "verify_timeout": verify_timeout,
+            "use_loop": use_loop,
+            "loop_max_iterations": loop_max_iterations if use_loop else None,
+            "loop_model": loop_model if use_loop else None,
+            "loop_memory": loop_memory if use_loop else None,
+            "loop_memory_k": loop_memory_k if use_loop else None,
+            "loop_enable_mathlib_search": (
+                loop_enable_mathlib_search if use_loop else None
+            ),
+            "pass_n": pass_n if use_loop else None,
         },
         timestamp=datetime.now(timezone.utc).isoformat(),
         by_year=by_year,
