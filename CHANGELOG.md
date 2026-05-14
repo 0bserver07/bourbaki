@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0-pending — 2026-04-25
+## v0.3.0-pending — 2026-04-25 → 2026-05-09
 
 ### Proposer-builder-reviewer loop replaces HILBERT pipeline
 
@@ -11,6 +11,14 @@ loop: GLM-5.1 proposes a complete proof, a warm `LeanREPLSession` runs
 it, a reviewer node gates on `check_1 (statement preserved) AND check_2
 (no sorry/admit)`, and `lean_prover` runs once at approval as the
 final ground-truth gate.
+
+Phase 3 (commit `2113629`) deleted the legacy `autonomous/` pipeline —
+`sketch.py`, `formalizer.py`, `decomposer.py`, `search_tree.py`,
+`scoring.py`, `strategies.py`, `search.py`, `modal_runner.py`,
+`progress.py` — net `-6,576 / +118` lines. The `/autonomous/*` route
+handlers now return HTTP 410 Gone with a deprecation message pointing
+clients at `/query` with `use_loop=True`. The blocklist in
+`autonomous/tactics.py` is the only legacy module that survived.
 
 **10-problem A/B (same subset as the 50% decomposer baseline):**
 
@@ -24,9 +32,25 @@ The single remaining failure (`mathd_algebra_31`, an NNReal
 `Filter.Tendsto` fixed-point problem) is genuinely hard — the
 decomposer also failed it.
 
-**Status:** preliminary. **Not yet re-run on the full 244 split** —
-35-problem stratified A/B is in progress at the time of writing. Tag
-withheld until the larger run confirms the result holds.
+**35-problem stratified follow-up (2026-05-09):** **22/35 (62.9%) verified, 0 false positives.**
+More than doubles the 28.6% heuristic baseline on the same sample.
+Per-source breakdown: aime 0/3, imo 0/3 (LLM unfamiliar), mathd 13/15
+(87%), induction 2/2 and numbertheory 2/2 (100%), algebra 3/5, amc 2/3,
+unknown 2/5. Result file:
+`.bourbaki/benchmarks/results/2026-05-09_2241_minif2f_valid.json`.
+
+**Phase 4 (already wired, off by default):** `mathlib_search` as a
+proposer tool (commit `4ef9398`, A/B tracked in
+[#17](https://github.com/0bserver07/bourbaki/issues/17)) and Pass@N
+sampling via `attempt_proof_pass_at_n` (commit `3222a07`, A/B tracked
+in [#18](https://github.com/0bserver07/bourbaki/issues/18)).
+
+**Status:** v0.3.0 tag withheld pending the full 244-problem run with
+the new loop, tracked in
+[#14](https://github.com/0bserver07/bourbaki/issues/14). The retraction
+of v0.2.0 / v0.2.1 GitHub releases is tracked in
+[#15](https://github.com/0bserver07/bourbaki/issues/15) (release titles
+were updated to "RETRACTED" on 2026-05-14).
 
 **Architecture:** `backend/bourbaki/prover/` — see
 [`.bourbaki/plans/proposer-builder-loop.md`](.bourbaki/plans/proposer-builder-loop.md)
@@ -123,7 +147,16 @@ decide (7), nlinarith (3), simp_all (2).
 
 ---
 
-## v0.2.1 — 2026-02-18
+## v0.2.1 — 2026-02-18 — **RETRACTED**
+
+> **RETRACTED 2026-05-14.** The 91.8% / 94.3% claims below were inflated
+> ~15× by REPL false positives — the REPL reported `goals=[]` for tactics
+> whose standalone Lean compile rejected them. The corresponding GitHub
+> release title now reads "v0.2.1 — RETRACTED (inflated numbers)". The
+> honest verified rate on the same code is 6.2% on the valid split
+> (re-verified 2026-02-22; see the v0.2.2 entry and
+> [`docs/REALITY_CHECK.md`](docs/REALITY_CHECK.md) for the audit).
+> Retained here only for historical context; do not cite these numbers.
 
 ### 94.3% on miniF2F test split — no fine-tuning, no custom training
 
@@ -174,7 +207,16 @@ and Goedel-Prover V2 (90.4%).
 
 ---
 
-## v0.2.0 — 2026-02-17
+## v0.2.0 — 2026-02-17 — **RETRACTED**
+
+> **RETRACTED 2026-05-14.** The 91.8% / 224-of-244 number below was
+> inflated ~15× by REPL false positives — the same REPL bug that
+> invalidated v0.2.1. The corresponding GitHub release title now reads
+> "v0.2.0 — RETRACTED (inflated numbers)". The honest verified rate on
+> the same code is 6.2% on the valid split (re-verified 2026-02-22;
+> see the v0.2.2 entry below and
+> [`docs/REALITY_CHECK.md`](docs/REALITY_CHECK.md)). Retained here only
+> for historical context; do not cite these numbers.
 
 ### 91.8% on miniF2F (valid split) — competitive with Aristotle and DeepSeek-Prover
 
