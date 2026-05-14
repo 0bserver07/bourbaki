@@ -111,7 +111,7 @@ for keep/reuse/drop classification.
 - Pyright across `backend/bourbaki/`: **48 errors → 0**.
 - Drafted `backend/bourbaki/prover/prompts_v2.py` (-150 tokens/iter,
   tactic shortlist, ≤2-sentence reasoning cap). Not swapped in yet —
-  needs an A/B run first ([#17](https://github.com/0bserver07/bourbaki/issues/17)).
+  the dedicated A/B is tracked in [#20](https://github.com/0bserver07/bourbaki/issues/20).
 - TUI's `/prove`, `/pause`, `/progress` deprecated (legacy routes now
   return HTTP 410); commands print deprecation messages instead.
 
