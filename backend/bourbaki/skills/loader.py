@@ -45,9 +45,9 @@ def parse_skill_file(content: str, path: str, source: SkillSource) -> Skill:
     name = post.metadata.get("name")
     description = post.metadata.get("description")
 
-    if not name:
+    if not name or not isinstance(name, str):
         raise ValueError(f"SKILL.md at {path} missing required 'name' field")
-    if not description:
+    if not description or not isinstance(description, str):
         raise ValueError(f"SKILL.md at {path} missing required 'description' field")
 
     return Skill(
@@ -75,7 +75,9 @@ def extract_skill_metadata(path: Path, source: SkillSource) -> SkillMetadata | N
         post = frontmatter.loads(content)
         name = post.metadata.get("name")
         description = post.metadata.get("description")
-        if not name or not description:
+        if not name or not isinstance(name, str):
+            return None
+        if not description or not isinstance(description, str):
             return None
         return SkillMetadata(
             name=name,

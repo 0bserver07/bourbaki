@@ -156,6 +156,7 @@ class _IndexHolder:
             self._metadata = json.load(f)
 
         # Sanity check
+        assert self._metadata is not None  # populated above
         if self._index.ntotal != len(self._metadata):
             logger.error(
                 "Index/metadata mismatch: %d vectors vs %d entries",
@@ -177,6 +178,10 @@ class _IndexHolder:
         if not self._loaded:
             if not self.load():
                 return []
+
+        # load() populates these; assert keeps the type-checker happy.
+        assert self._index is not None
+        assert self._metadata is not None
 
         model = self._ensure_model()
 
@@ -412,7 +417,7 @@ def build_index(
     # 3. Build FAISS index
     logger.info("Step 3/3: Building FAISS index (dim=%d, n=%d)...", dim, len(decls))
     index = faiss.IndexFlatIP(dim)  # Inner product (cosine sim with normalized vectors)
-    index.add(embeddings_matrix)
+    index.add(embeddings_matrix)  # type: ignore[call-arg]  # faiss stub omits positional `x`
 
     # Prepare metadata
     metadata = []

@@ -18,8 +18,7 @@ import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from pydantic_ai import Agent, RunContext
-from pydantic_ai._agent_graph import CallToolsNode, ModelRequestNode
+from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -111,6 +110,7 @@ def _create_agent(model: str) -> Agent[AgentDependencies, str]:
 
     agent: Agent[AgentDependencies, str] = Agent(
         resolved_model,
+        deps_type=AgentDependencies,
         system_prompt=system_prompt,
         retries=2,
     )

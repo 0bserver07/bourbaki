@@ -109,7 +109,7 @@ def _sym(name: str | None) -> Symbol:
 
 
 def symbolic_compute(
-    operation: Operation,
+    operation: Operation | str,
     expression: str = "",
     variable: str | None = None,
     from_val: str | int | None = None,
@@ -147,7 +147,7 @@ def symbolic_compute(
         if isinstance(result, sympy.Basic):
             latex_str = sympy.latex(result)
             try:
-                numeric = float(result.evalf())
+                numeric = float(result.evalf())  # type: ignore[attr-defined]
             except (TypeError, ValueError):
                 pass
             result_str = str(result)
@@ -296,16 +296,16 @@ def _dispatch(
             return m.rref()[0]
         if operation == "characteristic_polynomial":
             lam = Symbol("lambda")
-            return m.charpoly(lam).as_expr()
+            return m.charpoly(lam).as_expr()  # type: ignore[arg-type]
         if operation == "minimal_polynomial":
             lam = Symbol("lambda")
-            return m.charpoly(lam).as_expr()  # SymPy minimal_poly is on algebraic numbers
+            return m.charpoly(lam).as_expr()  # type: ignore[arg-type]  # SymPy minimal_poly is on algebraic numbers
 
     # --- Analysis ---
     if operation == "taylor_series":
         expr = _parse(expression)
         pt = _parse(str(point)) if point is not None else 0
-        return series(expr, sym, pt, n=order)
+        return series(expr, sym, pt, n=order)  # type: ignore[arg-type]
 
     if operation == "fourier_series":
         expr = _parse(expression)
