@@ -16,9 +16,7 @@ import os
 from abc import ABC, abstractmethod
 
 from pydantic_ai import Agent
-from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from bourbaki.prover import prompts
@@ -27,12 +25,21 @@ from bourbaki.prover.state import FeedbackMessage, ProposalMessage, ProverState
 logger = logging.getLogger(__name__)
 
 
-def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
+# z.ai's OpenAI-compatible chat-completions endpoint. See issue #13 for
+# why we no longer route through the Anthropic-compat endpoint.
+_ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
+
+
+def _resolve_model_object(model: str) -> str | OpenAIChatModel:
     """Resolve a model string to a Pydantic AI model object.
 
     Duplicated from :mod:`bourbaki.prover.reviewer` deliberately — the design
     doc keeps memory and reviewer free of cross-module dependencies during
     Phase 2 so the two can ship and be tested independently.
+
+    ``glm:`` now routes through z.ai's OpenAI-compatible endpoint to
+    avoid the pydantic_ai 1.56 ``args_as_dict`` crash on PutnamBench
+    problems (issue #13).
     """
     if model.startswith("ollama-cloud:"):
         model_name = model.removeprefix("ollama-cloud:")
@@ -46,11 +53,11 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
     if model.startswith("glm:"):
         model_name = model.removeprefix("glm:")
         api_key = os.environ.get("GLM_API_KEY", "")
-        provider = AnthropicProvider(
-            base_url="https://api.z.ai/api/anthropic",
+        provider = OpenAIProvider(
+            base_url=_ZAI_OPENAI_BASE_URL,
             api_key=api_key,
         )
-        return AnthropicModel(model_name, provider=provider)
+        return OpenAIChatModel(model_name, provider=provider)
 
     return model
 
