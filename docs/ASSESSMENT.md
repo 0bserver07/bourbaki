@@ -1,8 +1,27 @@
 # Bourbaki Assessment Report
 
-> Last updated: 2026-03-19
-> Status: Active development, post-correction
-> Author: Project maintainers
+> **SUPERSEDED 2026-05-13.** This report was written on 2026-03-19 and
+> describes the decomposer-era architecture (sketch → formalize →
+> decompose → search → stitch). That pipeline was deleted in Phase 3
+> (commit `2113629`, May 2026, net `-6,576 / +118` lines) and replaced by
+> the proposer-builder-reviewer loop in `backend/bourbaki/prover/`.
+>
+> The numbers in this report (28.6% heuristic, 40% with decomposer) are
+> historical. Current verified rates (lean_prover-gated, 0 false positives):
+> **9/10 (90%)** on a 10-problem subset (2026-04-25) and **22/35 (62.9%)**
+> on a 35-problem stratified sample (2026-05-09). For the current state
+> read `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and
+> `docs/REALITY_CHECK.md`.
+>
+> Most module references below (`sketch.py`, `formalizer.py`, `decomposer.py`,
+> `search_tree.py`, `scoring.py`, `strategies.py`, `modal_runner.py`,
+> `progress.py`) no longer exist on disk; they survive here only as the
+> pre-refactor history of the project. The blocklist in
+> `autonomous/tactics.py` is the only legacy module that still ships.
+>
+> *Last edited 2026-03-19 (original).*
+> *Original status: Active development, post-correction.*
+> *Original author: Project maintainers.*
 
 ---
 
@@ -15,12 +34,12 @@ to be 15x inflated due to REPL false positives. The actual verified rate is
 the LLM decomposer into the benchmark, and produced the first honest numbers
 with the full system running.
 
-| Metric | Claimed (Feb 18) | Verified (Mar 19) |
-|--------|:---:|:---:|
-| miniF2F valid | 91.8% | **28.6%** (heuristics) / **40%** (with decomposer) |
-| PutnamBench | 95.4% | **0%** |
-| SOTA comparison | Competitive with Aristotle | **70pp behind HILBERT** |
-| False positives in results | Unknown | **0** (inline verification) |
+| Metric | Claimed (Feb 18) | Verified (Mar 19) | Current (May 9) |
+|--------|:---:|:---:|:---:|
+| miniF2F valid | 91.8% — **RETRACTED** | 28.6% (heuristics) / 40% (decomposer, 4/10) | **22/35 (62.9%)** stratified sample |
+| PutnamBench | 95.4% — **RETRACTED** | 0% | Re-run pending after #13 closed in `66cba4c` |
+| SOTA comparison | "Competitive with Aristotle" — **RETRACTED** | 70pp behind HILBERT | Full 244 run is v0.3.0 blocker, [#14](https://github.com/0bserver07/bourbaki/issues/14) |
+| False positives in results | Unknown (~15× inflation) | 0 (inline verification) | 0 |
 
 ---
 
@@ -203,7 +222,7 @@ sat unused for a month.
 
 ---
 
-## Current status
+## Current status (as of 2026-03-19)
 
 ### What works (verified)
 
@@ -213,34 +232,44 @@ sat unused for a month.
 - Multi-step proofs: 3 verified (2-4 tactics each)
 - GLM-5 decompositions: mathematically sensible strategies
 
-### Known blockers
+### Known blockers (March 2026 — most resolved by Phase 3 refactor)
 
-- REPL concurrency for parallel subgoal solving (#11 needed)
-- `induction...simp_all` false positive factory (#10)
-- Decomposer timeouts on complex problems (subgoal search too slow)
+- ~~REPL concurrency for parallel subgoal solving~~ — moot: decomposer deleted
+- ~~`induction...simp_all` false positive factory (#10)~~ — closed
+- ~~Decomposer timeouts on complex problems (subgoal search too slow)~~ — moot: decomposer deleted
 
-### Open issues
+### Issue status (rechecked 2026-05-13 against `gh issue list`)
 
 | # | Issue | Status |
 |---|-------|--------|
-| #1 | Re-run miniF2F full split | Open — needs full 244-problem run |
-| #2 | Fix proof_code context | **Merged, verified** |
-| #3 | Tactic blocklist | **Merged, verified** |
-| #4 | Pass@N sampling | Open |
-| #5 | Add polyrith tactic | Open |
-| #6 | Inline verification | **Merged, verified** |
-| #7 | Trained value model | Open (research) |
-| #8 | RL tactic policy | Open (research) |
-| #9 | Verification guardrails | **Merged, verified** |
-| #10 | Blocklist induction...simp_all | Open |
+| #1 | Re-run miniF2F full split after REPL pipe-corruption fix | **CLOSED** |
+| #2 | Fix proof_code context (imports + open + preamble) | **CLOSED** |
+| #3 | Tactic blocklist for REPL false positives | **CLOSED** |
+| #4 | Pass@N sampling | **CLOSED** (implemented in commit `3222a07`; A/B tracked in [#18](https://github.com/0bserver07/bourbaki/issues/18)) |
+| #5 | Add polyrith tactic | **CLOSED** |
+| #6 | Inline `lean_prover` verification during search | **CLOSED** |
+| #7 | Trained value model | **CLOSED** (parked — current loop uses typed feedback, no learned value) |
+| #8 | RL-trained tactic policy | **CLOSED** (parked — same reason) |
+| #9 | Verification guardrails | **CLOSED** |
+| #10 | Blocklist `induction…simp_all` | **CLOSED** |
+| #11 | Status tracker — inflated results correction | **Open** (note: in this Mar-19 doc the same number was misused for REPL concurrency; that issue was retired with the decomposer) |
+| #12 | Decomposer subgoals timeout | **CLOSED** |
+| #13 | pydantic_ai Anthropic adapter crashes on z.ai responses | **CLOSED** (commit `66cba4c`) |
+| #14 | Full 244-problem miniF2F run with the new loop | **Open** — v0.3.0 release blocker |
+| #15 | Tag v0.3.0 + retract v0.2.1 release notes | **Open** (GitHub releases already retitled "RETRACTED") |
+| #16 | Wire ProverLoop into `run_putnam` | **CLOSED** (commit `87114ef`) |
+| #17 | `mathlib_search` proposer tool A/B | **Open** |
+| #18 | Pass@N live A/B (N=4 on the 35-problem subset) | **Open** |
 
 ---
 
-## Commit timeline
+## Commit timeline (extended 2026-05-13)
+
+Pre-Phase-2 history (decomposer era):
 
 ```
 Feb 09  e641f2c  let there be proof
-Feb 18  29205c1  v0.2.1: 94.3% claimed              <-- inflated
+Feb 18  29205c1  v0.2.1: 94.3% claimed              <-- inflated, RETRACTED
 Feb 19  43d3f21  PutnamBench audit: 0% verified      <-- crash
 Feb 23  a8e8c3e  miniF2F verified: 63/244 (25.8%)    <-- honest baseline
 Mar 08  1e6f199  REPL pipe corruption fix
@@ -253,7 +282,31 @@ Mar 18  6bbd34c  expand() fix + verified run (10/35 = 28.6%)
 Mar 19  c385ad9  Decomposer wired in (4/10 = 40%)
 ```
 
+Proposer-builder-reviewer refactor (April-May):
+
+```
+Apr 25  49211ce  Scaffold prover module (Phase 1)
+Apr 25  9d8adbb  Proposer node (Phase 2)
+Apr 25  6beda20  Builder node (Phase 2)
+Apr 25  fdcb76b  Reviewer + memory strategies (Phase 2)
+Apr 25  c06e006  ProverLoop driver + benchmark wiring (Phase 2)
+Apr 25  aa99595  Post-Phase-2 review fixes
+Apr 25  8bc16ec  Builder strips imports from preamble too
+Apr 25  ef364ee  Five A/B fixes turning 50% → 90% on 10-problem
+May 09  aa4e0af  Replace v0.2.1's inflated claims with honest history
+May 09  4ef9398  Wire mathlib_search as proposer tool (Phase 4)
+May 09  3222a07  Pass@N sampling
+May 09  2113629  Delete legacy autonomous/ pipeline (Phase 3, -6,576 / +118)
+May 11  677cd3e  Refresh ARCHITECTURE / README / REALITY_CHECK for new loop
+May 11  04dea47  Light-theme SVG redesign
+May 13  ddd6edc  Switch z.ai routing to OpenAI-compat endpoint (#13)
+May 13  87114ef  Wire ProverLoop into run_putnam (#16)
+May 13  fd3066f  pyright cleanup on putnam.py after #16
+May 13  66cba4c  Shim pydantic_ai args_as_dict for z.ai responses (#13)
+```
+
 ---
 
 *This report documents what happened, what we tried, what worked, and what
-didn't. Updated after every significant change.*
+didn't. The May 13 superseded note at the top of this file points to the
+docs that describe the post-refactor state.*
