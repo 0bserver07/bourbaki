@@ -49,6 +49,14 @@ view *ARGS:
 diff A B:
     python3 backend/scripts/view_result.py {{A}} --diff {{B}}
 
+# ---------- Health checks ----------
+
+# Pre-benchmark health check. Run before any long-running benchmark to
+# catch a loaded system or a misconfigured z.ai key before the run
+# silently regresses.  See issue #19 for the motivating regression.
+preflight *ARGS:
+    python3 backend/scripts/preflight.py {{ARGS}}
+
 # ---------- Tests ----------
 
 # Run the pytest suite.
