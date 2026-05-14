@@ -20,7 +20,9 @@ import os
 from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import Tool
 
@@ -35,31 +37,31 @@ from bourbaki.prover.state import (
 logger = logging.getLogger(__name__)
 
 
-# z.ai's OpenAI-compatible chat-completions endpoint. Documented base URL,
-# used with ``OpenAIProvider`` so the Anthropic adapter's
-# ``args_as_dict`` retry-mapping path (the one that explodes on z.ai's
-# tool-use response shape) is never hit. See issue #13.
+# z.ai has two API surfaces with separate billing pools:
+#  - Anthropic-compat (`glm:` prefix, default) — where GLM-5/5.1 resource
+#    packages live. Survives pydantic_ai's retry mapping thanks to the
+#    args_as_dict shim in ``_pydantic_ai_compat.py``.
+#  - OpenAI-compat (`glm-oai:` prefix) — separate billing pool, alternative
+#    routing if the Anthropic-compat endpoint becomes unsuitable.
+# See issue #13.
+_ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 _ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
 
 
-def _resolve_model_object(model_str: str) -> str | OpenAIChatModel:
+def _resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicModel:
     """Resolve a model string into a Pydantic AI model object.
 
-    Supports the same ``glm:`` and ``ollama-cloud:`` prefixes as
-    :func:`bourbaki.agent.core._resolve_model_object`. Anything else falls
-    through and is handed to Pydantic AI as a plain provider string
-    (e.g. ``openai:gpt-4o``).
+    Supported prefixes:
 
-    ``glm:`` was previously routed through ``AnthropicProvider`` against
-    z.ai's Anthropic-compatible endpoint (``https://api.z.ai/api/anthropic``).
-    That path crashes during pydantic_ai's retry-message re-mapping with
-    ``TypeError: Expected bytes, bytearray or str`` inside
-    ``messages.py:args_as_dict`` whenever z.ai's structured-output
-    response feeds a non-string/non-dict back into a ``ToolCallPart``.
-    PutnamBench problems reliably trigger it (miniF2F mostly does not).
-    Switching to z.ai's OpenAI-compatible endpoint side-steps the bug
-    entirely — the OpenAI message-mapping code does not use
-    ``args_as_dict`` in the same way. See issue #13.
+    - ``glm:<model>`` — z.ai's Anthropic-compatible endpoint (default for
+      GLM models; pairs with the args_as_dict shim).
+    - ``glm-oai:<model>`` — z.ai's OpenAI-compatible endpoint
+      (alternative billing pool / different message-mapping code path).
+    - ``ollama-cloud:<model>`` — Ollama Cloud's OpenAI-compat endpoint.
+    - Anything else (e.g. ``openai:gpt-4o``, ``anthropic:claude-sonnet-4-5``)
+      is handed to Pydantic AI verbatim.
+
+    All ``glm*`` prefixes pull the API key from ``GLM_API_KEY``.
     """
 
     if model_str.startswith("ollama-cloud:"):
@@ -71,14 +73,23 @@ def _resolve_model_object(model_str: str) -> str | OpenAIChatModel:
         )
         return OpenAIChatModel(model_name, provider=provider)
 
-    if model_str.startswith("glm:"):
-        model_name = model_str.removeprefix("glm:")
+    if model_str.startswith("glm-oai:"):
+        model_name = model_str.removeprefix("glm-oai:")
         api_key = os.environ.get("GLM_API_KEY", "")
         provider = OpenAIProvider(
             base_url=_ZAI_OPENAI_BASE_URL,
             api_key=api_key,
         )
         return OpenAIChatModel(model_name, provider=provider)
+
+    if model_str.startswith("glm:"):
+        model_name = model_str.removeprefix("glm:")
+        api_key = os.environ.get("GLM_API_KEY", "")
+        provider = AnthropicProvider(
+            base_url=_ZAI_ANTHROPIC_BASE_URL,
+            api_key=api_key,
+        )
+        return AnthropicModel(model_name, provider=provider)
 
     return model_str
 

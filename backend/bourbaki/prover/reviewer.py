@@ -21,7 +21,9 @@ import os
 from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from bourbaki.prover import feedback, prompts
@@ -32,27 +34,17 @@ from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 logger = logging.getLogger(__name__)
 
 
-# z.ai's OpenAI-compatible chat-completions endpoint. See issue #13 / the
-# matching comment in :mod:`bourbaki.prover.proposer` for the full story:
-# the Anthropic-compat path crashes on PutnamBench problems because
-# z.ai's tool-use response shape breaks pydantic_ai's retry re-mapping.
+# See :mod:`bourbaki.prover.proposer` for the full routing rationale.
+_ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 _ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
 
 
-def _resolve_model_object(model: str) -> str | OpenAIChatModel:
+def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
     """Resolve a model string to a Pydantic AI model object.
 
-    Mirrors :func:`bourbaki.agent.core._resolve_model_object` for the two
-    custom providers we route through (``glm:`` via z.ai's
-    OpenAI-compatible endpoint, ``ollama-cloud:`` via OpenAI-compatible
-    endpoint). Other strings pass through untouched so Pydantic AI
-    handles them natively.
-
-    ``glm:`` previously routed through ``AnthropicProvider`` against
-    ``https://api.z.ai/api/anthropic``; we switched to the
-    OpenAI-compatible endpoint to dodge a pydantic_ai 1.56 bug in
-    ``messages.py:args_as_dict`` that crashes on z.ai's tool-call
-    response shape during retry re-mapping. See issue #13.
+    Mirrors :func:`bourbaki.prover.proposer._resolve_model_object`:
+    ``glm:`` → Anthropic-compat, ``glm-oai:`` → OpenAI-compat,
+    ``ollama-cloud:`` → OpenAI-compat, anything else passed through.
     """
     if model.startswith("ollama-cloud:"):
         model_name = model.removeprefix("ollama-cloud:")
@@ -63,14 +55,23 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel:
         )
         return OpenAIChatModel(model_name, provider=provider)
 
-    if model.startswith("glm:"):
-        model_name = model.removeprefix("glm:")
+    if model.startswith("glm-oai:"):
+        model_name = model.removeprefix("glm-oai:")
         api_key = os.environ.get("GLM_API_KEY", "")
         provider = OpenAIProvider(
             base_url=_ZAI_OPENAI_BASE_URL,
             api_key=api_key,
         )
         return OpenAIChatModel(model_name, provider=provider)
+
+    if model.startswith("glm:"):
+        model_name = model.removeprefix("glm:")
+        api_key = os.environ.get("GLM_API_KEY", "")
+        provider = AnthropicProvider(
+            base_url=_ZAI_ANTHROPIC_BASE_URL,
+            api_key=api_key,
+        )
+        return AnthropicModel(model_name, provider=provider)
 
     return model
 
