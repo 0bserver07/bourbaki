@@ -35,7 +35,7 @@ An AI agent for mathematical reasoning and theorem proving. Named after Nicolas 
 │  └─────────┴───────┴──────────┴──────────┴──────────┴──────────┘    │
 │                                                                      │
 │  Sessions ──→ .bourbaki/sessions/                                    │
-│  Autonomous ──→ Strategy queue + checkpoint/resume                   │
+│  Prover loop ──→ proposer / builder / reviewer / memory              │
 │  Problems ──→ 13 classic theorems                                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -70,7 +70,10 @@ backend/bourbaki/
 │   └── event_mapper.py        # Helper factories for AgentEvent creation
 ├── tools/
 │   ├── symbolic_compute.py    # 30+ SymPy operations
-│   ├── lean_prover.py         # Lean 4 subprocess
+│   ├── lean_prover.py         # Lean 4 subprocess (whole-file compile)
+│   ├── lean_repl.py           # LeanREPLSession (warm Mathlib REPL)
+│   ├── proof_code_builder.py  # assemble_standalone_proof(preamble, code)
+│   ├── mathlib_search.py      # Loogle + LeanSearch + LeanExplore
 │   ├── sequence_lookup.py     # OEIS API + 15 builtin sequences
 │   ├── paper_search.py        # arXiv API
 │   ├── web_search.py          # Exa API
@@ -81,11 +84,21 @@ backend/bourbaki/
 ├── sessions/
 │   ├── manager.py             # CRUD, persistence, token tracking
 │   └── context_compactor.py   # LLM-based conversation summarization
+├── prover/                    # Proposer-builder-reviewer-memory loop
+│   ├── prover.py              # ProverLoop + ProverConfig + routing
+│   ├── proposer.py            # GLM-5.1 proposer node + mathlib_search wiring
+│   ├── builder.py             # REPL-backed builder + typed feedback
+│   ├── reviewer.py            # Reviewer node + lean_prover final gate
+│   ├── memory.py              # Memoryless / PreviousK / Experience strategies
+│   ├── feedback.py            # 10 typed feedback factories
+│   ├── prompts.py             # PROPOSER / REVIEWER / EXPERIENCE prompts
+│   └── state.py               # ProverState + Pydantic message models
 ├── autonomous/
-│   ├── search.py              # Main search loop + checkpoint/resume
-│   ├── strategies.py          # 18 strategies, priority queue, dead-end DB
-│   ├── modal_runner.py        # Strategy execution via Pydantic AI
-│   └── progress.py            # ProgressReport model
+│   └── tactics.py             # Tactic blocklist (kept; rest deleted in commit 2113629)
+├── benchmarks/
+│   ├── loader.py              # miniF2F problem loader
+│   ├── minif2f.py             # attempt_proof_loop + attempt_proof_pass_at_n
+│   └── putnam.py              # PutnamBench runner (ProverLoop-wired)
 ├── problems/
 │   └── database.py            # 13 classic theorems with metadata
 └── server/routes/
@@ -97,7 +110,7 @@ backend/bourbaki/
     ├── export.py              # POST /export
     ├── sessions.py            # CRUD /sessions
     ├── problems.py            # GET /problems
-    ├── autonomous.py          # Autonomous proof search control
+    ├── autonomous.py          # /autonomous/* — all handlers return HTTP 410 Gone (deprecated; legacy pipeline removed in commit 2113629)
     └── skills.py              # GET /skills
 ```
 
@@ -256,28 +269,22 @@ Max 50 sessions are retained (oldest auto-deleted).
 | ramsey-r33 | R(3,3) = 6 | 3 | pigeonhole + cases |
 | erdos-ko-rado | Erdos-Ko-Rado theorem | 4 | counting + contradiction |
 
-### Autonomous Proof Search
+### Autonomous Proof Search (deprecated)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/autonomous/start` | Start long-running proof search |
-| POST | `/autonomous/pause` | Pause current search |
-| POST | `/autonomous/resume` | Resume from checkpoint |
-| GET | `/autonomous/progress` | Get progress report |
-| GET | `/autonomous/insights` | Get accumulated insights |
+| POST | `/autonomous/start` | **HTTP 410 Gone** — legacy strategy-queue pipeline removed in commit `2113629` |
+| POST | `/autonomous/pause` | **HTTP 410 Gone** |
+| POST | `/autonomous/resume` | **HTTP 410 Gone** |
+| GET | `/autonomous/progress` | **HTTP 410 Gone** |
+| GET | `/autonomous/insights` | **HTTP 410 Gone** |
 
-**Start request:**
-```json
-{
-  "problem": {"id": "sqrt2-irrational", "statement": "..."},
-  "max_iterations": 100,
-  "max_hours": 4.0,
-  "strategies": ["direct-proof", "contradiction"],
-  "checkpoint_interval": 10
-}
-```
-
-The search engine cycles through 18 strategies with dynamic prioritization, tracks dead ends (max 3 attempts per strategy), and checkpoints progress to `.bourbaki/progress/`.
+The 18-strategy + checkpoint/resume engine that previously served these
+routes (`autonomous/search.py`, `strategies.py`, `modal_runner.py`,
+`progress.py`) was deleted in Phase 3 along with the HILBERT pipeline.
+The proposer-builder-reviewer loop in `backend/bourbaki/prover/` is the
+current proving engine; drive it via `attempt_proof_loop` in
+`benchmarks/minif2f.py` or via `POST /query` with `use_loop=True`.
 
 ### Skills
 
@@ -373,17 +380,23 @@ SKILL.md files contain structured instructions for proof techniques. Each has YA
 
 ---
 
-## Autonomous Proof Search
+## Autonomous Proof Search (historical — deleted in Phase 3)
 
-Long-running proof search with 18 strategies:
+The 18-strategy priority-queue pipeline that previously sat behind
+`/autonomous/*` was removed in commit `2113629` along with the rest of the
+HILBERT-style decomposer. See "Solver Architecture" below for the
+proposer-builder-reviewer loop that replaced it.
 
-| Strategy | Priority | Type |
-|----------|----------|------|
+Historical table preserved for context only — none of these strategies
+are reachable from current code:
+
+| Strategy (deleted) | Priority | Type |
+|---------------------|---------:|------|
 | direct-computation | 100 | Compute |
 | direct-proof | 90 | Logic |
 | simple-induction | 85 | Induction |
-| strong-induction | 80 | Induction |
 | pigeonhole | 85 | Combinatorics |
+| strong-induction | 80 | Induction |
 | double-counting | 80 | Combinatorics |
 | structural-induction | 75 | Induction |
 | generalized-pigeonhole | 75 | Combinatorics |
@@ -398,12 +411,9 @@ Long-running proof search with 18 strategies:
 | specialize | 30 | Meta |
 | counterexample-search | 25 | Meta |
 
-**Features:**
-- Dynamic prioritization based on problem domain and tags
-- Dead-end tracking (max 3 attempts per strategy before marking exhausted)
-- Checkpoint/resume to `.bourbaki/progress/`
-- Parallel strategy execution (up to 5 concurrent via `asyncio.gather`)
-- Insight accumulation across attempts
+Replaced by: one proposer (GLM-5.1) that emits a complete proof per
+iteration; routing is governed by typed builder/reviewer feedback rather
+than a strategy queue.
 
 ---
 
@@ -494,9 +504,9 @@ When a model is selected, it's stored as `provider:model` (e.g., `openrouter:dee
 | `/new` | Start fresh session |
 | `/debug` | Toggle debug panel |
 | `/problems` | List available problems |
-| `/prove <id>` | Start autonomous proof search |
-| `/pause` | Pause proof search |
-| `/progress` | Show proof search progress |
+| `/prove <id>` | Legacy handler — POSTs to `/autonomous/start` which now returns 410. Use `attempt_proof_loop` or `/query` with `use_loop=True` for the current loop. |
+| `/pause` | Legacy handler (410 Gone) |
+| `/progress` | Legacy handler (410 Gone) |
 | `/skills` | List available proof techniques |
 | `/export [format]` | Export last proof (latex/lean/markdown) |
 | `exit` / `quit` | Exit CLI |
@@ -762,27 +772,35 @@ backend/bourbaki/benchmarks/
 
 | Date | Approach | Verified | Rate | Sample |
 |------|----------|----------|------|--------|
-| 2026-02-18 (v0.2.1) | Best-first search, **REPL-only** ⚠ | claimed 224/244 | claimed 91.8% | full 244 |
-| 2026-02-22 (correction) | Same code, `lean_prover` standalone verify | 15/244 | **6.2%** | full 244 |
+| 2026-02-17 (v0.2.0) | Best-first search, **REPL-only** ⚠ — RETRACTED | claimed 224/244 | claimed 91.8% | full 244 |
+| 2026-02-18 (v0.2.1) | + multi-agent coordinator, **REPL-only** ⚠ — RETRACTED | claimed 230/244 (test) | claimed 94.3% (test) | full 244 |
+| 2026-02-22 (audit) | Same code, `lean_prover` standalone verify | 15/244 | **6.2%** | full 244 |
 | 2026-03-08 (v0.2.2) | + REPL pipe-recovery + tactic blocklist | 63/244 | 25.8% | full 244 |
 | 2026-03-19 | + heuristic search | 10/35 | 28.6% | 35-problem stratified |
 | 2026-04-01 | + HILBERT decomposer + in-context solving | 5/10 | 50.0% | 10-problem subset |
-| 2026-04-25 | **Proposer-builder-reviewer loop (GLM-5.1)** | **9/10** | **90.0%** | 10-problem subset |
+| 2026-04-25 | **Proposer-builder-reviewer loop (GLM-5.1)** | **9/10** | **90.0%** | 10-problem subset · 0 false positives |
 | 2026-05-09 | Same loop, post-fix suite | **22/35** | **62.9%** | 35-problem stratified · 0 false positives |
 
-The Feb 18 91.8% was inflated ~15× by REPL false positives (the REPL reported
-`goals=[]` for tactics whose standalone Lean compile would have failed). Every
-solve since v0.2.2 is gated by `lean_prover`'s whole-file compile. See
+The Feb 17 / Feb 18 numbers (91.8% / 94.3%) were inflated ~15× by REPL
+false positives — the REPL reported `goals=[]` for tactics whose
+standalone Lean compile would have failed. Both v0.2.0 and v0.2.1
+releases on GitHub have been retracted (their titles now read
+"RETRACTED (inflated numbers)"). Every solve since v0.2.2 is gated by
+`lean_prover`'s whole-file compile. See
 [`docs/REALITY_CHECK.md`](docs/REALITY_CHECK.md) for the full audit.
 
-The 90% on the 10-problem subset is preliminary. A 35-problem stratified
-re-run is in progress; full 244 hasn't been re-attempted with the new loop.
+The 90% on the 10-problem subset and 62.9% on the 35-problem stratified
+sample are both gated by `lean_prover` with 0 false positives reported.
+A full 244-problem re-run with the new loop is the v0.3.0 release
+blocker, tracked in [issue #14](https://github.com/0bserver07/bourbaki/issues/14).
 
 ### Comparison with Reference Systems
 
-⚠ Reference systems are on the *full* 244-problem split. Bourbaki's last
-honest full-split number (25.8% from v0.2.2) trails the field; the loop's
-90% is on a 10-problem subset only.
+⚠ Reference systems are on the *full* 244-problem split. Bourbaki's
+last honest full-split number (25.8% from v0.2.2) trails the field;
+the loop's 90% / 62.9% are on a 10-problem subset and a 35-problem
+stratified sample respectively. Full 244 run with the new loop is
+tracked in [#14](https://github.com/0bserver07/bourbaki/issues/14).
 
 | System | Organization | miniF2F Valid (full 244) | Key Technique |
 |--------|-------------|---------------|---------------|
@@ -791,19 +809,21 @@ honest full-split number (25.8% from v0.2.2) trails the field; the loop's
 | Aristotle | Harmonic | 90% | MCGS + 200B transformer + test-time training |
 | DeepSeek-Prover V2 | DeepSeek | 88.9% | Recursive decomposition + GRPO RL |
 | **Bourbaki (v0.2.2)** | — | **25.8%** verified | Best-first search + lean_prover gate |
-| **Bourbaki (loop, partial)** | — | 9/10 on subset | Proposer-builder-reviewer + GLM-5.1 |
+| **Bourbaki (loop, 35-problem)** | — | 22/35 (62.9%) on stratified sample | Proposer-builder-reviewer + GLM-5.1 |
+| **Bourbaki (loop, 10-problem)** | — | 9/10 on subset | Proposer-builder-reviewer + GLM-5.1 |
 
 ### Capability Matrix
 
-| Capability | HILBERT | Aristotle | DeepSeek-V2 | Numina | Bourbaki |
-|------------|---------|-----------|-------------|--------|----------|
-| Best-first search | Yes | MCGS | Sampling | Yes | Yes |
-| Recursive decomposition | Core | No | Core | Blueprint | Basic |
-| Semantic retrieval | MPNet+FAISS | — | — | LeanDex | LeanExplore API |
-| Self-correction | — | — | — | — | Yes (basic) |
-| Multi-agent | — | — | — | Claude+MCP | Yes |
-| Lean LSP | — | — | — | 17 tools | No (REPL only) |
-| Trained value model | Goedel-V2-32B | 200B | GRPO RL | — | Heuristic |
+| Capability | HILBERT | Aristotle | DeepSeek-V2 | Numina | Bourbaki (current) |
+|------------|---------|-----------|-------------|--------|--------------------|
+| Best-first search | Yes | MCGS | Sampling | Yes | Deleted in Phase 3 |
+| Recursive decomposition | Core | No | Core | Blueprint | Deleted in Phase 3 (proposer can still emit `have/sorry` blocks) |
+| Semantic retrieval | MPNet+FAISS | — | — | LeanDex | LeanExplore API (mathlib_search tool) |
+| Self-correction | — | — | — | — | Yes — proposer iterates on typed feedback |
+| Multi-agent | — | — | — | Claude+MCP | No (single GLM-5.1 proposer + single reviewer) |
+| Lean LSP | — | — | — | 17 tools | No (REPL + whole-file lean_prover) |
+| Trained value model | Goedel-V2-32B | 200B | GRPO RL | — | None — typed feedback only |
+| Pass@N sampling | — | — | — | — | Yes (`attempt_proof_pass_at_n`, default N=1) |
 
 ---
 
