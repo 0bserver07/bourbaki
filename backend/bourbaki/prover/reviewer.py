@@ -160,8 +160,14 @@ async def run_reviewer(
         state.preamble, state.last_proposal.code
     )
 
+    # Standalone `lake env lean` with `import Mathlib` typically needs
+    # 60-180s on a cold cache (the REPL stays warm; standalone compiles
+    # don't). lean_prover's default 30s timeout was set for vanilla Lean
+    # without Mathlib — too short for our use case. See issue #13 follow-up.
     try:
-        verify_result = await lean_prover(code=full_source, mode="check")
+        verify_result = await lean_prover(
+            code=full_source, mode="check", timeout=240,
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception("Reviewer final lean_prover call raised")
         return feedback.review_rejected(
