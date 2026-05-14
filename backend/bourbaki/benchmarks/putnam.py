@@ -152,14 +152,14 @@ async def _verify_whole_file(
         # class as issue #19 (miniF2F).
         logger.warning(
             "putnam _verify_whole_file: %s exceeded %ds — marking unverified",
-            problem.problem_id, timeout,
+            problem.id, timeout,
         )
         return {
             "verified": False,
             "error": f"Verification timeout ({timeout}s)",
         }
     except Exception as e:  # noqa: BLE001
-        logger.exception("putnam _verify_whole_file: %s raised", problem.problem_id)
+        logger.exception("putnam _verify_whole_file: %s raised", problem.id)
         return {"verified": False, "error": f"Verification error: {e}"}
 
 
