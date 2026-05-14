@@ -111,7 +111,7 @@ def _contains_invalid_tactic(proof_code: str) -> str | None:
 async def _verify_whole_file(
     problem: PutnamProblem,
     proof_code: str,
-    timeout: int = 30,
+    timeout: int = 240,
 ) -> dict[str, Any]:
     """Verify a proof via whole-file compilation with lean_prover.
 
@@ -146,7 +146,20 @@ async def _verify_whole_file(
                 "error": "; ".join(err_msgs) if err_msgs else "Verification failed",
             }
         return {"verified": True, "error": None}
-    except (asyncio.TimeoutError, Exception) as e:
+    except asyncio.TimeoutError:
+        # Surface load-induced verification timeouts at WARNING so a
+        # silent fall-through never reads as a real failure.  Same bug
+        # class as issue #19 (miniF2F).
+        logger.warning(
+            "putnam _verify_whole_file: %s exceeded %ds — marking unverified",
+            problem.problem_id, timeout,
+        )
+        return {
+            "verified": False,
+            "error": f"Verification timeout ({timeout}s)",
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("putnam _verify_whole_file: %s raised", problem.problem_id)
         return {"verified": False, "error": f"Verification error: {e}"}
 
 
@@ -322,13 +335,17 @@ async def attempt_putnam_repl(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
+        logger.warning(
+            "attempt_putnam_repl: %s exceeded %ds setting up proof state",
+            problem.id, timeout,
+        )
         return ProblemResult(
             problem_id=problem.id,
             year=problem.year,
             section=problem.section,
             has_answer=problem.has_answer,
             solved=False,
-            error="Timeout setting up proof state",
+            error=f"Timeout setting up proof state ({timeout}s)",
             duration_seconds=time.monotonic() - start,
         )
 
@@ -420,7 +437,7 @@ async def run_putnam(
     year_range: tuple[int, int] | None = None,
     exclude_answer: bool = True,
     verify_proofs: bool = True,
-    verify_timeout: int = 30,
+    verify_timeout: int = 240,
     attempt_answers: bool = False,
     answer_model: str = "glm:glm-5",
     answer_max_attempts: int = 3,
@@ -1026,8 +1043,13 @@ def main() -> None:
     parser.add_argument(
         "--verify-timeout",
         type=int,
-        default=30,
-        help="Timeout for whole-file verification (seconds, default 30)",
+        default=240,
+        help=(
+            "Timeout for whole-file verification (seconds, default 240). "
+            "Must cover a cold-cache `lake env lean + import Mathlib` "
+            "(typically 60-180s). Below ~150s the run risks the silent "
+            "false-fail bug from issue #19."
+        ),
     )
     parser.add_argument(
         "--attempt-answers",

@@ -256,11 +256,15 @@ async def attempt_proof_repl(
             timeout=timeout,
         )
     except asyncio.TimeoutError:
+        logger.warning(
+            "attempt_proof_repl: %s exceeded %ds setting up proof state",
+            problem.id, timeout,
+        )
         return ProblemResult(
             problem_id=problem.id,
             source=problem.source,
             solved=False,
-            error="Timeout setting up proof state",
+            error=f"Timeout setting up proof state ({timeout}s)",
             duration_seconds=time.monotonic() - start,
         )
 
@@ -355,11 +359,18 @@ async def attempt_proof_loop(
     try:
         state = await asyncio.wait_for(loop.run(problem), timeout=timeout)
     except asyncio.TimeoutError:
+        # Make load-induced loop stalls observable.  See issue #19 — a
+        # silent fall-through here was indistinguishable from a real
+        # proof failure on the 2026-05-13 mathd_algebra_10 regression.
+        logger.warning(
+            "attempt_proof_loop: %s exceeded %ds outer timeout",
+            problem.id, timeout,
+        )
         return ProblemResult(
             problem_id=problem.id,
             source=problem.source,
             solved=False,
-            error="loop timeout",
+            error=f"loop timeout ({timeout}s)",
             duration_seconds=time.monotonic() - start,
         )
     return ProblemResult(
@@ -481,7 +492,14 @@ async def _verify_with_lean_prover(
             result.error = f"Verification failed: {err_msg[:200]}"
             return result
     except asyncio.TimeoutError:
-        logger.info("  Verification TIMEOUT (%ds) -- marking as unsolved", verify_timeout)
+        # WARNING (not info): a verify_timeout fall-through is exactly the
+        # bug class issue #19 documents — a too-tight budget converts a
+        # correct proof into a phantom failure.  Surface the duration so a
+        # load-induced miss is grep-able in the run log.
+        logger.warning(
+            "  Verification TIMEOUT (%ds) -- marking %s as unsolved",
+            verify_timeout, result.problem_id,
+        )
         result.solved = False
         result.verified = False
         result.error = f"Verification timeout ({verify_timeout}s)"

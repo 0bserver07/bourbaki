@@ -313,7 +313,7 @@ async def generate_answer(
     max_attempts: int = 3,
     prove_timeout: int = 60,
     search_budget: int = 64,
-    verify_timeout: int = 30,
+    verify_timeout: int = 240,
 ) -> AnswerAttempt | None:
     """Generate a candidate answer for an answer-type problem.
 
@@ -409,7 +409,7 @@ async def _try_answer(
     source: str,
     prove_timeout: int = 60,
     search_budget: int = 64,
-    verify_timeout: int = 30,
+    verify_timeout: int = 240,
 ) -> AnswerAttempt:
     """Try a single answer candidate: insert, prove, verify.
 

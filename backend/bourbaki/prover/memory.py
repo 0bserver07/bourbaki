@@ -125,11 +125,19 @@ class PreviousKMemory(BaseMemory):
         return f"<previous-attempts>\n{rendered}\n</previous-attempts>"
 
 
+_EXPERIENCE_LLM_TIMEOUT = 60.0  # seconds — per-call cap on the LLM summary
+
+
 class ExperienceMemory(BaseMemory):
     """LLM-summarized experience block, regenerated each iteration."""
 
-    def __init__(self, model: str = "glm:glm-5.1") -> None:
+    def __init__(
+        self,
+        model: str = "glm:glm-5.1",
+        llm_timeout: float = _EXPERIENCE_LLM_TIMEOUT,
+    ) -> None:
         self.model = model
+        self.llm_timeout = llm_timeout
 
     async def process(self, state: ProverState) -> str:
         # Defensive: if we don't have a full last attempt to summarize,
@@ -154,10 +162,23 @@ class ExperienceMemory(BaseMemory):
                 output_type=str,
                 system_prompt=prompts.EXPERIENCE_SYSTEM_PROMPT,
             )
-            result = await asyncio.wait_for(agent.run(user_prompt), timeout=60.0)
+            result = await asyncio.wait_for(
+                agent.run(user_prompt), timeout=self.llm_timeout
+            )
             summary = result.output
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-            logger.exception("ExperienceMemory LLM call failed; keeping prior experience")
+        except asyncio.TimeoutError:
+            # Surface the duration so a load-induced stall is observable in
+            # the logs rather than silently falling back to stale experience.
+            logger.warning(
+                "ExperienceMemory LLM call exceeded %.0fs timeout — "
+                "keeping prior experience",
+                self.llm_timeout,
+            )
+            return state.experience
+        except Exception:  # noqa: BLE001 — last-resort safety net
+            logger.exception(
+                "ExperienceMemory LLM call failed; keeping prior experience"
+            )
             # Fall back to whatever experience we already had so the loop
             # doesn't lose context due to a transient API hiccup or hang.
             return state.experience

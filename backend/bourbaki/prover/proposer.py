@@ -245,7 +245,11 @@ async def run_proposer(
         result = await asyncio.wait_for(agent.run(user_msg), timeout=llm_timeout)
         output: ProverResult = result.output
     except asyncio.TimeoutError:
-        logger.error("Proposer LLM call exceeded %.0fs timeout", llm_timeout)
+        # WARNING (not ERROR): a single hung LLM call is a recoverable
+        # condition — the loop will retry on the next iteration with the
+        # parse-failed feedback in scope. Keep the duration in the line so
+        # load-induced stalls are observable. See issue #19.
+        logger.warning("Proposer LLM call exceeded %.0fs timeout", llm_timeout)
         return feedback.structured_output_parsing_failed(
             f"LLM call timed out after {llm_timeout:.0f}s"
         )

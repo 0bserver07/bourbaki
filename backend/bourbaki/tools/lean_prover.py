@@ -30,15 +30,33 @@ GOAL_RE = re.compile(r"⊢\s+(.+)")
 _lean_capabilities: dict[str, Any] | None = None
 
 
-def detect_lean_capabilities() -> dict[str, Any]:
+def reset_lean_capabilities_cache() -> None:
+    """Drop the cached capability result so the next call re-detects.
+
+    The cache pins the first-seen state for the lifetime of the process;
+    if Lean was missing at startup but became available mid-session (or
+    vice versa), call this helper before re-running ``detect_lean_capabilities``.
+    Used by ``scripts/preflight.py`` so it always reports the current state.
+    """
+    global _lean_capabilities
+    _lean_capabilities = None
+
+
+def detect_lean_capabilities(*, force_refresh: bool = False) -> dict[str, Any]:
     """Detect Lean 4 installation and Mathlib availability (cached).
 
     Returns dict with:
         installed: bool
         version: str | None
         mathlib: bool
+
+    The result is cached for the lifetime of the process; pass
+    ``force_refresh=True`` to re-detect (also useful from the preflight
+    script when Lean was just installed or PATH was updated).
     """
     global _lean_capabilities
+    if force_refresh:
+        _lean_capabilities = None
     if _lean_capabilities is not None:
         return _lean_capabilities
 
@@ -137,14 +155,21 @@ When writing Lean proofs:
 async def lean_prover(
     code: str,
     mode: str = "check",
-    timeout: int = 30,
+    timeout: int = 240,
 ) -> dict[str, Any]:
     """Verify Lean 4 code.
 
     Args:
         code: Lean 4 code (theorem, tactic proof, or expression).
         mode: One of 'check', 'elaborate', 'tactic'.
-        timeout: Timeout in seconds (default 30).
+        timeout: Timeout in seconds (default 240).
+
+            The default needs to cover a cold-cache ``lake env lean``
+            with ``import Mathlib`` (typically 60-180s on a fresh
+            machine). The pre-#19 default of 30s was a silent
+            false-fail trap on every caller that didn't override it.
+            Callers that target vanilla Lean (no Mathlib) can pass a
+            smaller explicit value.
 
     Returns:
         Dict with success, goals, proofComplete, errors, rawOutput, codeUsed.
