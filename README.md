@@ -124,6 +124,14 @@ The 2026-02-17 v0.2.0 and 2026-02-18 v0.2.1 releases claimed 91.8% / 94.3% on th
   <img src="assets/benchmark-history.svg" alt="miniF2F verified pass-rate history" width="100%">
 </p>
 
+## Known limitations
+
+- **Reviewer's `lean_prover` timeout was 30s until commit `7b07c07`** ([#19](https://github.com/0bserver07/bourbaki/issues/19)). Standalone `lake env lean + import Mathlib` typically needs 60-180s on a cold cache, so on busy/cold systems the gate silently rejected correct proofs. Bumped to 240s — the 2026-05-09 22/35 result is a lower bound; the new headline lands once #19's re-run completes.
+- **The Bash-tool-managed sessions some agents use kill long background processes** when their parent shell exits. The standalone scripts in `backend/scripts/` (and their `just` wrappers) launch the asyncio loop inside a single Python process, but the launching shell still owns the process group — run benchmarks from a normal terminal (or with `nohup`/`tmux`/`screen`) rather than from inside an ephemeral agent session.
+- **z.ai has two separate billing pools.** `glm:` routes via the Anthropic-compat endpoint, `glm-oai:` via the OpenAI-compat one. Funds in one pool do NOT cover the other — verify your balance is on the side your prefix targets (the loop defaults to `glm:` after commit `66cba4c`).
+- **The loop's ceiling on AIME/IMO problems is GLM-5.1's familiarity, not a code bug.** On the 2026-05-09 35-problem run, aime 0/3 and imo 0/3 was a model-capability floor — the proposer simply did not produce proof candidates for problems in styles GLM-5.1 has weak coverage of. A stronger LLM would lift these without architectural changes.
+- **Pass@N shares a single REPL session across attempts.** `attempt_proof_pass_at_n` runs the loop up to N times per problem but does not currently reset the Lean session between attempts. The lean4-repl has no clean `:reset` primitive, so state from attempt K can leak into attempt K+1. Documented in the function docstring; A/B tracked in [#18](https://github.com/0bserver07/bourbaki/issues/18).
+
 ## Example Usage
 
 **Prove a theorem:**
