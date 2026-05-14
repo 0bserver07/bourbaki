@@ -102,7 +102,7 @@ Long-running proof search via a proposer-builder-reviewer loop driven by GLM-5.1
   <img src="assets/prover-loop.svg" alt="Proposer-Builder-Reviewer loop" width="100%">
 </p>
 
-Start from the TUI with `/prove <problem_id>` or via the API.
+Drive the loop from `backend/bourbaki/benchmarks/minif2f.py::attempt_proof_loop` or from the FastAPI `/query` endpoint with `use_loop=True`. (The TUI's `/prove <id>` command still points at the legacy `/autonomous/start` route, which now returns HTTP 410 Gone — the legacy pipeline was deleted in commit `2113629`. Rewiring the TUI to the new loop is tracked separately.)
 
 ## Results
 
@@ -168,9 +168,9 @@ A000045 — Fibonacci numbers: F(n) = F(n-1) + F(n-2) with F(0) = 0 and F(1) = 1
 | `/model <name>` | Switch LLM model |
 | `/skills` | List available proof technique skills |
 | `/problems` | Browse the problem database |
-| `/prove <id>` | Start autonomous proof search on a problem |
-| `/pause` | Pause autonomous search |
-| `/progress` | Show autonomous search progress |
+| `/prove <id>` | Start proof attempt (legacy TUI handler still POSTs to `/autonomous/start`, which now returns 410; use the `attempt_proof_loop` driver or `/query` with `use_loop=True` for the new loop) |
+| `/pause` | Pause proof search (legacy, 410) |
+| `/progress` | Show proof search progress (legacy, 410) |
 | `/sessions` | List saved sessions |
 | `/new` | Start a new session |
 | `/export [format]` | Export last answer (latex, lean, markdown) |
@@ -189,7 +189,9 @@ backend/bourbaki/             Python backend (owns all state)
 ├── agent/                    Pydantic AI agent, prompts, scratchpad, event mapper
 ├── tools/                    SymPy, Lean 4, OEIS, arXiv, Web Search, Skills
 ├── sessions/                 Persistence + context compaction
-├── autonomous/               Long-running proof search with strategies
+├── prover/                   Proposer-builder-reviewer-memory loop
+├── autonomous/               Phase-3 vestige — only `tactics.py` survives (blocklist)
+├── benchmarks/               miniF2F + PutnamBench runners
 ├── problems/                 13 classic problems database
 └── server/routes/            FastAPI endpoints (query, sessions, skills, ...)
 ```
