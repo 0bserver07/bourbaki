@@ -35,12 +35,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from bourbaki.benchmarks.minif2f import (
     attempt_proof_loop,
@@ -54,9 +53,6 @@ from bourbaki.benchmarks.putnam_loader import (
 from bourbaki.autonomous.tactics import TACTIC_BLOCKLIST, contains_blocklisted_tactic
 from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.lean_repl import LeanREPLSession
-
-if TYPE_CHECKING:
-    from bourbaki.prover import ProverConfig as _ProverConfigType  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -694,14 +690,22 @@ async def run_putnam(
                     memory_k=loop_memory_k,
                     enable_mathlib_search=loop_enable_mathlib_search,
                 )
+                # PutnamProblem is duck-compatible with MiniF2FProblem on
+                # the fields the loop actually reads (id, source, statement,
+                # full_lean_code). pyright doesn't know that; cast to
+                # silence the type-checker. Covered by
+                # test_putnam_problem_is_duck_compatible_with_attempt_proof_loop.
+                from typing import cast as _cast
+                from bourbaki.benchmarks.loader import MiniF2FProblem as _M
+                _problem = _cast(_M, problem)
                 if pass_n > 1:
                     loop_result = await attempt_proof_pass_at_n(
-                        problem, repl_session, config=loop_cfg,
+                        _problem, repl_session, config=loop_cfg,
                         n=pass_n, timeout_per_attempt=timeout,
                     )
                 else:
                     loop_result = await attempt_proof_loop(
-                        problem, repl_session, config=loop_cfg,
+                        _problem, repl_session, config=loop_cfg,
                         timeout=timeout,
                     )
                 result = _loop_result_to_putnam(problem, loop_result)
