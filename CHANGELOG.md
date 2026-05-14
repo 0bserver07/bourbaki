@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0-pending — 2026-04-25 → 2026-05-09
+## v0.3.0-pending — 2026-04-25 → 2026-05-14
 
 ### Proposer-builder-reviewer loop replaces HILBERT pipeline
 
@@ -75,6 +75,45 @@ for keep/reuse/drop classification.
   feedback was misrouted to "retry".
 - Builder now strips imports from `state.preamble` too, not just from
   the proposal code (REPL has Mathlib pre-loaded; re-importing errors).
+
+**Late-cycle fix that may bump the 35-problem number (commit `7b07c07`):**
+
+- Reviewer's final `lean_prover` gate was using the function's 30s default
+  timeout. Standalone `lake env lean` with `import Mathlib` needs 60-180s
+  on a cold cache (the REPL stays warm; standalone compiles don't). So
+  on a busy or cold system every reviewer call silently timed out and
+  the loop reported FAILED even when the proposer had generated a
+  correct proof. Bumped to **240s** to match the outer benchmark verifier.
+- Implication: **the 22/35 (62.9%) May 9 number is a lower bound.**
+  Some failures may have been correct proofs that just timed out at the
+  reviewer's gate. Re-running with the fix is tracked separately
+  (see [#19](https://github.com/0bserver07/bourbaki/issues/19)).
+
+**z.ai routing reverted to Anthropic-compat (commit `66cba4c`):**
+
+- The earlier "switch to OpenAI-compat to dodge pydantic_ai's
+  `args_as_dict` crash" was wrong-direction — z.ai's billing splits the
+  two endpoints into separate resource pools and the user's funds are on
+  the Anthropic-compat side. Restored `glm:` → Anthropic-compat
+  (`https://api.z.ai/api/anthropic`) and patched the upstream
+  `args_as_dict` bug at the source with a defensive shim in
+  `bourbaki.prover._pydantic_ai_compat`. New `glm-oai:` prefix retained
+  as an opt-in for the OpenAI-compat pool. Verified live: 6.1s for a
+  structured `ProverResult` response.
+
+**Wave-1 parallel agent integration (commits `4eb3430`..`dcdfc57`):**
+
+- Deleted `agent/coordinator.py`, `agent/roles.py`, `agent/messages.py`,
+  `benchmarks/run_enhanced.py` (~1,296 LoC) — vestigial multi-agent
+  infra not referenced by anything live.
+- Added `backend/scripts/` standalone runners + `justfile` + `backend/
+  bourbaki/benchmarks/results_db.py` for benchmark result inspection.
+- Pyright across `backend/bourbaki/`: **48 errors → 0**.
+- Drafted `backend/bourbaki/prover/prompts_v2.py` (-150 tokens/iter,
+  tactic shortlist, ≤2-sentence reasoning cap). Not swapped in yet —
+  needs an A/B run first ([#17](https://github.com/0bserver07/bourbaki/issues/17)).
+- TUI's `/prove`, `/pause`, `/progress` deprecated (legacy routes now
+  return HTTP 410); commands print deprecation messages instead.
 
 ## v0.2.2 — 2026-03-08
 

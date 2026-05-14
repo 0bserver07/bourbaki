@@ -114,9 +114,11 @@ Verified pass rates on miniF2F valid (every solve confirmed by `lean_prover` sta
 | 2026-03-08 (v0.2.2) | + REPL pipe-recovery + tactic blocklist | 25.8% (63/244) | full 244 |
 | 2026-04-01 | + HILBERT decomposer + in-context solving | 50.0% (5/10) | 10-problem |
 | 2026-04-25 | **proposer-builder-reviewer loop (GLM-5.1)** | **90.0% (9/10)** | 10-problem · 0 false positives |
-| 2026-05-09 | same loop on a wider sample | **62.9% (22/35)** | 35-problem stratified · 0 false positives |
+| 2026-05-09 | same loop on a wider sample | **62.9% (22/35)** † | 35-problem stratified · 0 false positives |
 
-The 2026-02-17 v0.2.0 and 2026-02-18 v0.2.1 releases claimed 91.8% / 94.3% on the valid/test splits. Both numbers were inflated ~15× by REPL false positives and were retracted in the v0.2.2 audit (both GitHub releases now read "RETRACTED (inflated numbers)" in their titles). The current proposer-builder-reviewer architecture (commits `49211ce` through `2113629`) replaces the prior HILBERT-style pipeline; the full 244-problem run with the new architecture is pending (tracked in [issue #14](https://github.com/0bserver07/bourbaki/issues/14)).
+† This number is a **lower bound**. The reviewer's final-gate `lean_prover` call was using a 30s default timeout in `tools/lean_prover.py`, which is too short for standalone `lake env lean + import Mathlib` (typically 60-180s). On the 2026-05-09 run, an unknown number of correct proofs were rejected by this timeout. Commit `7b07c07` raises the reviewer's timeout to 240s; a re-run with the fix is tracked in [issue #19](https://github.com/0bserver07/bourbaki/issues/19).
+
+The 2026-02-17 v0.2.0 and 2026-02-18 v0.2.1 releases claimed 91.8% / 94.3% on the valid/test splits. Both numbers were inflated ~15× by REPL false positives and were retracted in the v0.2.2 audit (both GitHub releases now read "RETRACTED (inflated numbers)" in their titles). The current proposer-builder-reviewer architecture (commits `49211ce` through `7b07c07`) replaces the prior HILBERT-style pipeline; the full 244-problem run with the new architecture is pending (tracked in [issue #14](https://github.com/0bserver07/bourbaki/issues/14)).
 
 <p align="center">
   <img src="assets/benchmark-history.svg" alt="miniF2F verified pass-rate history" width="100%">
