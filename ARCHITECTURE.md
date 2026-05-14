@@ -645,7 +645,7 @@ One iteration per proposal. Hard cap at 50 iterations (8 in interactive / CI) �
    - target theorem not declared in the proposal → `missing_target_theorem` (non-terminal — the proposer retries with the correct name)
    - else → `build_success`
 
-3. **Reviewer** (`backend/bourbaki/prover/reviewer.py`) — second Pydantic AI agent with `output_type=ReviewDecision`. Two real checks (`check_1`: statement signature unchanged · `check_2`: no `sorry`/`admit` in the proposed body) plus two honeypots ignored by the caller. On approval, runs `lean_prover` **once** on the assembled standalone source (`assemble_standalone_proof(preamble, proposal.code)`) — this is the ground-truth gate that catches REPL false positives.
+3. **Reviewer** (`backend/bourbaki/prover/reviewer.py`) — second Pydantic AI agent with `output_type=ReviewDecision`. Two real checks (`check_1`: statement signature unchanged · `check_2`: no `sorry`/`admit` in the proposed body) plus two honeypots ignored by the caller. On approval, runs `lean_prover` **once** on the assembled standalone source (`assemble_standalone_proof(preamble, proposal.code)`) — this is the ground-truth gate that catches REPL false positives. The reviewer passes `timeout=240` explicitly (commit `7b07c07`) — the function's own default is 30s, which is too short for standalone `lake env lean + import Mathlib` (60-180s on a cold cache). See [issue #19](https://github.com/0bserver07/bourbaki/issues/19) for the May-14 audit that exposed this latent bug.
 
 4. **Memory** (`backend/bourbaki/prover/memory.py`) — three strategies, swappable via `ProverConfig.memory_cls`:
 

@@ -5,6 +5,76 @@ and what they don't. Updated as we go.
 
 ---
 
+## 2026-05-14 — Reviewer-timeout bug: 22/35 was a lower bound
+
+A latent 30-second timeout in the reviewer's final-gate `lean_prover` call
+silently rejected an unknown number of correct proofs on the 2026-05-09 run.
+Caught while attempting to reproduce a known-good result.
+
+### What happened
+
+The reviewer node calls `lean_prover` once on the assembled standalone source
+to verify a proposal before reporting it as solved. Until commit
+[`7b07c07`](https://github.com/0bserver07/bourbaki/commit/7b07c07), that call
+passed no `timeout` kwarg and inherited the function's 30s default. Standalone
+`lake env lean` with `import Mathlib` needs **60-180s on a cold cache** —
+the REPL stays warm between proofs, but each standalone compile starts fresh.
+
+On a quiet machine the 30s often happened to be enough. On a loaded one, the
+timeout fired silently — the reviewer's final gate returned failure, the loop
+reported the problem as FAILED, and the actual code-level state was "the
+proposer generated a correct proof but we couldn't compile it fast enough."
+
+### How it surfaced
+
+Trying to re-run `mathd_algebra_10` (a single-step `by norm_num` problem that
+solved on iteration #1 in both the Apr 25 and May 9 runs) under heavy CPU load
+(`uptime` showed load average ~17). Result: **0/1 verified, attempts=4**.
+Same code that scored 9/10 and 22/35 now scored 0/1.
+
+### The fix
+
+[Commit `7b07c07`](https://github.com/0bserver07/bourbaki/commit/7b07c07)
+bumps the reviewer's `lean_prover` call to `timeout=240`, matching what the
+outer benchmark verifier (`_verify_with_lean_prover`) already used.
+
+### Implications for previously-reported numbers
+
+- **9/10 (Apr 25, 10-problem subset):** ran on a quiet machine. Almost
+  certainly not affected — the headline number was reproducible at the time
+  and the 1 miss (`mathd_algebra_31`) is a genuinely hard problem.
+- **22/35 (May 9, 35-problem stratified):** **this is a lower bound.** Some
+  of the 13 failures may have been correct proofs that timed out at the 30s
+  gate. The actual capability of the loop on that subset is somewhere
+  between 62.9% and 100%. We won't know until the re-run lands.
+- **All earlier numbers** (6.2%, 25.8%, 28.6%, 40%, etc.) used the heuristic
+  search pipeline, not the proposer-builder-reviewer loop, and are
+  unaffected by this bug.
+
+### Lessons
+
+1. **Default timeouts on functions called by other functions are landmines.**
+   The `lean_prover` 30s default makes sense for interactive tool use from
+   the agent. It does not make sense for a programmatic final-gate call from
+   the reviewer. The two call sites have different latency requirements.
+   Add explicit `timeout=` kwargs at every site rather than relying on the
+   default to be "right for everyone."
+2. **System load can mask latent bugs.** The same code that scored 22/35 on
+   a quiet workstation scored 0/1 under load. Always run benchmarks on a
+   dedicated/quiet machine; otherwise you're measuring kernel scheduler
+   pressure as much as model capability.
+3. **Reproducibility is a feature.** Trying to reproduce a known-good result
+   surfaced this bug. If the May 14 reproduction had been skipped on the
+   assumption that "the May 9 number is fine," the bug would have remained
+   latent and `v0.3.0` would have shipped with it.
+
+Re-run on the same 35-problem subset is tracked in
+[issue #19](https://github.com/0bserver07/bourbaki/issues/19); it blocks
+the full 244-problem run ([#14](https://github.com/0bserver07/bourbaki/issues/14))
+and the v0.3.0 release ([#15](https://github.com/0bserver07/bourbaki/issues/15)).
+
+---
+
 ## 2026-02-18 — v0.2.1 (94.3% miniF2F test) — **RETRACTED**
 
 > **RETRACTED 2026-05-14.** The 91.8% / 94.3% numbers below were
