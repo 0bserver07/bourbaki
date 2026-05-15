@@ -16,16 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
 from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.anthropic import AnthropicProvider
-from pydantic_ai.providers.openai import OpenAIProvider
 
+from bourbaki.providers import resolve_model_object
 from bourbaki.prover import feedback, prompts
 from bourbaki.prover.state import FeedbackMessage, ProverState, ReviewDecision
 from bourbaki.tools.lean_prover import lean_prover
@@ -34,58 +30,10 @@ from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 logger = logging.getLogger(__name__)
 
 
-# See :mod:`bourbaki.prover.proposer` for the full routing rationale.
-_ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
-_ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
-
-
-def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
-    """Resolve a model string to a Pydantic AI model object.
-
-    Mirrors :func:`bourbaki.prover.proposer._resolve_model_object`:
-    ``glm:`` → Anthropic-compat, ``glm-oai:`` → OpenAI-compat,
-    ``ollama:`` → local daemon OpenAI-compat (default
-    ``http://localhost:11434/v1``, ``OLLAMA_BASE_URL`` override),
-    ``ollama-cloud:`` → direct Ollama Cloud OpenAI-compat,
-    anything else passed through.
-    """
-    if model.startswith("ollama-cloud:"):
-        model_name = model.removeprefix("ollama-cloud:")
-        api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "ollama")
-        provider = OpenAIProvider(
-            base_url="https://ollama.com/v1",
-            api_key=api_key,
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model.startswith("ollama:"):
-        model_name = model.removeprefix("ollama:")
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        provider = OpenAIProvider(
-            base_url=base_url,
-            api_key="ollama",
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model.startswith("glm-oai:"):
-        model_name = model.removeprefix("glm-oai:")
-        api_key = os.environ.get("GLM_API_KEY", "")
-        provider = OpenAIProvider(
-            base_url=_ZAI_OPENAI_BASE_URL,
-            api_key=api_key,
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model.startswith("glm:"):
-        model_name = model.removeprefix("glm:")
-        api_key = os.environ.get("GLM_API_KEY", "")
-        provider = AnthropicProvider(
-            base_url=_ZAI_ANTHROPIC_BASE_URL,
-            api_key=api_key,
-        )
-        return AnthropicModel(model_name, provider=provider)
-
-    return model
+# Kept as a module-level alias so existing tests and external callers that
+# import ``reviewer._resolve_model_object`` (and monkeypatch it) keep working.
+# See :mod:`bourbaki.providers` for the routing logic.
+_resolve_model_object = resolve_model_object
 
 
 def _summarize_lean_errors(result: dict) -> str:

@@ -80,6 +80,8 @@ def _record_call(ctx: RunContext[AgentDependencies], tool_name: str, args: dict,
     )
 
 
+# Note: core.py keeps its own copy because it uses OpenAIModel (deprecated alias).
+# Migration to bourbaki.providers + OpenAIChatModel is tracked separately.
 def _resolve_model_object(model: str) -> str | OpenAIModel | AnthropicModel:
     """Resolve model string, returning a custom model object for custom providers."""
     if model.startswith("ollama-cloud:"):

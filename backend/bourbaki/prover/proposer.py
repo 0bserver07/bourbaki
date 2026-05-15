@@ -15,17 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 
 from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.anthropic import AnthropicProvider
-from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import Tool
 
+from bourbaki.providers import resolve_model_object
 from bourbaki.prover import feedback, prompts
 from bourbaki.prover.state import (
     FeedbackMessage,
@@ -37,77 +33,10 @@ from bourbaki.prover.state import (
 logger = logging.getLogger(__name__)
 
 
-# z.ai has two API surfaces with separate billing pools:
-#  - Anthropic-compat (`glm:` prefix, default) — where GLM-5/5.1 resource
-#    packages live. Survives pydantic_ai's retry mapping thanks to the
-#    args_as_dict shim in ``_pydantic_ai_compat.py``.
-#  - OpenAI-compat (`glm-oai:` prefix) — separate billing pool, alternative
-#    routing if the Anthropic-compat endpoint becomes unsuitable.
-# See issue #13.
-_ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
-_ZAI_OPENAI_BASE_URL = "https://api.z.ai/api/paas/v4/"
-
-
-def _resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicModel:
-    """Resolve a model string into a Pydantic AI model object.
-
-    Supported prefixes:
-
-    - ``glm:<model>`` — z.ai's Anthropic-compatible endpoint (default for
-      GLM models; pairs with the args_as_dict shim).
-    - ``glm-oai:<model>`` — z.ai's OpenAI-compatible endpoint
-      (alternative billing pool / different message-mapping code path).
-    - ``ollama:<model>`` — local Ollama daemon's OpenAI-compat endpoint
-      (default ``http://localhost:11434/v1``, override via
-      ``OLLAMA_BASE_URL``). The daemon transparently proxies ``:cloud``
-      tags to Ollama Cloud, so frontier models (e.g.
-      ``ollama:kimi-k2.6:cloud``, ``ollama:deepseek-v4-pro:cloud``) work
-      without an explicit API key.
-    - ``ollama-cloud:<model>`` — direct Ollama Cloud API at
-      ``https://ollama.com/v1`` (requires ``OLLAMA_CLOUD_API_KEY``).
-    - Anything else (e.g. ``openai:gpt-4o``, ``anthropic:claude-sonnet-4-5``)
-      is handed to Pydantic AI verbatim.
-
-    All ``glm*`` prefixes pull the API key from ``GLM_API_KEY``.
-    """
-
-    if model_str.startswith("ollama-cloud:"):
-        model_name = model_str.removeprefix("ollama-cloud:")
-        api_key = os.environ.get("OLLAMA_CLOUD_API_KEY", "ollama")
-        provider = OpenAIProvider(
-            base_url="https://ollama.com/v1",
-            api_key=api_key,
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model_str.startswith("ollama:"):
-        model_name = model_str.removeprefix("ollama:")
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        provider = OpenAIProvider(
-            base_url=base_url,
-            api_key="ollama",  # dummy; local daemon ignores
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model_str.startswith("glm-oai:"):
-        model_name = model_str.removeprefix("glm-oai:")
-        api_key = os.environ.get("GLM_API_KEY", "")
-        provider = OpenAIProvider(
-            base_url=_ZAI_OPENAI_BASE_URL,
-            api_key=api_key,
-        )
-        return OpenAIChatModel(model_name, provider=provider)
-
-    if model_str.startswith("glm:"):
-        model_name = model_str.removeprefix("glm:")
-        api_key = os.environ.get("GLM_API_KEY", "")
-        provider = AnthropicProvider(
-            base_url=_ZAI_ANTHROPIC_BASE_URL,
-            api_key=api_key,
-        )
-        return AnthropicModel(model_name, provider=provider)
-
-    return model_str
+# Kept as a module-level alias so existing tests and external callers that
+# import ``proposer._resolve_model_object`` (and monkeypatch it) keep working.
+# See :mod:`bourbaki.providers` for the routing logic.
+_resolve_model_object = resolve_model_object
 
 
 def _build_user_message(state: ProverState) -> str:
