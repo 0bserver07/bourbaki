@@ -252,6 +252,24 @@ def test_verify_timeout_defaults_cover_cold_mathlib():
         )
 
 
+def test_prove_route_default_timeout_covers_cold_mathlib():
+    """``POST /prove`` (``ProveRequest.timeout``) must default >= 180s.
+
+    HANDOFF.md §4 #2: the request schema's default was 30s, identical
+    to the pre-#19 reviewer footgun on the HTTP endpoint. A client that
+    POSTs Lean code without an explicit ``timeout=`` would silently time
+    out before ``lake env lean + import Mathlib`` finished loading.
+    """
+    from bourbaki.server.routes.prove import ProveRequest
+
+    default = ProveRequest.model_fields["timeout"].default
+    assert default >= 180, (
+        f"ProveRequest.timeout default is {default}s; below 180s the "
+        "cold-cache Mathlib compile times out before lean_prover gets "
+        "a chance to run. Canonical fix: 240s, matching lean_prover."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Outer budgets don't shrink between siblings (Pass@N vs single-shot)
 # ---------------------------------------------------------------------------

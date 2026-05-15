@@ -15,7 +15,11 @@ router = APIRouter()
 class ProveRequest(BaseModel):
     code: str
     mode: str = "check"
-    timeout: int = 30
+    # Aligned with lean_prover's 240s default — see HANDOFF.md §4 #2.
+    # A cold-cache `lake env lean + import Mathlib` takes 60-180s on a
+    # quiet box; the prior 30s default silently timed out before Mathlib
+    # finished loading, same #19-class footgun as the pre-7b07c07 reviewer.
+    timeout: int = 240
 
 
 @router.post("/prove")
