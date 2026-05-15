@@ -172,7 +172,9 @@ class ProverLoop:
         )
 
     async def _builder(self, state: ProverState) -> FeedbackMessage:
-        return await run_builder(state, self.session)
+        return await run_builder(
+            state, self.session, timeout=self.config.build_timeout
+        )
 
     async def _reviewer(self, state: ProverState) -> FeedbackMessage:
         return await run_reviewer(

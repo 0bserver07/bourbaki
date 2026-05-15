@@ -91,14 +91,10 @@ def test_memory_llm_timeout_is_module_constant():
 def test_send_cmd_default_covers_build_timeout():
     """``ProverConfig.build_timeout`` should not exceed the REPL's per-cmd cap.
 
-    The builder currently calls ``session.send_cmd(cmd)`` with no explicit
-    ``timeout=`` and therefore inherits ``send_cmd``'s default (120s).
-    ``ProverConfig.build_timeout`` is declared but unused; until it's
-    wired through ``builder.py`` the only safe invariant is that the
-    declared field doesn't promise more than the REPL actually delivers.
-
-    See follow-up note in the timeout audit: wire ``build_timeout``
-    through ``run_builder`` so this becomes the contract it pretends to be.
+    Even now that ``build_timeout`` is wired through ``run_builder`` (see
+    HANDOFF.md §4 #1 fix), keeping the REPL's send_cmd default >= the
+    declared build_timeout means a caller that forgets to pass the kwarg
+    still gets a reasonable upper bound rather than a silent 30s default.
     """
     send_cmd_default = _default_for(LeanREPLSession.send_cmd, "timeout")
     build_timeout = ProverConfig().build_timeout
@@ -106,6 +102,32 @@ def test_send_cmd_default_covers_build_timeout():
         f"REPL send_cmd default ({send_cmd_default}s) is below the "
         f"declared ProverConfig.build_timeout ({build_timeout}s); "
         "either lower build_timeout or raise the REPL default."
+    )
+
+
+def test_build_timeout_is_wired_through_run_builder():
+    """``ProverLoop._builder`` must forward ``cfg.build_timeout`` to ``run_builder``.
+
+    Codifies the HANDOFF.md §4 #1 fix: the field was declared on
+    ``ProverConfig`` but the call site in ``ProverLoop._builder`` did not
+    pass it, so every REPL call inherited send_cmd's default. Inspect
+    the source to confirm the kwarg is plumbed end-to-end.
+    """
+    from bourbaki.prover.builder import run_builder
+    from bourbaki.prover.prover import ProverLoop
+
+    # run_builder accepts timeout
+    sig = inspect.signature(run_builder)
+    assert "timeout" in sig.parameters, (
+        "run_builder must accept a `timeout` kwarg so ProverLoop can "
+        "thread ProverConfig.build_timeout through to the REPL."
+    )
+
+    # ProverLoop._builder passes cfg.build_timeout
+    src = inspect.getsource(ProverLoop._builder)
+    assert "build_timeout" in src, (
+        "ProverLoop._builder must reference cfg.build_timeout; "
+        "without it the field is declared but dead."
     )
 
 

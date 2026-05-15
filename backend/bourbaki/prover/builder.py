@@ -42,13 +42,20 @@ _IMPORT_LINE_RE = re.compile(r"^\s*import\s+\S+.*$", re.MULTILINE)
 
 
 async def run_builder(
-    state: ProverState, session: LeanREPLSession
+    state: ProverState,
+    session: LeanREPLSession,
+    *,
+    timeout: float = 60.0,
 ) -> FeedbackMessage:
     """Run the builder node on ``state.last_proposal``.
 
     Returns a :class:`FeedbackMessage` describing the build outcome. The
     caller is responsible for routing on the resulting feedback (e.g.
     ``is_terminal`` ends the loop; ``is_success`` advances to the reviewer).
+
+    ``timeout`` is forwarded to ``session.send_cmd`` and bounds the per-build
+    REPL call. Defaults to 60.0s to match ``ProverConfig.build_timeout``;
+    pass an explicit value to override (e.g. ``cfg.build_timeout``).
     """
     proposal = state.last_proposal
     if proposal is None:
@@ -83,8 +90,10 @@ async def run_builder(
         cmd = stripped_code
 
     # 3) Send to REPL.
-    logger.debug("builder: sending %d chars to REPL", len(cmd))
-    result: dict[str, Any] = await session.send_cmd(cmd)
+    logger.debug(
+        "builder: sending %d chars to REPL (timeout=%.0fs)", len(cmd), timeout
+    )
+    result: dict[str, Any] = await session.send_cmd(cmd, timeout=timeout)
 
     # 4) Inspect result.
 

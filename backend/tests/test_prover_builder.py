@@ -338,6 +338,46 @@ def test_render_repl_errors_includes_position() -> None:
     assert "no pos" in rendered
 
 
+# ---------------------------------------------------------------------------
+# build_timeout wiring (HANDOFF.md §4 #1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_builder_forwards_timeout_kwarg_to_send_cmd() -> None:
+    """``run_builder(..., timeout=T)`` must forward ``timeout=T`` to send_cmd.
+
+    Regression for HANDOFF.md §4 #1: ``ProverConfig.build_timeout`` was
+    declared but the call site dropped it, so every build silently
+    inherited the REPL's 120s default.
+    """
+    state = _make_state(
+        code="theorem my_target : True := trivial",
+        problem_id="my_target",
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"messages": [], "sorries": [], "env": 1}
+
+    await run_builder(state, mock_session, timeout=45.0)
+
+    mock_session.send_cmd.assert_awaited_once()
+    assert mock_session.send_cmd.await_args.kwargs.get("timeout") == 45.0
+
+
+@pytest.mark.asyncio
+async def test_run_builder_default_timeout_matches_prover_config() -> None:
+    """The signature default for ``timeout`` must match ``ProverConfig.build_timeout``.
+
+    Two sources of truth aren't great, but the alternative (importing
+    ProverConfig into builder.py) creates a circular dependency.
+    """
+    from bourbaki.prover.prover import ProverConfig
+
+    import inspect
+    sig = inspect.signature(run_builder)
+    assert sig.parameters["timeout"].default == ProverConfig().build_timeout
+
+
 def test_extract_sorry_goals_handles_singular_and_plural() -> None:
     sorries = [
         {"goal": "⊢ True", "proofState": 0},
