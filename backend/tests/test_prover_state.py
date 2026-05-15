@@ -234,6 +234,22 @@ def test_factory_kinds_are_unique():
     assert len(kinds) == len(set(kinds))
 
 
+def test_prover_config_llm_timeout_defaults_match_module_constants():
+    """``ProverConfig`` exposes proposer / reviewer LLM-call timeouts so
+    frontier models (Kimi K2.6 1T, gpt-oss:120b) that exceed the 90s
+    hardcoded default can be lifted from the config layer. The defaults
+    must match the module-level constants in proposer.py / reviewer.py
+    so legacy callers see byte-identical behaviour.
+    """
+    from bourbaki.prover import proposer as proposer_mod
+    from bourbaki.prover import reviewer as reviewer_mod
+    from bourbaki.prover.prover import ProverConfig
+
+    cfg = ProverConfig()
+    assert cfg.proposer_llm_timeout == proposer_mod._PROPOSER_LLM_TIMEOUT
+    assert cfg.reviewer_llm_timeout == reviewer_mod._REVIEWER_LLM_TIMEOUT
+
+
 def test_only_terminal_factories_are_terminal():
     terminal_kinds = {"max_iterations"}
     factories = {

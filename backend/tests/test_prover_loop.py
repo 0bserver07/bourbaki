@@ -327,3 +327,122 @@ def test_route_reviewer_rejected_retries():
     state = ProverState(problem_id="x", target_theorem="t")
     state.last_feedback = fb.review_rejected("nope")
     assert loop._route_reviewer(state) == "retry"
+
+
+# ---------------------------------------------------------------------------
+# Per-LLM-call timeout threading (proposer / reviewer)
+#
+# Regression for the Kimi K2.6 1T / gpt-oss:120b timeout footgun: the
+# hardcoded 90s _PROPOSER_LLM_TIMEOUT was too tight for frontier
+# proposer models. ProverConfig now exposes proposer_llm_timeout and
+# reviewer_llm_timeout, which must reach ``run_proposer(llm_timeout=...)``
+# and ``run_reviewer(llm_timeout=...)`` respectively.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_loop_forwards_proposer_llm_timeout_to_run_proposer(monkeypatch):
+    """``ProverLoop._proposer`` must pass ``cfg.proposer_llm_timeout`` as the
+    ``llm_timeout`` kwarg to :func:`run_proposer`.
+    """
+    from bourbaki.prover import prover as prover_mod
+
+    captured: dict = {}
+
+    async def fake_run_proposer(state, **kwargs):
+        captured.update(kwargs)
+        # End the loop immediately on the next route check.
+        return fb.max_iterations(5)
+
+    monkeypatch.setattr(prover_mod, "run_proposer", fake_run_proposer)
+
+    cfg = ProverConfig(
+        memory_cls="MemorylessMemory",
+        max_iterations=5,
+        proposer_llm_timeout=600.0,
+    )
+    loop = ProverLoop(config=cfg, session=AsyncMock())
+    await loop.run(_make_problem())
+
+    assert captured.get("llm_timeout") == 600.0
+
+
+@pytest.mark.asyncio
+async def test_loop_forwards_reviewer_llm_timeout_to_run_reviewer(monkeypatch):
+    """``ProverLoop._reviewer`` must pass ``cfg.reviewer_llm_timeout`` as the
+    ``llm_timeout`` kwarg to :func:`run_reviewer`.
+    """
+    from bourbaki.prover import prover as prover_mod
+
+    proposal = ProposalMessage(
+        reasoning="rfl works",
+        code="theorem mathd_test_1 : 1 = 1 := rfl",
+        iteration=1,
+    )
+
+    async def fake_run_proposer(state, **kwargs):
+        return proposal
+
+    async def fake_run_builder(state, session, **kwargs):
+        return fb.build_success()
+
+    captured: dict = {}
+
+    async def fake_run_reviewer(state, **kwargs):
+        captured.update(kwargs)
+        return fb.review_approved("ok")
+
+    monkeypatch.setattr(prover_mod, "run_proposer", fake_run_proposer)
+    monkeypatch.setattr(prover_mod, "run_builder", fake_run_builder)
+    monkeypatch.setattr(prover_mod, "run_reviewer", fake_run_reviewer)
+
+    cfg = ProverConfig(
+        memory_cls="MemorylessMemory",
+        max_iterations=5,
+        reviewer_llm_timeout=450.0,
+    )
+    loop = ProverLoop(config=cfg, session=AsyncMock())
+    await loop.run(_make_problem())
+
+    assert captured.get("llm_timeout") == 450.0
+
+
+@pytest.mark.asyncio
+async def test_loop_defaults_forward_module_constants(monkeypatch):
+    """When the caller leaves ``ProverConfig`` defaults alone, the loop
+    must still forward the module-constant values explicitly — not rely
+    on ``run_proposer`` / ``run_reviewer`` falling through to their own
+    defaults. Future refactors could drop those module defaults and we'd
+    silently lose coverage.
+    """
+    from bourbaki.prover import prover as prover_mod
+    from bourbaki.prover import proposer as proposer_mod
+    from bourbaki.prover import reviewer as reviewer_mod
+
+    proposal = ProposalMessage(
+        reasoning="r", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=1
+    )
+    proposer_captured: dict = {}
+    reviewer_captured: dict = {}
+
+    async def fake_run_proposer(state, **kwargs):
+        proposer_captured.update(kwargs)
+        return proposal
+
+    async def fake_run_builder(state, session, **kwargs):
+        return fb.build_success()
+
+    async def fake_run_reviewer(state, **kwargs):
+        reviewer_captured.update(kwargs)
+        return fb.review_approved("ok")
+
+    monkeypatch.setattr(prover_mod, "run_proposer", fake_run_proposer)
+    monkeypatch.setattr(prover_mod, "run_builder", fake_run_builder)
+    monkeypatch.setattr(prover_mod, "run_reviewer", fake_run_reviewer)
+
+    cfg = ProverConfig(memory_cls="MemorylessMemory", max_iterations=5)
+    loop = ProverLoop(config=cfg, session=AsyncMock())
+    await loop.run(_make_problem())
+
+    assert proposer_captured["llm_timeout"] == proposer_mod._PROPOSER_LLM_TIMEOUT
+    assert reviewer_captured["llm_timeout"] == reviewer_mod._REVIEWER_LLM_TIMEOUT

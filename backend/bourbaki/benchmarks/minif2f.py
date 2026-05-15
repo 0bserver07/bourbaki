@@ -527,6 +527,8 @@ async def run_minif2f(
     loop_memory: str = "MemorylessMemory",
     loop_memory_k: int = 2,
     loop_enable_mathlib_search: bool = False,
+    loop_proposer_llm_timeout: float | None = None,
+    loop_reviewer_llm_timeout: float | None = None,
     pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,
@@ -553,6 +555,14 @@ async def run_minif2f(
         loop_memory: Name of the Memory subclass driving experience.
         loop_memory_k: Number of past experiences passed to the proposer.
         loop_enable_mathlib_search: Wire ``mathlib_search`` as a proposer tool.
+        loop_proposer_llm_timeout: Per-LLM-call timeout for the proposer
+            node (seconds). ``None`` (default) inherits
+            :class:`ProverConfig.proposer_llm_timeout`. Pass a larger
+            value (e.g. 600.0) when running frontier proposer models
+            like Kimi K2.6 1T or gpt-oss:120b that routinely exceed 90s.
+        loop_reviewer_llm_timeout: Per-LLM-call timeout for the reviewer
+            node (seconds). ``None`` (default) inherits
+            :class:`ProverConfig.reviewer_llm_timeout`.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -604,20 +614,33 @@ async def run_minif2f(
             logger.warning("REPL not available (%s), using lean_prover", e)
             repl_session = None
 
+    # Build the ProverConfig once per run; the loop reuses it across all
+    # problems. Only override the per-LLM-call timeouts when the caller
+    # explicitly passed them — None falls through to the ProverConfig
+    # defaults (which match the proposer.py / reviewer.py module
+    # constants).
+    def _build_loop_cfg():
+        from bourbaki.prover import ProverConfig as _ProverConfig
+        kwargs: dict = {
+            "model": loop_model,
+            "max_iterations": loop_max_iterations,
+            "memory_cls": loop_memory,
+            "memory_k": loop_memory_k,
+            "enable_mathlib_search": loop_enable_mathlib_search,
+        }
+        if loop_proposer_llm_timeout is not None:
+            kwargs["proposer_llm_timeout"] = loop_proposer_llm_timeout
+        if loop_reviewer_llm_timeout is not None:
+            kwargs["reviewer_llm_timeout"] = loop_reviewer_llm_timeout
+        return _ProverConfig(**kwargs)
+
     try:
         if concurrency <= 1:
             # Sequential execution
             for i, problem in enumerate(problems):
                 logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
                 if repl_session is not None and use_loop:
-                    from bourbaki.prover import ProverConfig as _ProverConfig
-                    loop_cfg = _ProverConfig(
-                        model=loop_model,
-                        max_iterations=loop_max_iterations,
-                        memory_cls=loop_memory,
-                        memory_k=loop_memory_k,
-                        enable_mathlib_search=loop_enable_mathlib_search,
-                    )
+                    loop_cfg = _build_loop_cfg()
                     if pass_n > 1:
                         result = await attempt_proof_pass_at_n(
                             problem, repl_session, config=loop_cfg,
@@ -651,14 +674,7 @@ async def run_minif2f(
                 for i, problem in enumerate(problems):
                     logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
                     if use_loop:
-                        from bourbaki.prover import ProverConfig as _ProverConfig
-                        loop_cfg = _ProverConfig(
-                            model=loop_model,
-                            max_iterations=loop_max_iterations,
-                            memory_cls=loop_memory,
-                            memory_k=loop_memory_k,
-                            enable_mathlib_search=loop_enable_mathlib_search,
-                        )
+                        loop_cfg = _build_loop_cfg()
                         if pass_n > 1:
                             result = await attempt_proof_pass_at_n(
                                 problem, repl_session, config=loop_cfg,
@@ -749,6 +765,12 @@ async def run_minif2f(
             "loop_memory_k": loop_memory_k if use_loop else None,
             "loop_enable_mathlib_search": (
                 loop_enable_mathlib_search if use_loop else None
+            ),
+            "loop_proposer_llm_timeout": (
+                loop_proposer_llm_timeout if use_loop else None
+            ),
+            "loop_reviewer_llm_timeout": (
+                loop_reviewer_llm_timeout if use_loop else None
             ),
             "pass_n": pass_n if use_loop else None,
             "verify": verify,

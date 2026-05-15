@@ -447,6 +447,8 @@ async def run_putnam(
     loop_memory: str = "MemorylessMemory",
     loop_memory_k: int = 2,
     loop_enable_mathlib_search: bool = False,
+    loop_proposer_llm_timeout: float | None = None,
+    loop_reviewer_llm_timeout: float | None = None,
     pass_n: int = 1,
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
@@ -503,6 +505,14 @@ async def run_putnam(
         loop_memory_k: Number of past experiences passed to the proposer.
         loop_enable_mathlib_search: Wire ``mathlib_search`` as a proposer
             tool.
+        loop_proposer_llm_timeout: Per-LLM-call timeout for the proposer
+            node (seconds). ``None`` (default) inherits
+            :class:`ProverConfig.proposer_llm_timeout`. Pass a larger
+            value (e.g. 600.0) when running frontier proposer models
+            like Kimi K2.6 1T or gpt-oss:120b that routinely exceed 90s.
+        loop_reviewer_llm_timeout: Per-LLM-call timeout for the reviewer
+            node (seconds). ``None`` (default) inherits
+            :class:`ProverConfig.reviewer_llm_timeout`.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -700,13 +710,18 @@ async def run_putnam(
 
             if use_loop:
                 from bourbaki.prover import ProverConfig as _ProverConfig
-                loop_cfg = _ProverConfig(
-                    model=loop_model,
-                    max_iterations=loop_max_iterations,
-                    memory_cls=loop_memory,
-                    memory_k=loop_memory_k,
-                    enable_mathlib_search=loop_enable_mathlib_search,
-                )
+                _loop_kwargs: dict = {
+                    "model": loop_model,
+                    "max_iterations": loop_max_iterations,
+                    "memory_cls": loop_memory,
+                    "memory_k": loop_memory_k,
+                    "enable_mathlib_search": loop_enable_mathlib_search,
+                }
+                if loop_proposer_llm_timeout is not None:
+                    _loop_kwargs["proposer_llm_timeout"] = loop_proposer_llm_timeout
+                if loop_reviewer_llm_timeout is not None:
+                    _loop_kwargs["reviewer_llm_timeout"] = loop_reviewer_llm_timeout
+                loop_cfg = _ProverConfig(**_loop_kwargs)
                 # PutnamProblem is duck-compatible with MiniF2FProblem on
                 # the fields the loop actually reads (id, source, statement,
                 # full_lean_code). pyright doesn't know that; cast to
@@ -861,6 +876,12 @@ async def run_putnam(
             "loop_memory_k": loop_memory_k if use_loop else None,
             "loop_enable_mathlib_search": (
                 loop_enable_mathlib_search if use_loop else None
+            ),
+            "loop_proposer_llm_timeout": (
+                loop_proposer_llm_timeout if use_loop else None
+            ),
+            "loop_reviewer_llm_timeout": (
+                loop_reviewer_llm_timeout if use_loop else None
             ),
             "pass_n": pass_n if use_loop else None,
         },

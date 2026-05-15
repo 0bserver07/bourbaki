@@ -106,6 +106,26 @@ def parse_args() -> argparse.Namespace:
         help="Register mathlib_search as a proposer tool.",
     )
     parser.add_argument(
+        "--proposer-llm-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-LLM-call timeout for the proposer node, in seconds. "
+            "Defaults to ProverConfig.proposer_llm_timeout (90.0). "
+            "Bump (e.g. 600) for frontier models like Kimi K2.6 1T or "
+            "gpt-oss:120b that routinely exceed 90s on a single call."
+        ),
+    )
+    parser.add_argument(
+        "--reviewer-llm-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-LLM-call timeout for the reviewer node, in seconds. "
+            "Defaults to ProverConfig.reviewer_llm_timeout (60.0)."
+        ),
+    )
+    parser.add_argument(
         "--include-answer",
         action="store_true",
         help="Include answer-sorry problems (excluded by default).",
@@ -155,6 +175,8 @@ async def _run(
         loop_memory=args.memory,
         loop_memory_k=args.memory_k,
         loop_enable_mathlib_search=args.enable_mathlib_search,
+        loop_proposer_llm_timeout=args.proposer_llm_timeout,
+        loop_reviewer_llm_timeout=args.reviewer_llm_timeout,
         pass_n=args.pass_n,
     )
 
@@ -231,6 +253,8 @@ def main() -> None:
         "memory_k": args.memory_k,
         "pass_n": args.pass_n,
         "enable_mathlib_search": args.enable_mathlib_search,
+        "proposer_llm_timeout_s": args.proposer_llm_timeout,
+        "reviewer_llm_timeout_s": args.reviewer_llm_timeout,
         "verify_timeout_s": args.verify_timeout,
     }
     common.banner(

@@ -47,6 +47,14 @@ class ProverConfig(BaseModel):
     enable_mathlib_search: bool = False
     verify_on_approve: bool = True
     build_timeout: float = 60.0
+    # Per-LLM-call timeouts on the proposer / reviewer nodes. Defaults
+    # match the module-level constants in proposer.py / reviewer.py so
+    # legacy callers see identical behaviour; frontier models (e.g.
+    # Kimi K2.6 1T, gpt-oss:120b) routinely exceed 90s on a single
+    # proposer call, so the timeout has to be liftable from the config
+    # layer rather than baked into the node modules.
+    proposer_llm_timeout: float = 90.0
+    reviewer_llm_timeout: float = 60.0
 
 
 def _build_memory(config: ProverConfig) -> memory_module.BaseMemory:
@@ -168,6 +176,7 @@ class ProverLoop:
         return await run_proposer(
             state,
             model=self.config.model,
+            llm_timeout=self.config.proposer_llm_timeout,
             enable_mathlib_search=self.config.enable_mathlib_search,
         )
 
@@ -178,7 +187,9 @@ class ProverLoop:
 
     async def _reviewer(self, state: ProverState) -> FeedbackMessage:
         return await run_reviewer(
-            state, model=self.config.reviewer_model or self.config.model
+            state,
+            model=self.config.reviewer_model or self.config.model,
+            llm_timeout=self.config.reviewer_llm_timeout,
         )
 
     async def _memory(self, state: ProverState) -> str:
