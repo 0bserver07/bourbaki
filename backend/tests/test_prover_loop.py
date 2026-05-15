@@ -446,3 +446,145 @@ async def test_loop_defaults_forward_module_constants(monkeypatch):
 
     assert proposer_captured["llm_timeout"] == proposer_mod._PROPOSER_LLM_TIMEOUT
     assert reviewer_captured["llm_timeout"] == reviewer_mod._REVIEWER_LLM_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider parallel-fanout proposer routing
+#
+# ProverConfig.proposer_configs gates which proposer entrypoint
+# ProverLoop._proposer calls. None / empty -> legacy run_proposer; non-empty
+# list -> parallel_propose with the supplied configs. Reviewer is unaffected.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_loop_calls_run_proposer_when_proposer_configs_is_none(monkeypatch):
+    """``ProverConfig(proposer_configs=None)`` keeps the single-model path:
+    ``ProverLoop._proposer`` must invoke :func:`run_proposer` and must NOT
+    call :func:`parallel_propose`.
+    """
+    from bourbaki.prover import prover as prover_mod
+
+    run_proposer_mock = AsyncMock(return_value=fb.max_iterations(5))
+    parallel_propose_mock = AsyncMock()
+
+    monkeypatch.setattr(prover_mod, "run_proposer", run_proposer_mock)
+    monkeypatch.setattr(prover_mod, "parallel_propose", parallel_propose_mock)
+
+    cfg = ProverConfig(
+        memory_cls="MemorylessMemory",
+        max_iterations=5,
+        proposer_configs=None,
+    )
+    loop = ProverLoop(config=cfg, session=AsyncMock())
+    await loop.run(_make_problem())
+
+    assert run_proposer_mock.await_count == 1
+    assert parallel_propose_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_calls_parallel_propose_when_proposer_configs_set(monkeypatch):
+    """``ProverConfig(proposer_configs=[c1, c2])`` routes through
+    :func:`parallel_propose`, passing the supplied configs unchanged.
+    :func:`run_proposer` must NOT be called for the proposer step.
+    """
+    from bourbaki.prover import prover as prover_mod
+    from bourbaki.prover.parallel_proposer import ProposerConfig
+
+    c1 = ProposerConfig(model="glm:glm-5.1", llm_timeout=90.0)
+    c2 = ProposerConfig(model="ollama-cloud:kimi-k2.6", llm_timeout=600.0)
+
+    run_proposer_mock = AsyncMock()
+    parallel_propose_mock = AsyncMock(return_value=fb.max_iterations(5))
+
+    monkeypatch.setattr(prover_mod, "run_proposer", run_proposer_mock)
+    monkeypatch.setattr(prover_mod, "parallel_propose", parallel_propose_mock)
+
+    cfg = ProverConfig(
+        memory_cls="MemorylessMemory",
+        max_iterations=5,
+        proposer_configs=[c1, c2],
+    )
+    loop = ProverLoop(config=cfg, session=AsyncMock())
+    await loop.run(_make_problem())
+
+    assert run_proposer_mock.await_count == 0
+    assert parallel_propose_mock.await_count == 1
+    # parallel_propose(state, configs) — second positional arg is the list.
+    assert parallel_propose_mock.await_args is not None
+    _, call_args = parallel_propose_mock.await_args.args
+    assert call_args == [c1, c2]
+
+
+def test_run_minif2f_loop_proposer_configs_plumbed_into_prover_config():
+    """``run_minif2f(loop_proposer_configs=...)`` must reach the constructed
+    :class:`ProverConfig`. We mock :class:`LeanREPLSession` (so the runner
+    takes the loop path), then capture the ``config`` object that the
+    runner forwards into :func:`attempt_proof_loop`.
+    """
+    import asyncio as _asyncio
+    import unittest.mock as _mock
+
+    from bourbaki.benchmarks import minif2f as minif2f_mod
+    from bourbaki.prover.parallel_proposer import ProposerConfig
+
+    cfgs = [
+        ProposerConfig(model="glm:glm-5.1", llm_timeout=90.0),
+        ProposerConfig(model="ollama-cloud:gpt-oss:120b", llm_timeout=120.0),
+    ]
+    captured: dict = {}
+
+    class _StubREPLSession:
+        """Minimal stand-in. Accepts the kwargs ``run_minif2f`` passes
+        and survives ``ensure_initialized`` so the runner picks the
+        loop path rather than the lean_prover fallback.
+        """
+
+        _initialized = True
+        env_id = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def ensure_initialized(self):
+            self._initialized = True
+
+    async def fake_attempt_proof_loop(problem, session, config=None, timeout=300):
+        assert config is not None
+        captured["proposer_configs"] = config.proposer_configs
+        return minif2f_mod.ProblemResult(
+            problem_id=problem.id,
+            source=problem.source,
+            solved=False,
+            duration_seconds=0.0,
+        )
+
+    with _mock.patch.object(minif2f_mod, "LeanREPLSession", _StubREPLSession), \
+         _mock.patch.object(minif2f_mod, "attempt_proof_loop", fake_attempt_proof_loop), \
+         _mock.patch.object(minif2f_mod, "load_minif2f_problems", return_value=[
+             MiniF2FProblem(
+                 id="mathd_test_1",
+                 source="mathd",
+                 split="valid",
+                 statement="theorem mathd_test_1 : 1 = 1 := sorry",
+                 imports=["Mathlib"],
+                 file_path="/dev/null",
+                 full_lean_code="import Mathlib\n\ntheorem mathd_test_1 : 1 = 1 := sorry\n",
+             )
+         ]):
+        _asyncio.run(
+            minif2f_mod.run_minif2f(
+                use_loop=True,
+                loop_proposer_configs=cfgs,
+                verify=False,
+            )
+        )
+
+    assert captured["proposer_configs"] == cfgs

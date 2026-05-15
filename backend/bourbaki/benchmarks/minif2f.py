@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from bourbaki.prover import ProverConfig
+    from bourbaki.prover.parallel_proposer import ProposerConfig
 
 from bourbaki.benchmarks.loader import (
     MiniF2FProblem,
@@ -529,6 +530,7 @@ async def run_minif2f(
     loop_enable_mathlib_search: bool = False,
     loop_proposer_llm_timeout: float | None = None,
     loop_reviewer_llm_timeout: float | None = None,
+    loop_proposer_configs: list["ProposerConfig"] | None = None,
     pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,
@@ -563,6 +565,13 @@ async def run_minif2f(
         loop_reviewer_llm_timeout: Per-LLM-call timeout for the reviewer
             node (seconds). ``None`` (default) inherits
             :class:`ProverConfig.reviewer_llm_timeout`.
+        loop_proposer_configs: Multi-provider parallel-fanout proposer
+            configs. When ``None`` (default) the loop runs the
+            single-model proposer using ``loop_model`` /
+            ``loop_proposer_llm_timeout``. When a non-empty list is
+            supplied, ``ProverLoop`` races those legs via
+            :func:`parallel_propose` and the single-model fields are
+            ignored for the proposer step (reviewer is unaffected).
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -632,6 +641,8 @@ async def run_minif2f(
             kwargs["proposer_llm_timeout"] = loop_proposer_llm_timeout
         if loop_reviewer_llm_timeout is not None:
             kwargs["reviewer_llm_timeout"] = loop_reviewer_llm_timeout
+        if loop_proposer_configs:
+            kwargs["proposer_configs"] = loop_proposer_configs
         return _ProverConfig(**kwargs)
 
     try:
@@ -771,6 +782,19 @@ async def run_minif2f(
             ),
             "loop_reviewer_llm_timeout": (
                 loop_reviewer_llm_timeout if use_loop else None
+            ),
+            "loop_proposer_configs": (
+                [
+                    {
+                        "model": c.model,
+                        "llm_timeout": c.llm_timeout,
+                        "enable_mathlib_search": c.enable_mathlib_search,
+                        "label": c.label,
+                    }
+                    for c in loop_proposer_configs
+                ]
+                if use_loop and loop_proposer_configs
+                else None
             ),
             "pass_n": pass_n if use_loop else None,
             "verify": verify,

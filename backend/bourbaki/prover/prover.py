@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from bourbaki.prover import memory as memory_module
 from bourbaki.prover.builder import run_builder
 from bourbaki.prover.feedback import max_iterations as max_iterations_feedback
+from bourbaki.prover.parallel_proposer import parallel_propose
 from bourbaki.prover.proposer import run_proposer
 from bourbaki.prover.reviewer import run_reviewer
 from bourbaki.prover.state import (
@@ -27,6 +28,7 @@ from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 
 if TYPE_CHECKING:
     from bourbaki.benchmarks.loader import MiniF2FProblem
+    from bourbaki.prover.parallel_proposer import ProposerConfig
     from bourbaki.tools.lean_repl import LeanREPLSession
 
 
@@ -55,6 +57,16 @@ class ProverConfig(BaseModel):
     # layer rather than baked into the node modules.
     proposer_llm_timeout: float = 90.0
     reviewer_llm_timeout: float = 60.0
+    # Multi-provider parallel-fanout proposer. When ``None`` (default),
+    # ``ProverLoop._proposer`` calls :func:`run_proposer` once with
+    # ``model`` / ``proposer_llm_timeout`` (single-model legacy path).
+    # When a non-empty list is supplied, the loop routes through
+    # :func:`parallel_propose` and races those configs; the single-model
+    # ``model`` / ``proposer_llm_timeout`` fields are ignored for the
+    # proposer step. Reviewer is unaffected — always single-model.
+    proposer_configs: list["ProposerConfig"] | None = None
+
+    model_config = {"arbitrary_types_allowed": True}
 
 
 def _build_memory(config: ProverConfig) -> memory_module.BaseMemory:
@@ -173,6 +185,14 @@ class ProverLoop:
     # ----- Node delegators -----
 
     async def _proposer(self, state: ProverState) -> ProposalMessage | FeedbackMessage:
+        # Multi-provider fanout: when ``proposer_configs`` is set, race
+        # the supplied legs and take the first valid ProposalMessage.
+        # The single-model ``model`` / ``proposer_llm_timeout`` /
+        # ``enable_mathlib_search`` fields are ignored in this path —
+        # each ``ProposerConfig`` carries its own.  No outer cap is
+        # imposed here: per-leg ``llm_timeout`` governs.
+        if self.config.proposer_configs:
+            return await parallel_propose(state, self.config.proposer_configs)
         return await run_proposer(
             state,
             model=self.config.model,
@@ -228,3 +248,13 @@ class ProverLoop:
         if isinstance(last, FeedbackMessage) and last.kind == "review_approved":
             return "continue"
         return "retry"
+
+
+# Resolve the forward reference on ``ProverConfig.proposer_configs`` —
+# ``ProposerConfig`` is a frozen dataclass living in ``parallel_proposer``
+# and is only imported under ``TYPE_CHECKING`` above to avoid mixing the
+# Pydantic field type-resolution with runtime imports.  Without this
+# rebuild Pydantic raises ``PydanticUserError`` on first instantiation.
+from bourbaki.prover.parallel_proposer import ProposerConfig as _ProposerConfig  # noqa: E402
+
+ProverConfig.model_rebuild(_types_namespace={"ProposerConfig": _ProposerConfig})

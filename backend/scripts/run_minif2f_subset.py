@@ -109,7 +109,65 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Pass@N sampling (default: 1).",
     )
+    parser.add_argument(
+        "--proposer-models",
+        type=str,
+        default=None,
+        help=(
+            "Multi-provider parallel-fanout proposer. Comma- or "
+            "pipe-separated list of ``model[@llm_timeout]`` specs. "
+            "``@`` separates the (colon-containing) model string from "
+            "its per-leg timeout in seconds. Example: "
+            "'ollama-cloud:gpt-oss:120b@90,glm:glm-5.1@90,"
+            "ollama-cloud:kimi-k2.6@600'. When set, --model is ignored "
+            "for the proposer step (reviewer still uses --model)."
+        ),
+    )
     return parser.parse_args()
+
+
+def _parse_proposer_models(spec: str | None):
+    """Parse ``--proposer-models`` into a list of ``ProposerConfig``.
+
+    Empty / None / whitespace-only input returns ``None`` (single-model
+    legacy path). Splits on ``,`` and ``|`` so the flag survives a shell
+    that munges either. Inside each entry, ``@`` separates the model
+    string from its optional ``llm_timeout`` (seconds) — we can't use
+    ``:`` since model strings already contain colons
+    (``ollama-cloud:gpt-oss:120b``).
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+    from bourbaki.prover.parallel_proposer import ProposerConfig
+
+    # Split on both ``,`` and ``|`` so callers can use whichever their
+    # shell tolerates better.
+    raw_entries: list[str] = []
+    for chunk in spec.split("|"):
+        raw_entries.extend(chunk.split(","))
+    configs: list[ProposerConfig] = []
+    for entry in raw_entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            model, _, timeout_str = entry.rpartition("@")
+            model = model.strip()
+            timeout_str = timeout_str.strip()
+            try:
+                llm_timeout = float(timeout_str)
+            except ValueError as e:
+                raise ValueError(
+                    f"--proposer-models: bad timeout {timeout_str!r} in "
+                    f"entry {entry!r}; expected float seconds"
+                ) from e
+            configs.append(ProposerConfig(model=model, llm_timeout=llm_timeout))
+        else:
+            configs.append(ProposerConfig(model=entry))
+    return configs or None
 
 
 def _resolve_problem_ids(args: argparse.Namespace, logger) -> list[str]:
@@ -137,6 +195,14 @@ def _resolve_problem_ids(args: argparse.Namespace, logger) -> list[str]:
 async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None:
     from bourbaki.benchmarks.minif2f import run_minif2f
 
+    proposer_configs = _parse_proposer_models(args.proposer_models)
+    if proposer_configs:
+        logger.info(
+            "Parallel proposer fanout: %d legs [%s]",
+            len(proposer_configs),
+            ", ".join(f"{c.model}@{c.llm_timeout:.0f}s" for c in proposer_configs),
+        )
+
     result = await run_minif2f(
         split=args.split,
         problem_ids=problem_ids,
@@ -149,6 +215,7 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
         loop_enable_mathlib_search=args.enable_mathlib_search,
         loop_proposer_llm_timeout=args.proposer_llm_timeout,
         loop_reviewer_llm_timeout=args.reviewer_llm_timeout,
+        loop_proposer_configs=proposer_configs,
         pass_n=args.pass_n,
     )
 
@@ -203,6 +270,7 @@ def main() -> None:
         "enable_mathlib_search": args.enable_mathlib_search,
         "proposer_llm_timeout_s": args.proposer_llm_timeout,
         "reviewer_llm_timeout_s": args.reviewer_llm_timeout,
+        "proposer_models": args.proposer_models,
         "source": "--ids" if args.ids else ("--from-file " + args.from_file if args.from_file else "default 35-problem subset"),
     }
     common.banner(
