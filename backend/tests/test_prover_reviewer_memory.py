@@ -28,6 +28,31 @@ from bourbaki.prover.state import (
 
 
 # ---------------------------------------------------------------------------
+# Fixture: ensure GLM_API_KEY is set before any reviewer/memory test runs.
+#
+# Both `reviewer._resolve_model_object` and `memory._resolve_model_object`
+# build an `AnthropicProvider(api_key=os.environ.get("GLM_API_KEY", ""))`
+# eagerly. Without a value (or with an empty string), pydantic_ai raises
+# `UserError` BEFORE `monkeypatch.setattr("pydantic_ai.Agent.run", ...)`
+# can intercept — the provider construction happens inside `run_reviewer`
+# itself.
+#
+# Locally these tests pass because `bourbaki.config.export_api_keys()`
+# reads .env at import time and populates the env var as a side effect.
+# In a CI environment without the secret, every test in this file would
+# fail with UserError before the mock is reached. HANDOFF.md §4 #3.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _stub_glm_api_key(monkeypatch):
+    """Provide a dummy GLM_API_KEY so the provider constructors don't
+    raise UserError. The actual LLM calls are mocked downstream, so the
+    value is never used by a real HTTP client."""
+    monkeypatch.setenv("GLM_API_KEY", "test-dummy-key")
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
