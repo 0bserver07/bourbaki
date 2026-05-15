@@ -39,7 +39,9 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
     doc keeps memory and reviewer free of cross-module dependencies during
     Phase 2 so the two can ship and be tested independently. Supports
     ``glm:`` (Anthropic-compat), ``glm-oai:`` (OpenAI-compat),
-    ``ollama-cloud:``, and plain pydantic_ai provider strings.
+    ``ollama:`` (local daemon OpenAI-compat),
+    ``ollama-cloud:`` (direct Ollama Cloud OpenAI-compat), and plain
+    pydantic_ai provider strings.
     """
     if model.startswith("ollama-cloud:"):
         model_name = model.removeprefix("ollama-cloud:")
@@ -47,6 +49,15 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
         provider = OpenAIProvider(
             base_url="https://ollama.com/v1",
             api_key=api_key,
+        )
+        return OpenAIChatModel(model_name, provider=provider)
+
+    if model.startswith("ollama:"):
+        model_name = model.removeprefix("ollama:")
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        provider = OpenAIProvider(
+            base_url=base_url,
+            api_key="ollama",
         )
         return OpenAIChatModel(model_name, provider=provider)
 

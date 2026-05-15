@@ -44,7 +44,10 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
 
     Mirrors :func:`bourbaki.prover.proposer._resolve_model_object`:
     ``glm:`` → Anthropic-compat, ``glm-oai:`` → OpenAI-compat,
-    ``ollama-cloud:`` → OpenAI-compat, anything else passed through.
+    ``ollama:`` → local daemon OpenAI-compat (default
+    ``http://localhost:11434/v1``, ``OLLAMA_BASE_URL`` override),
+    ``ollama-cloud:`` → direct Ollama Cloud OpenAI-compat,
+    anything else passed through.
     """
     if model.startswith("ollama-cloud:"):
         model_name = model.removeprefix("ollama-cloud:")
@@ -52,6 +55,15 @@ def _resolve_model_object(model: str) -> str | OpenAIChatModel | AnthropicModel:
         provider = OpenAIProvider(
             base_url="https://ollama.com/v1",
             api_key=api_key,
+        )
+        return OpenAIChatModel(model_name, provider=provider)
+
+    if model.startswith("ollama:"):
+        model_name = model.removeprefix("ollama:")
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        provider = OpenAIProvider(
+            base_url=base_url,
+            api_key="ollama",
         )
         return OpenAIChatModel(model_name, provider=provider)
 

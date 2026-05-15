@@ -91,6 +91,15 @@ def _resolve_model_object(model: str) -> str | OpenAIModel | AnthropicModel:
         )
         return OpenAIModel(model_name, provider=provider)
 
+    if model.startswith("ollama:"):
+        model_name = model.removeprefix("ollama:")
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        provider = OpenAIProvider(
+            base_url=base_url,
+            api_key="ollama",
+        )
+        return OpenAIModel(model_name, provider=provider)
+
     if model.startswith("glm:"):
         model_name = model.removeprefix("glm:")
         api_key = os.environ.get("GLM_API_KEY", "")

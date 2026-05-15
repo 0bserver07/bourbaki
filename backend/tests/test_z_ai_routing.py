@@ -88,6 +88,51 @@ def test_ollama_cloud_prefix_routes_to_openai_compat(module, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Routing: ollama: → local-daemon OpenAI-compat (default http://localhost:11434/v1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "module",
+    [proposer_mod, reviewer_mod, memory_mod],
+    ids=["proposer", "reviewer", "memory"],
+)
+def test_ollama_prefix_routes_to_local_daemon(module, monkeypatch):
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    model = module._resolve_model_object("ollama:kimi-k2.6:cloud")
+    assert isinstance(model, OpenAIChatModel)
+    assert model.model_name == "kimi-k2.6:cloud"
+    assert "localhost:11434" in str(model.client.base_url)
+
+
+@pytest.mark.parametrize(
+    "module",
+    [proposer_mod, reviewer_mod, memory_mod],
+    ids=["proposer", "reviewer", "memory"],
+)
+def test_ollama_prefix_respects_ollama_base_url_override(module, monkeypatch):
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434/v1")
+    model = module._resolve_model_object("ollama:gpt-oss:120b")
+    assert isinstance(model, OpenAIChatModel)
+    assert model.model_name == "gpt-oss:120b"
+    assert "10.0.0.5" in str(model.client.base_url)
+
+
+def test_ollama_prefix_is_distinct_from_ollama_cloud_prefix(monkeypatch):
+    """``ollama-cloud:foo`` must NOT match the ``ollama:`` branch.
+
+    The ``ollama-cloud:`` branch is checked first; this is a regression
+    guard against someone reordering the branches and silently routing
+    cloud requests to localhost.
+    """
+    monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "test-key")
+    model = proposer_mod._resolve_model_object("ollama-cloud:kimi-k2.6")
+    assert isinstance(model, OpenAIChatModel)
+    assert "ollama.com" in str(model.client.base_url)
+    assert "localhost" not in str(model.client.base_url)
+
+
+# ---------------------------------------------------------------------------
 # Routing: pass-through for plain pydantic_ai strings
 # ---------------------------------------------------------------------------
 

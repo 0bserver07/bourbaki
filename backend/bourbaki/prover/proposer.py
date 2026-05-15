@@ -57,7 +57,14 @@ def _resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicMo
       GLM models; pairs with the args_as_dict shim).
     - ``glm-oai:<model>`` — z.ai's OpenAI-compatible endpoint
       (alternative billing pool / different message-mapping code path).
-    - ``ollama-cloud:<model>`` — Ollama Cloud's OpenAI-compat endpoint.
+    - ``ollama:<model>`` — local Ollama daemon's OpenAI-compat endpoint
+      (default ``http://localhost:11434/v1``, override via
+      ``OLLAMA_BASE_URL``). The daemon transparently proxies ``:cloud``
+      tags to Ollama Cloud, so frontier models (e.g.
+      ``ollama:kimi-k2.6:cloud``, ``ollama:deepseek-v4-pro:cloud``) work
+      without an explicit API key.
+    - ``ollama-cloud:<model>`` — direct Ollama Cloud API at
+      ``https://ollama.com/v1`` (requires ``OLLAMA_CLOUD_API_KEY``).
     - Anything else (e.g. ``openai:gpt-4o``, ``anthropic:claude-sonnet-4-5``)
       is handed to Pydantic AI verbatim.
 
@@ -70,6 +77,15 @@ def _resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicMo
         provider = OpenAIProvider(
             base_url="https://ollama.com/v1",
             api_key=api_key,
+        )
+        return OpenAIChatModel(model_name, provider=provider)
+
+    if model_str.startswith("ollama:"):
+        model_name = model_str.removeprefix("ollama:")
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        provider = OpenAIProvider(
+            base_url=base_url,
+            api_key="ollama",  # dummy; local daemon ignores
         )
         return OpenAIChatModel(model_name, provider=provider)
 
