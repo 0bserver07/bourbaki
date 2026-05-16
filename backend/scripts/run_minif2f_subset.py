@@ -123,10 +123,22 @@ def parse_args() -> argparse.Namespace:
             "for the proposer step (reviewer still uses --model)."
         ),
     )
+    parser.add_argument(
+        "--race-mode",
+        choices=["first_completed", "first_verified"],
+        default="first_completed",
+        help=(
+            "Race semantics for --proposer-models. 'first_completed' "
+            "(default) takes the fastest valid ProposalMessage. "
+            "'first_verified' runs lean_prover on each leg's proposal "
+            "and only declares a winner once it compiles clean — "
+            "trades latency for compile-correctness."
+        ),
+    )
     return parser.parse_args()
 
 
-def _parse_proposer_models(spec: str | None):
+def _parse_proposer_models(spec: str | None, race_mode: str = "first_completed"):
     """Parse ``--proposer-models`` into a list of ``ProposerConfig``.
 
     Empty / None / whitespace-only input returns ``None`` (single-model
@@ -135,6 +147,11 @@ def _parse_proposer_models(spec: str | None):
     string from its optional ``llm_timeout`` (seconds) — we can't use
     ``:`` since model strings already contain colons
     (``ollama-cloud:gpt-oss:120b``).
+
+    When ``race_mode == "first_verified"``, every parsed leg gets
+    ``verify_with_lean=True`` so it's eligible to win the verified race.
+    Without this, the CLI would silently produce an all-downgrade fanout
+    where no leg can ever win.
     """
     if spec is None:
         return None
@@ -142,6 +159,8 @@ def _parse_proposer_models(spec: str | None):
     if not spec:
         return None
     from bourbaki.prover.parallel_proposer import ProposerConfig
+
+    verify = race_mode == "first_verified"
 
     # Split on both ``,`` and ``|`` so callers can use whichever their
     # shell tolerates better.
@@ -164,9 +183,11 @@ def _parse_proposer_models(spec: str | None):
                     f"--proposer-models: bad timeout {timeout_str!r} in "
                     f"entry {entry!r}; expected float seconds"
                 ) from e
-            configs.append(ProposerConfig(model=model, llm_timeout=llm_timeout))
+            configs.append(ProposerConfig(
+                model=model, llm_timeout=llm_timeout, verify_with_lean=verify,
+            ))
         else:
-            configs.append(ProposerConfig(model=entry))
+            configs.append(ProposerConfig(model=entry, verify_with_lean=verify))
     return configs or None
 
 
@@ -195,12 +216,15 @@ def _resolve_problem_ids(args: argparse.Namespace, logger) -> list[str]:
 async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None:
     from bourbaki.benchmarks.minif2f import run_minif2f
 
-    proposer_configs = _parse_proposer_models(args.proposer_models)
+    proposer_configs = _parse_proposer_models(
+        args.proposer_models, race_mode=args.race_mode,
+    )
     if proposer_configs:
         logger.info(
-            "Parallel proposer fanout: %d legs [%s]",
+            "Parallel proposer fanout: %d legs [%s] race_mode=%s",
             len(proposer_configs),
             ", ".join(f"{c.model}@{c.llm_timeout:.0f}s" for c in proposer_configs),
+            args.race_mode,
         )
 
     result = await run_minif2f(
@@ -216,6 +240,7 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
         loop_proposer_llm_timeout=args.proposer_llm_timeout,
         loop_reviewer_llm_timeout=args.reviewer_llm_timeout,
         loop_proposer_configs=proposer_configs,
+        loop_proposer_race_mode=args.race_mode,
         pass_n=args.pass_n,
     )
 
@@ -271,6 +296,7 @@ def main() -> None:
         "proposer_llm_timeout_s": args.proposer_llm_timeout,
         "reviewer_llm_timeout_s": args.reviewer_llm_timeout,
         "proposer_models": args.proposer_models,
+        "race_mode": args.race_mode,
         "source": "--ids" if args.ids else ("--from-file " + args.from_file if args.from_file else "default 35-problem subset"),
     }
     common.banner(

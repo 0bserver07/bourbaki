@@ -531,6 +531,7 @@ async def run_minif2f(
     loop_proposer_llm_timeout: float | None = None,
     loop_reviewer_llm_timeout: float | None = None,
     loop_proposer_configs: list["ProposerConfig"] | None = None,
+    loop_proposer_race_mode: str = "first_completed",
     pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,
@@ -572,6 +573,12 @@ async def run_minif2f(
             supplied, ``ProverLoop`` races those legs via
             :func:`parallel_propose` and the single-model fields are
             ignored for the proposer step (reviewer is unaffected).
+        loop_proposer_race_mode: Race mode forwarded to
+            :func:`parallel_propose`. ``"first_completed"`` (default)
+            picks the fastest valid proposal; ``"first_verified"`` gates
+            each leg on a follow-up ``lean_prover`` call so a
+            fast-but-broken proof loses to a slower-but-compiling peer.
+            Only consulted when ``loop_proposer_configs`` is non-empty.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -643,6 +650,7 @@ async def run_minif2f(
             kwargs["reviewer_llm_timeout"] = loop_reviewer_llm_timeout
         if loop_proposer_configs:
             kwargs["proposer_configs"] = loop_proposer_configs
+            kwargs["proposer_race_mode"] = loop_proposer_race_mode
         return _ProverConfig(**kwargs)
 
     try:
@@ -790,9 +798,16 @@ async def run_minif2f(
                         "llm_timeout": c.llm_timeout,
                         "enable_mathlib_search": c.enable_mathlib_search,
                         "label": c.label,
+                        "verify_with_lean": c.verify_with_lean,
+                        "verify_timeout": c.verify_timeout,
                     }
                     for c in loop_proposer_configs
                 ]
+                if use_loop and loop_proposer_configs
+                else None
+            ),
+            "loop_proposer_race_mode": (
+                loop_proposer_race_mode
                 if use_loop and loop_proposer_configs
                 else None
             ),

@@ -550,3 +550,339 @@ async def test_dispatcher_mixed_legs(monkeypatch):
         "ollama-native:kimi-k2.6": "native",
         "glm:glm-5.1": "glm",
     }
+
+
+# ---------------------------------------------------------------------------
+# 13. race_mode="first_verified": correctness-wins-the-race
+#
+# These tests gate proposal acceptance on a follow-up lean_prover call so a
+# fast-but-broken proposal loses to a slower-but-compiling peer. lean_prover
+# is always mocked with unittest.mock.AsyncMock — we never actually shell out
+# to Lean from the test suite.
+# ---------------------------------------------------------------------------
+
+
+def _ok_verify_result() -> dict:
+    return {"success": True, "errors": None, "rawOutput": "", "codeUsed": ""}
+
+
+def _fail_verify_result(msg: str = "unknown identifier 'fast_junk'") -> dict:
+    return {
+        "success": False,
+        "errors": [{"line": 3, "column": 0, "message": msg, "severity": "error"}],
+        "rawOutput": msg,
+        "codeUsed": "",
+    }
+
+
+async def test_first_verified_single_leg_verifies_and_returns(monkeypatch):
+    """One config, opted into verification: a valid proposal must be fed
+    through lean_prover and only then returned as the winner.
+    """
+    proposal = _make_proposal(code="theorem t : True := trivial")
+    proposer_mock = AsyncMock(return_value=proposal)
+    verify_mock = AsyncMock(return_value=_ok_verify_result())
+
+    monkeypatch.setattr(pp_mod, "run_proposer", proposer_mock)
+    monkeypatch.setattr(pp_mod, "lean_prover", verify_mock)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert out is proposal
+    proposer_mock.assert_awaited_once()
+    verify_mock.assert_awaited_once()
+
+
+async def test_first_verified_slow_compiling_beats_fast_junk(monkeypatch):
+    """Two legs: 'fast_junk' returns a proposal quickly but fails verify.
+    'slow_real' returns later but verifies clean. The slower compiling leg
+    must win the race.
+    """
+    fast_proposal = _make_proposal(code="theorem t : True := <bogus>")
+    slow_proposal = _make_proposal(code="theorem t : True := trivial")
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "fast_junk:m":
+            return fast_proposal
+        # Make the slow leg's propose strictly later than fast leg's
+        # propose+verify-fail so the test result doesn't depend on
+        # scheduler micro-timing.
+        await asyncio.sleep(0.05)
+        return slow_proposal
+
+    async def fake_verify(code, **kwargs):
+        if "<bogus>" in code:
+            return _fail_verify_result("unexpected token '<'")
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(
+                model="fast_junk:m", verify_with_lean=True, label="fast",
+            ),
+            ProposerConfig(
+                model="slow_real:m", verify_with_lean=True, label="slow",
+            ),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert out is slow_proposal
+
+
+async def test_first_verified_all_fail_returns_first_feedback(monkeypatch):
+    """When every leg's verify fails, return the first FeedbackMessage to
+    arrive (chronologically) — same fallback as the legacy mode.
+    """
+    fast_proposal = _make_proposal(code="theorem fast : True := <bogus_a>")
+    slow_proposal = _make_proposal(code="theorem slow : True := <bogus_b>")
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "fast:m":
+            return fast_proposal
+        await asyncio.sleep(0.05)
+        return slow_proposal
+
+    fail_a = _fail_verify_result("first-arrival-failure")
+    fail_b = _fail_verify_result("second-arrival-failure")
+
+    async def fake_verify(code, **kwargs):
+        if "<bogus_a>" in code:
+            return fail_a
+        return fail_b
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(model="fast:m", verify_with_lean=True),
+            ProposerConfig(model="slow:m", verify_with_lean=True),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    # First arrival wins; the synthesized feedback summary embeds the
+    # leg's lean_prover error string.
+    assert "first-arrival-failure" in out.content
+
+
+async def test_first_verified_verify_timeout_is_a_loss(monkeypatch):
+    """If a leg's lean_prover call exceeds ``verify_timeout`` the leg must
+    be treated as a loss (not crash the fanout); a surviving leg's
+    successful verify still wins.
+    """
+    fast_proposal = _make_proposal(code="theorem fast_hang : True := <hang>")
+    slow_proposal = _make_proposal(code="theorem slow_ok : True := trivial")
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "hang:m":
+            return fast_proposal
+        await asyncio.sleep(0.05)
+        return slow_proposal
+
+    async def fake_verify(code, **kwargs):
+        if "<hang>" in code:
+            await asyncio.sleep(10.0)  # asyncio.wait_for will cancel us
+            return _ok_verify_result()
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(
+                model="hang:m", verify_with_lean=True, verify_timeout=0.05,
+            ),
+            ProposerConfig(model="ok:m", verify_with_lean=True),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert out is slow_proposal
+
+
+async def test_first_verified_skips_verify_when_flag_off(monkeypatch):
+    """A leg with ``verify_with_lean=False`` under ``race_mode='first_verified'``
+    must NOT have its lean_prover invoked. The leg's proposal is downgraded
+    to a fallback FeedbackMessage (not eligible to win the verified race);
+    a peer leg that opts in and verifies must win instead.
+    """
+    skip_proposal = _make_proposal(code="theorem skipper : True := trivial")
+    real_proposal = _make_proposal(code="theorem winner : True := trivial")
+
+    verify_call_codes: list[str] = []
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "skip:m":
+            return skip_proposal
+        await asyncio.sleep(0.05)
+        return real_proposal
+
+    async def fake_verify(code, **kwargs):
+        verify_call_codes.append(code)
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(model="skip:m", verify_with_lean=False),
+            ProposerConfig(model="real:m", verify_with_lean=True),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert out is real_proposal
+    # The skip leg's proposal text must never have been verified.
+    assert all("skipper" not in c for c in verify_call_codes)
+    # The real leg's proposal text must have been verified exactly once.
+    assert sum("winner" in c for c in verify_call_codes) == 1
+
+
+async def test_first_completed_default_unchanged(monkeypatch):
+    """Default ``race_mode='first_completed'`` must not call lean_prover at
+    all, even when ``verify_with_lean=True`` is set on a config (the flag
+    is only consulted under first_verified). This is the back-compat
+    guarantee for the existing 14 tests.
+    """
+    proposal = _make_proposal(code="theorem t : True := trivial")
+    proposer_mock = AsyncMock(return_value=proposal)
+    verify_mock = AsyncMock(return_value=_ok_verify_result())
+
+    monkeypatch.setattr(pp_mod, "run_proposer", proposer_mock)
+    monkeypatch.setattr(pp_mod, "lean_prover", verify_mock)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        # default race_mode
+    )
+
+    assert out is proposal
+    verify_mock.assert_not_awaited()
+
+
+async def test_first_verified_winner_cancels_pending_verify(monkeypatch):
+    """When leg A wins under first_verified, leg B's pending propose AND
+    its in-flight verify must both be cancelled.
+    """
+    fast_proposal = _make_proposal(code="theorem fast_winner : True := trivial")
+    slow_proposal = _make_proposal(code="theorem slow_loser : True := trivial")
+
+    slow_propose_started = asyncio.Event()
+    slow_verify_started = asyncio.Event()
+    slow_propose_cancelled = asyncio.Event()
+    slow_verify_cancelled = asyncio.Event()
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "fast:m":
+            # Wait until the slow leg starts its propose before letting
+            # the fast leg complete; otherwise the fast leg may finish
+            # before the slow leg's task is even scheduled.
+            await slow_propose_started.wait()
+            return fast_proposal
+        slow_propose_started.set()
+        try:
+            # Long enough for the fast leg to verify and win before us.
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            slow_propose_cancelled.set()
+            raise
+        return slow_proposal
+
+    async def fake_verify(code, **kwargs):
+        if "fast_winner" in code:
+            return _ok_verify_result()
+        # The slow leg's verify should never start (we cancel it via the
+        # task hierarchy when the fast leg wins). Track it regardless so
+        # the test fails loudly if cancellation regresses.
+        slow_verify_started.set()
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            slow_verify_cancelled.set()
+            raise
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(model="fast:m", verify_with_lean=True, label="fast"),
+            ProposerConfig(model="slow:m", verify_with_lean=True, label="slow"),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert out is fast_proposal
+    # The slow leg's propose was definitely in flight (it set the gate).
+    # parallel_propose's cancel + gather must have fired CancelledError
+    # inside its propose body. Equivalent test for verify is gated on
+    # whether the slow leg's verify even started — usually it didn't,
+    # but if scheduling lets it start it must also observe cancellation.
+    assert slow_propose_cancelled.is_set()
+    if slow_verify_started.is_set():
+        assert slow_verify_cancelled.is_set()
+
+
+async def test_first_verified_logs_verify_outcomes(monkeypatch, caplog):
+    """INFO logs under first_verified must include the per-leg verifying /
+    VERIFIED / failed messages so on-call humans can see why a race went
+    the way it did.
+    """
+    fast_proposal = _make_proposal(code="theorem t : True := <bogus>")
+    slow_proposal = _make_proposal(code="theorem t : True := trivial")
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "fast:m":
+            return fast_proposal
+        await asyncio.sleep(0.05)
+        return slow_proposal
+
+    async def fake_verify(code, **kwargs):
+        if "<bogus>" in code:
+            return _fail_verify_result("syntax error")
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    with caplog.at_level(logging.INFO, logger=pp_mod.logger.name):
+        out = await parallel_propose(
+            _make_state(),
+            [
+                ProposerConfig(
+                    model="fast:m", verify_with_lean=True, label="fast",
+                ),
+                ProposerConfig(
+                    model="slow:m", verify_with_lean=True, label="slow",
+                ),
+            ],
+            race_mode="first_verified",
+        )
+
+    assert out is slow_proposal
+    msgs = [rec.getMessage() for rec in caplog.records]
+    # Both legs emit a "verifying..." line.
+    assert sum("verifying..." in m for m in msgs) >= 2
+    # The fast leg's verify_fail summary is in the logs.
+    assert any("failed lean_prover" in m and "fast" in m for m in msgs)
+    # The slow leg's VERIFIED summary is in the logs.
+    assert any("VERIFIED" in m and "slow" in m for m in msgs)

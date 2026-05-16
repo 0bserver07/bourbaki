@@ -65,6 +65,14 @@ class ProverConfig(BaseModel):
     # ``model`` / ``proposer_llm_timeout`` fields are ignored for the
     # proposer step. Reviewer is unaffected — always single-model.
     proposer_configs: list["ProposerConfig"] | None = None
+    # Race mode forwarded to :func:`parallel_propose`. Only consulted
+    # when ``proposer_configs`` is non-empty. ``"first_completed"``
+    # (default) preserves the original speed-wins-the-race primitive.
+    # ``"first_verified"`` gates each leg on ``lean_prover`` before
+    # declaring a winner — trades latency for compile-correctness.
+    proposer_race_mode: Literal["first_completed", "first_verified"] = (
+        "first_completed"
+    )
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -192,7 +200,11 @@ class ProverLoop:
         # each ``ProposerConfig`` carries its own.  No outer cap is
         # imposed here: per-leg ``llm_timeout`` governs.
         if self.config.proposer_configs:
-            return await parallel_propose(state, self.config.proposer_configs)
+            return await parallel_propose(
+                state,
+                self.config.proposer_configs,
+                race_mode=self.config.proposer_race_mode,
+            )
         return await run_proposer(
             state,
             model=self.config.model,
