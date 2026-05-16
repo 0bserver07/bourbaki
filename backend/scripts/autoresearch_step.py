@@ -132,8 +132,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--per-problem-timeout",
         type=int,
-        default=300,
-        help="Per-problem timeout passed to the inner runner (default: 300s).",
+        default=1500,
+        help=(
+            "Per-problem timeout passed to the inner runner (default: 1500s). "
+            "Bumped from 300s — with race_mode=first_verified, each leg waits "
+            "60-180s for lean_prover, so 300s is below the floor for most "
+            "fanout configurations."
+        ),
     )
     parser.add_argument(
         "--benchmark-timeout",
