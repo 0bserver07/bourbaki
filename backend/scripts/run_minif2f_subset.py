@@ -128,14 +128,33 @@ def parse_args() -> argparse.Namespace:
         choices=["first_completed", "first_verified"],
         default="first_completed",
         help=(
-            "Race semantics for --proposer-models. 'first_completed' "
-            "(default) takes the fastest valid ProposalMessage. "
-            "'first_verified' runs lean_prover on each leg's proposal "
-            "and only declares a winner once it compiles clean — "
-            "trades latency for compile-correctness."
+            "Race semantics for --proposer-models / --smart-fanout. "
+            "'first_completed' (default) takes the fastest valid "
+            "ProposalMessage. 'first_verified' runs lean_prover on each "
+            "leg's proposal and only declares a winner once it compiles "
+            "clean — trades latency for compile-correctness."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--smart-fanout",
+        choices=["minimal", "balanced", "max"],
+        default=None,
+        help=(
+            "Auto-construct a multi-provider fanout from whichever API "
+            "keys are available in the environment, no --proposer-models "
+            "spec required. 'minimal' = baseline + 1 frontier (2 legs); "
+            "'balanced' = baseline + 2 frontier + claude-if-available "
+            "(3-4 legs); 'max' = every eligible leg (up to 7). Mutually "
+            "exclusive with --proposer-models."
+        ),
+    )
+    args = parser.parse_args()
+    if args.smart_fanout and args.proposer_models:
+        parser.error(
+            "--smart-fanout and --proposer-models are mutually exclusive; "
+            "pick one"
+        )
+    return args
 
 
 def _parse_proposer_models(spec: str | None, race_mode: str = "first_completed"):
@@ -213,12 +232,37 @@ def _resolve_problem_ids(args: argparse.Namespace, logger) -> list[str]:
         sys.exit(2)
 
 
+def _resolve_proposer_configs(args: argparse.Namespace, logger):
+    """Resolve proposer fanout configs from CLI args.
+
+    Precedence: ``--smart-fanout`` (auto-built from env) takes priority
+    when set; argparse already rejects the combination with
+    ``--proposer-models``. When neither flag is set, returns ``None`` so
+    the loop falls back to the legacy single-model path.
+    """
+    if args.smart_fanout:
+        from bourbaki.config import export_api_keys
+        from bourbaki.prover.default_fanout import smart_default_fanout
+
+        export_api_keys()  # bridge Settings → env before probing keys
+        verify = args.race_mode == "first_verified"
+        configs = smart_default_fanout(tier=args.smart_fanout, verify_with_lean=verify)
+        logger.info(
+            "smart_default_fanout: selected %d legs [%s] (tier=%s)",
+            len(configs),
+            ", ".join(c.label or c.model for c in configs),
+            args.smart_fanout,
+        )
+        return configs
+    return _parse_proposer_models(
+        args.proposer_models, race_mode=args.race_mode,
+    )
+
+
 async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None:
     from bourbaki.benchmarks.minif2f import run_minif2f
 
-    proposer_configs = _parse_proposer_models(
-        args.proposer_models, race_mode=args.race_mode,
-    )
+    proposer_configs = _resolve_proposer_configs(args, logger)
     if proposer_configs:
         logger.info(
             "Parallel proposer fanout: %d legs [%s] race_mode=%s",
@@ -296,6 +340,7 @@ def main() -> None:
         "proposer_llm_timeout_s": args.proposer_llm_timeout,
         "reviewer_llm_timeout_s": args.reviewer_llm_timeout,
         "proposer_models": args.proposer_models,
+        "smart_fanout": args.smart_fanout,
         "race_mode": args.race_mode,
         "source": "--ids" if args.ids else ("--from-file " + args.from_file if args.from_file else "default 35-problem subset"),
     }
