@@ -222,6 +222,54 @@ def test_build_user_message_appends_experience():
     assert msg.endswith("<experience>EXP</experience>")
 
 
+def test_build_user_message_renders_lean_verify_failed_feedback():
+    """When the prior feedback is ``lean_verify_failed`` (emitted by the
+    parallel proposer under race_mode=first_verified), its content must
+    flow verbatim into the proposer user message so the next iteration's
+    LLM sees the actual Lean error — not a generic "fix your JSON" hint.
+    """
+    last_proposal = ProposalMessage(
+        reasoning="prior reasoning",
+        code="theorem t : True := omega",
+        iteration=1,
+    )
+    last_feedback = FeedbackMessage(
+        kind="lean_verify_failed",
+        content=(
+            "<feedback>\n"
+            "Your previous proposal parsed as valid JSON but `lean_prover` "
+            "rejected the proof body with these errors:\n\n"
+            "line 18: DISTINCTIVE-OMEGA-ERROR\n\n"
+            "Read the error carefully and emit a DIFFERENT proof body that "
+            "addresses the specific issue. Do NOT just re-emit the same "
+            "tactics — the failure is in the math/tactic logic, not the JSON shape.\n"
+            "</feedback>"
+        ),
+        is_success=False,
+        is_terminal=False,
+    )
+
+    state = ProverState(
+        problem_id="p1",
+        target_theorem="theorem t : True := sorry",
+        full_file="-- file --",
+        iteration=1,
+        max_iterations=8,
+        last_proposal=last_proposal,
+        last_feedback=last_feedback,
+    )
+
+    msg = _build_user_message(state)
+    # The Lean error string is visible to the next-iteration proposer.
+    assert "DISTINCTIVE-OMEGA-ERROR" in msg
+    # The feedback wrapper text is included (so the LLM understands the
+    # JSON was fine and the rejection came from the compiler).
+    assert "`lean_prover` rejected" in msg
+    # The prior proposal's code is also in the message — same path as
+    # any other feedback kind.
+    assert "theorem t : True := omega" in msg
+
+
 # ---------------------------------------------------------------------------
 # Error handling: ValidationError / UnexpectedModelBehavior
 # ---------------------------------------------------------------------------

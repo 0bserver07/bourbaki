@@ -81,7 +81,10 @@ class ProposerConfig:
             When True, the leg's :class:`ProposalMessage` is fed through
             :func:`lean_prover` against
             :func:`assemble_standalone_proof(state.preamble, proposal.code)`;
-            only a ``success=True`` return makes the leg eligible to win.
+            only a ``proofComplete=True`` return makes the leg eligible
+            to win (matching the reviewer's final gate byte-for-byte —
+            ``success=True`` is too lenient because it ignores non-zero
+            return codes and substring ``sorry`` in comments).
             When False, the leg's proposal is recorded as a fallback but
             it cannot win the verified race — so a fast unverified leg
             never undercuts a slower compiling peer. No effect under
@@ -249,7 +252,22 @@ async def parallel_propose(
             )
 
         verify_s = time.monotonic() - verify_start
-        if verify_result.get("success"):
+        # Use ``proofComplete`` (not ``success``) so the leg's acceptance
+        # criterion matches the reviewer's final ``lean_prover`` gate
+        # (``reviewer.py`` and ``prover.ProverLoop._final_lean_gate``).
+        # ``success`` only reports ``not has_errors`` — it returns True
+        # when ``lake env lean`` exits non-zero with no regex-matched
+        # errors, OR when the code contains the substring ``sorry``
+        # anywhere (including a comment). The reviewer checks
+        # ``proofComplete = return_code == 0 and not has_errors and not
+        # has_sorry``. Using ``success`` here meant a leg could declare
+        # VERIFIED on a proof the reviewer's identical-source compile
+        # would reject — and since the leg's win drives the loop into
+        # builder → reviewer with the same code, the gate split produced
+        # an infinite "verified-then-rejected" cycle (observed on
+        # ``aime_1988_p3`` iter 1..N during the 2026-05-15 first_verified
+        # benchmark). Aligning the two checks closes the cycle.
+        if verify_result.get("proofComplete"):
             logger.info(
                 "parallel_propose[verified]: %s VERIFIED after %.1fs "
                 "(proposed in %.1fs, verified in %.1fs)",
@@ -268,8 +286,13 @@ async def parallel_propose(
             prop_s,
             err_summary,
         )
-        return feedback.structured_output_parsing_failed(
-            f"leg {label} verify failed: {err_summary}"
+        # Use the dedicated lean_verify_failed factory so the proposer's
+        # next-iteration prompt sees the actual Lean error (not a generic
+        # "fix your JSON" message). feedback.summarize_lean_errors gives
+        # up to 3 errors at 400 chars total — log message stays short,
+        # feedback payload carries the real signal.
+        return feedback.lean_verify_failed(
+            feedback.summarize_lean_errors(verify_result)
         )
 
     async def _run_one(cfg: ProposerConfig) -> ProposalMessage | FeedbackMessage:

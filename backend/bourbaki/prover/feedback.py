@@ -121,6 +121,61 @@ def structured_output_parsing_failed(error_message: str) -> FeedbackMessage:
     return FeedbackMessage(kind="structured_output_parsing_failed", content=content)
 
 
+def lean_verify_failed(error_summary: str) -> FeedbackMessage:
+    """The proposer emitted parseable JSON but ``lean_prover`` REJECTED the proof.
+
+    Qualitatively different from :func:`structured_output_parsing_failed`
+    (which means "JSON was malformed"). Here the JSON was fine — Lean
+    rejected the proof itself. The proposer's next iteration needs to see
+    the actual Lean error (e.g., "Tactic `rewrite` failed", "unsolved
+    goals", "application type mismatch") so it doesn't re-emit the same
+    broken tactic.
+
+    Used exclusively by :mod:`bourbaki.prover.parallel_proposer` under
+    ``race_mode="first_verified"`` when a leg's :func:`lean_prover` call
+    returns a non-successful result.
+    """
+    content = (
+        "<feedback>\n"
+        "Your previous proposal parsed as valid JSON but `lean_prover` "
+        "rejected the proof body with these errors:\n\n"
+        f"{error_summary}\n\n"
+        "Read the error carefully and emit a DIFFERENT proof body that "
+        "addresses the specific issue. Do NOT just re-emit the same "
+        "tactics — the failure is in the math/tactic logic, not the JSON shape.\n"
+        "</feedback>"
+    )
+    return FeedbackMessage(kind="lean_verify_failed", content=content)
+
+
+def summarize_lean_errors(verify_result: dict, max_errors: int = 3, max_chars: int = 400) -> str:
+    """Render the most useful error info from a ``lean_prover`` result.
+
+    Used by :func:`lean_verify_failed` to build the feedback content the
+    proposer sees on its next iteration. Returns at most ``max_errors``
+    error messages joined with ``; ``, then truncates to ``max_chars`` so
+    the proposer's user prompt stays bounded even on pathological
+    compiler outputs.
+    """
+    errors = verify_result.get("errors") or []
+    if errors:
+        head = errors[:max_errors]
+        rendered = "; ".join(
+            f"line {e.get('line', '?')}: {e.get('message', '')}" for e in head
+        )
+        if len(errors) > max_errors:
+            rendered += f" (+{len(errors) - max_errors} more)"
+    elif verify_result.get("error"):
+        rendered = str(verify_result["error"])
+    elif verify_result.get("rawOutput"):
+        rendered = str(verify_result["rawOutput"])
+    else:
+        rendered = "unknown error"
+    if len(rendered) > max_chars:
+        rendered = rendered[: max_chars - 3] + "..."
+    return rendered
+
+
 def _truncate_middle(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text

@@ -229,6 +229,7 @@ def test_factory_kinds_are_unique():
         fb.review_rejected("r"),
         fb.max_iterations(1),
         fb.structured_output_parsing_failed("e"),
+        fb.lean_verify_failed("e"),
     ]
     kinds = [f.kind for f in factories]
     assert len(kinds) == len(set(kinds))
@@ -263,6 +264,7 @@ def test_only_terminal_factories_are_terminal():
         "review_rejected": fb.review_rejected("r"),
         "max_iterations": fb.max_iterations(1),
         "structured_output_parsing_failed": fb.structured_output_parsing_failed("e"),
+        "lean_verify_failed": fb.lean_verify_failed("e"),
     }
     for kind, msg in factories.items():
         assert msg.is_terminal == (kind in terminal_kinds), kind

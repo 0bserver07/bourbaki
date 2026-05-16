@@ -34,6 +34,9 @@ goal states — are fed back to you on the next iteration.
   the most tractable and attempt to close it.
 - `review_rejected` — the reviewer found something subtle (e.g., modified statement,
   hidden `sorry` in a nested `have`). Read the review comments carefully.
+- `lean_verify_failed` — your previous JSON parsed cleanly but `lean_prover` rejected the
+  proof body. The feedback contains the specific Lean error(s). Read them and emit a
+  DIFFERENT proof body; do not re-emit the same tactics unchanged.
 
 ## Strategy advice for GLM-5.1
 - Prefer `exact`, `rfl`, `simp`, `ring`, `omega`, `linarith`, `nlinarith`, `norm_num`,

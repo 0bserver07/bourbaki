@@ -563,12 +563,23 @@ async def test_dispatcher_mixed_legs(monkeypatch):
 
 
 def _ok_verify_result() -> dict:
-    return {"success": True, "errors": None, "rawOutput": "", "codeUsed": ""}
+    # Mirror the real ``lean_prover`` return shape: a clean compile yields
+    # both ``success=True`` AND ``proofComplete=True``. The latter is what
+    # the leg-verify gate checks (matching the reviewer's final gate), so
+    # the fixture must include it.
+    return {
+        "success": True,
+        "proofComplete": True,
+        "errors": None,
+        "rawOutput": "",
+        "codeUsed": "",
+    }
 
 
 def _fail_verify_result(msg: str = "unknown identifier 'fast_junk'") -> dict:
     return {
         "success": False,
+        "proofComplete": False,
         "errors": [{"line": 3, "column": 0, "message": msg, "severity": "error"}],
         "rawOutput": msg,
         "codeUsed": "",
@@ -886,3 +897,267 @@ async def test_first_verified_logs_verify_outcomes(monkeypatch, caplog):
     assert any("failed lean_prover" in m and "fast" in m for m in msgs)
     # The slow leg's VERIFIED summary is in the logs.
     assert any("VERIFIED" in m and "slow" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# 14. race_mode="first_verified": verify-fail surfaces as ``lean_verify_failed``
+#
+# When lean_prover rejects a leg's proposal, the resulting FeedbackMessage
+# must carry the actual Lean error(s) (so the proposer's next iteration
+# fixes the math/tactic, not the JSON shape). This is the regression
+# guard for the previous behaviour, which mis-surfaced verify rejects as
+# ``structured_output_parsing_failed``.
+# ---------------------------------------------------------------------------
+
+
+async def test_first_verified_verify_fail_returns_lean_verify_failed(monkeypatch):
+    """Single leg under first_verified: proposer emits parseable JSON,
+    lean_prover returns ``success=False`` with errors → fanout returns a
+    ``lean_verify_failed`` FeedbackMessage (NOT ``structured_output_parsing_failed``).
+    """
+    proposal = _make_proposal(code="theorem t : True := <bogus>")
+    proposer_mock = AsyncMock(return_value=proposal)
+    fail_result = _fail_verify_result("omega could not prove the goal")
+    verify_mock = AsyncMock(return_value=fail_result)
+
+    monkeypatch.setattr(pp_mod, "run_proposer", proposer_mock)
+    monkeypatch.setattr(pp_mod, "lean_prover", verify_mock)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    assert out.kind == "lean_verify_failed"
+    assert out.is_terminal is False
+    assert out.is_success is False
+    proposer_mock.assert_awaited_once()
+    verify_mock.assert_awaited_once()
+
+
+async def test_first_verified_verify_fail_content_includes_lean_error(monkeypatch):
+    """The ``lean_verify_failed`` feedback's ``content`` must include the
+    first Lean error message verbatim so the next iteration's prompt
+    contains the actual signal the proposer needs.
+    """
+    proposal = _make_proposal(code="theorem t : True := <bogus>")
+    proposer_mock = AsyncMock(return_value=proposal)
+    # Multiple errors: the first 2-3 should appear in the rendered summary.
+    multi_err_result = {
+        "success": False,
+        "errors": [
+            {"line": 18, "column": 0, "message": "DISTINCTIVE-ERR-A", "severity": "error"},
+            {"line": 22, "column": 4, "message": "DISTINCTIVE-ERR-B", "severity": "error"},
+            {"line": 30, "column": 2, "message": "DISTINCTIVE-ERR-C", "severity": "error"},
+        ],
+        "rawOutput": "",
+        "codeUsed": "",
+    }
+    verify_mock = AsyncMock(return_value=multi_err_result)
+
+    monkeypatch.setattr(pp_mod, "run_proposer", proposer_mock)
+    monkeypatch.setattr(pp_mod, "lean_prover", verify_mock)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    assert out.kind == "lean_verify_failed"
+    # The first lean error message is embedded verbatim.
+    assert "DISTINCTIVE-ERR-A" in out.content
+    # Line numbers are preserved so the proposer can correlate with its own code.
+    assert "line 18" in out.content
+    # The feedback prose mentions lean_prover so the proposer knows the
+    # JSON parsed fine and the rejection came from the compiler.
+    assert "lean_prover" in out.content
+
+
+async def test_first_verified_first_arrived_lean_verify_failed_wins(monkeypatch):
+    """When every leg fails verify, the first-arrived FeedbackMessage is the
+    winner — matches the existing "first feedback wins" semantics. The
+    surviving feedback must be ``lean_verify_failed`` (not the legacy
+    parse-failed kind) and embed the first-arrived leg's error string.
+    """
+    fast_proposal = _make_proposal(code="theorem fast : True := <bogus_a>")
+    slow_proposal = _make_proposal(code="theorem slow : True := <bogus_b>")
+
+    async def dispatch(state, *, model, **kwargs):
+        if model == "fast:m":
+            return fast_proposal
+        await asyncio.sleep(0.05)
+        return slow_proposal
+
+    fail_a = _fail_verify_result("FIRST-LEAN-ERR")
+    fail_b = _fail_verify_result("SECOND-LEAN-ERR")
+
+    async def fake_verify(code, **kwargs):
+        if "<bogus_a>" in code:
+            return fail_a
+        return fail_b
+
+    monkeypatch.setattr(pp_mod, "run_proposer", dispatch)
+    monkeypatch.setattr(pp_mod, "lean_prover", fake_verify)
+
+    out = await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(model="fast:m", verify_with_lean=True),
+            ProposerConfig(model="slow:m", verify_with_lean=True),
+        ],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    assert out.kind == "lean_verify_failed"
+    # Chronological first-arrival is preserved.
+    assert "FIRST-LEAN-ERR" in out.content
+    assert "SECOND-LEAN-ERR" not in out.content
+
+
+async def test_first_completed_parse_failure_still_surfaces_as_parse_failed(monkeypatch):
+    """Under the default ``race_mode='first_completed'`` (no verification),
+    a proposer that returns a parse-failed FeedbackMessage must still
+    surface as ``structured_output_parsing_failed``. The new
+    ``lean_verify_failed`` kind is exclusive to the first_verified path.
+    """
+    parse_fail = FeedbackMessage(
+        kind="structured_output_parsing_failed",
+        content="malformed json",
+        is_success=False,
+        is_terminal=False,
+    )
+
+    async def returns_parse_fail(state, **kwargs):
+        return parse_fail
+
+    monkeypatch.setattr(pp_mod, "run_proposer", returns_parse_fail)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1")],
+        # default race_mode="first_completed"
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    assert out.kind == "structured_output_parsing_failed"
+    assert out.kind != "lean_verify_failed"
+
+
+# ---------------------------------------------------------------------------
+# Regression: leg verify must match the reviewer's final-gate criterion.
+#
+# ``lean_prover`` returns BOTH ``success`` (``not has_errors``) AND
+# ``proofComplete`` (``return_code == 0 and not has_errors and not
+# has_sorry``). The two flags can disagree: a non-zero return code
+# (Lean panic / elaborator timeout / stderr noise that didn't match the
+# error regex) leaves ``success=True`` / ``proofComplete=False``; so
+# does any occurrence of the substring ``"sorry"`` in the source
+# (including inside a comment).
+#
+# The reviewer's final ``lean_prover`` gate (``reviewer.py``,
+# ``ProverLoop._final_lean_gate``) checks ``proofComplete``. Before
+# this fix, the leg verify checked the laxer ``success`` — so a leg
+# could declare VERIFIED on the exact code the reviewer's
+# identical-source compile would reject. The loop entered a silent
+# spin ("verified" → rejected → next iter → "verified" → rejected …)
+# with no log line between, because builder/reviewer rejections are
+# at DEBUG / no log levels. This was observed on ``aime_1988_p3`` in
+# the 2026-05-15 first_verified benchmark, iter 1..N consecutive.
+# ---------------------------------------------------------------------------
+
+
+async def test_first_verified_rejects_success_true_but_not_proof_complete(monkeypatch):
+    """A verify result with ``success=True`` / ``proofComplete=False`` must
+    NOT be accepted by the leg verify.
+
+    The reviewer's final ``lean_prover`` gate checks ``proofComplete``;
+    if the leg accepted on the laxer ``success`` flag, the loop would
+    spin forever on a proof the reviewer immediately rejects. The leg
+    must downgrade to a verify-failed feedback so the loop can iterate
+    with real signal rather than re-racing the same broken proof.
+    """
+    proposal = _make_proposal(code="theorem t : True := trivial")
+    monkeypatch.setattr(pp_mod, "run_proposer", AsyncMock(return_value=proposal))
+
+    # ``success=True`` is set by ``not has_errors``; ``proofComplete=False``
+    # is set when ``return_code != 0`` (e.g. Lean panic / elaborator
+    # timeout where stderr didn't match the error regex) OR when the
+    # code contains the substring ``"sorry"`` anywhere (including a
+    # comment). Both are real conditions under which the reviewer's
+    # final compile would reject — so the leg must reject too.
+    half_baked = {
+        "success": True,
+        "proofComplete": False,
+        "errors": None,
+        "rawOutput": "(non-zero exit, no parseable error)",
+        "codeUsed": "",
+    }
+    monkeypatch.setattr(pp_mod, "lean_prover", AsyncMock(return_value=half_baked))
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage), (
+        "leg accepted success=True/proofComplete=False — the reviewer's "
+        "final gate would reject the same code, causing an infinite loop"
+    )
+
+
+async def test_first_verified_accepts_proof_complete_true(monkeypatch):
+    """The flip side: ``proofComplete=True`` is the affirmative signal the
+    reviewer's final gate looks for; the leg must accept on the same
+    flag and return the proposal as a winner.
+    """
+    proposal = _make_proposal(code="theorem t : True := trivial")
+    monkeypatch.setattr(pp_mod, "run_proposer", AsyncMock(return_value=proposal))
+    ok = {
+        "success": True,
+        "proofComplete": True,
+        "errors": None,
+        "rawOutput": "",
+        "codeUsed": "",
+    }
+    monkeypatch.setattr(pp_mod, "lean_prover", AsyncMock(return_value=ok))
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert out is proposal
+
+
+async def test_first_verified_rejects_when_proof_complete_missing(monkeypatch):
+    """If the ``lean_prover`` return dict omits ``proofComplete`` entirely
+    (e.g. an older code path or a malformed shim), the leg must NOT
+    silently accept. ``.get('proofComplete')`` returning ``None`` is
+    falsy — same as ``False`` — so the leg downgrades to verify-failed
+    feedback rather than letting an under-specified result win.
+
+    This guards against future regressions where someone might assume
+    ``success=True`` implies ``proofComplete=True``. The two flags are
+    independent fields in the ``lean_prover`` contract.
+    """
+    proposal = _make_proposal(code="theorem t : True := trivial")
+    monkeypatch.setattr(pp_mod, "run_proposer", AsyncMock(return_value=proposal))
+    # Missing ``proofComplete`` key entirely — pre-fix this passed because
+    # the gate looked at ``success`` instead.
+    legacy_shape = {"success": True, "errors": None, "rawOutput": "", "codeUsed": ""}
+    monkeypatch.setattr(pp_mod, "lean_prover", AsyncMock(return_value=legacy_shape))
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="m:1", verify_with_lean=True)],
+        race_mode="first_verified",
+    )
+
+    assert isinstance(out, FeedbackMessage)
