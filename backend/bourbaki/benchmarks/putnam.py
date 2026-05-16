@@ -182,6 +182,11 @@ class ProblemResult:
     tactics_used: int = 0
     duration_seconds: float = 0.0
     attempts: int = 0
+    # Pass@N: which sampling round produced this result (1-indexed).
+    # Always 1 when not running under attempt_proof_pass_at_n.  Mirrors
+    # the miniF2F-side field of the same name so the saved JSON for
+    # Putnam runs surfaces which sample-of-N won when Pass@N is enabled.
+    attempts_pass_n: int = 1
     skipped: bool = False
     skip_reason: str | None = None
 
@@ -199,6 +204,7 @@ class ProblemResult:
             "tactics_used": self.tactics_used,
             "duration_seconds": round(self.duration_seconds, 2),
             "attempts": self.attempts,
+            "attempts_pass_n": self.attempts_pass_n,
         }
         if self.skipped:
             d["skipped"] = True
@@ -283,7 +289,11 @@ def _loop_result_to_putnam(
 
     The two dataclasses are structurally similar; the Putnam one adds
     ``year``, ``section``, and ``has_answer`` columns drawn from the
-    source problem (these aren't on the miniF2F result).
+    source problem (these aren't on the miniF2F result).  Pass@N's
+    ``attempts_pass_n`` is forwarded so the saved JSON for Putnam runs
+    surfaces which sample-of-N won when Pass@N is enabled — without
+    this carry the Putnam result silently drops the field on every
+    run.
     """
     return ProblemResult(
         problem_id=loop_result.problem_id,
@@ -298,6 +308,7 @@ def _loop_result_to_putnam(
         tactics_used=loop_result.tactics_used,
         duration_seconds=loop_result.duration_seconds,
         attempts=loop_result.attempts,
+        attempts_pass_n=getattr(loop_result, "attempts_pass_n", 1),
     )
 
 

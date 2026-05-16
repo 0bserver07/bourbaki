@@ -431,8 +431,30 @@ async def attempt_proof_pass_at_n(
     if n < 1:
         raise ValueError(f"Pass@N requires n >= 1, got n={n}")
 
+    # Per-attempt start-of-run log only fires when n > 1 — a Pass@1 call is
+    # the no-op degenerate case and the loop's own logs are enough.  When
+    # n > 1 we want each attempt's launch to be greppable so a reader of
+    # a multi-hour run log can see which sample-of-N is currently going
+    # through the fanout (the proposer logs don't carry the pass-n index).
+    fanout_size = (
+        len(config.proposer_configs)
+        if config is not None and config.proposer_configs
+        else None
+    )
+
     last_result: ProblemResult | None = None
     for i in range(1, n + 1):
+        if n > 1:
+            if fanout_size:
+                logger.info(
+                    "pass-n attempt %d/%d: launching fanout [%d legs] for %s",
+                    i, n, fanout_size, problem.id,
+                )
+            else:
+                logger.info(
+                    "pass-n attempt %d/%d: launching single-model loop for %s",
+                    i, n, problem.id,
+                )
         result = await attempt_proof_loop(
             problem,
             session,
