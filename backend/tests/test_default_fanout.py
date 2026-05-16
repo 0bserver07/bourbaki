@@ -52,25 +52,28 @@ def test_only_glm_returns_baseline_only(monkeypatch: pytest.MonkeyPatch) -> None
         assert cfgs[0].llm_timeout == 90.0
 
 
-def test_only_ollama_cloud_returns_four_ollama_legs(
+def test_only_ollama_cloud_returns_six_ollama_legs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OLLAMA_CLOUD_API_KEY alone unlocks gpt-oss, qwen3-coder, kimi, and deepseek.
+    """OLLAMA_CLOUD_API_KEY alone unlocks the full ollama family.
 
     In ``max`` mode every eligible profile is included. The order
     asserts the deterministic ``_PROFILES`` ordering (frontier first,
-    then coder, then the two reasoning legs).
+    then coder, then the two non-streaming reasoning legs, then the
+    two streaming early-cancel reasoning legs).
     """
     monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "y")
 
     cfgs = smart_default_fanout(tier="max")
-    assert len(cfgs) == 4
+    assert len(cfgs) == 6
     models = [c.model for c in cfgs]
     assert models == [
         "ollama-cloud:gpt-oss:120b",
         "ollama-cloud:qwen3-coder:480b",
         "ollama-native:kimi-k2.6",
         "ollama-native:deepseek-v4-pro",
+        "ollama-stream:kimi-k2.6",
+        "ollama-stream:deepseek-v4-pro",
     ]
 
 
@@ -80,9 +83,12 @@ def test_glm_plus_ollama_balanced_returns_three_legs(
     """The realistic user environment: GLM + OLLAMA_CLOUD keys.
 
     Balanced policy: cheap GLM baseline + the first two diversity legs
-    (gpt-oss + qwen3-coder), no Claude available → 3 legs total.
+    (gpt-oss + qwen3-coder), no Claude available → 3 legs total. The
+    ``reasoning-fast`` streaming legs are excluded from balanced (only
+    eligible under ``max``) so they don't push out coder/frontier.
 
-    Max policy on the same env yields all 5 eligible profiles.
+    Max policy on the same env yields all 7 eligible profiles
+    (1 baseline + 2 ollama-cloud + 2 ollama-native + 2 ollama-stream).
     """
     monkeypatch.setenv("GLM_API_KEY", "x")
     monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "y")
@@ -95,22 +101,29 @@ def test_glm_plus_ollama_balanced_returns_three_legs(
     ]
 
     full = smart_default_fanout(tier="max")
-    assert len(full) == 5
+    assert len(full) == 7
 
 
-def test_all_keys_max_returns_seven_legs(
+def test_all_keys_max_returns_every_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With every key set, ``max`` returns every profile (7 legs)."""
+    """With every key set, ``max`` returns every profile.
+
+    The streaming ``reasoning-fast`` variants race alongside the
+    non-streaming reasoning legs (both kimi and deepseek appear twice,
+    once per adapter).
+    """
     for key in _ALL_KEYS:
         monkeypatch.setenv(key, "k")
 
     cfgs = smart_default_fanout(tier="max")
     assert len(cfgs) == len(_PROFILES)
-    # Anthropic and OpenAI legs must be present.
+    # Anthropic, OpenAI, and streaming legs must be present.
     labels = [c.label for c in cfgs]
     assert "claude-sonnet" in labels
     assert "openai-gpt5-mini" in labels
+    assert "kimi-stream" in labels
+    assert "deepseek-stream" in labels
 
 
 def test_include_roles_baseline_only_returns_glm(

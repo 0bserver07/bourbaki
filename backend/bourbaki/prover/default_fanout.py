@@ -29,7 +29,9 @@ Roles
 Each profile has a ``role`` tag the tier filter uses to compose the
 fanout. Roles are intentionally fuzzy — ``baseline`` is the "always-on"
 cheap leg, ``frontier`` covers the heaviest open-weights, ``reasoning``
-is for thinking models routed through ``ollama-native:``, ``coder`` for
+is for thinking models routed through ``ollama-native:``,
+``reasoning-fast`` is for the same thinking models routed through the
+streaming early-cancel adapter (``ollama-stream:``), ``coder`` for
 Lean-tuned coders, ``claude`` / ``openai`` for the proprietary peers
 when their keys are available. Callers can override the role mix via
 ``include_roles`` if they want e.g. only ``claude`` + ``baseline``.
@@ -85,6 +87,8 @@ class ModelProfile:
             - ``frontier``: heaviest open-weights (gpt-oss:120b)
             - ``coder``: Lean-tuned coder (qwen3-coder:480b)
             - ``reasoning``: thinking models via ollama-native (kimi, deepseek)
+            - ``reasoning-fast``: same thinking models via ollama-stream
+              (early-cancel; only eligible under the ``max`` tier)
             - ``claude``: Anthropic peer
             - ``openai``: OpenAI peer
     """
@@ -143,6 +147,29 @@ _PROFILES: tuple[ModelProfile, ...] = (
         ),
         required_env_var="OLLAMA_CLOUD_API_KEY",
         role="reasoning",
+    ),
+    # Ollama Stream — Kimi via streaming /api/chat with early-cancel.
+    # Shorter llm_timeout because streaming is meant to be 3-5x faster than
+    # the non-streaming reasoning path. ``reasoning-fast`` role is filtered
+    # out by minimal/balanced tiers, so this only appears under ``max``.
+    ModelProfile(
+        ProposerConfig(
+            model="ollama-stream:kimi-k2.6",
+            llm_timeout=60.0,
+            label="kimi-stream",
+        ),
+        required_env_var="OLLAMA_CLOUD_API_KEY",
+        role="reasoning-fast",
+    ),
+    # Ollama Stream — DeepSeek via streaming /api/chat with early-cancel.
+    ModelProfile(
+        ProposerConfig(
+            model="ollama-stream:deepseek-v4-pro",
+            llm_timeout=60.0,
+            label="deepseek-stream",
+        ),
+        required_env_var="OLLAMA_CLOUD_API_KEY",
+        role="reasoning-fast",
     ),
     # Anthropic — strong fast second baseline when ANTHROPIC_API_KEY is set.
     ModelProfile(

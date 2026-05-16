@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 _NATIVE_PREFIX = "ollama-native:"
+_STREAM_PREFIX = "ollama-stream:"
 
 RaceMode = Literal["first_completed", "first_verified"]
 
@@ -44,13 +45,18 @@ def _proposer_for(model: str):
     """Return the proposer callable matching a model string's routing prefix.
 
     The ``ollama-native:`` prefix routes through the native /api/chat
-    adapter (see :mod:`bourbaki.prover.native_proposer`); everything else
-    flows through :func:`bourbaki.prover.proposer.run_proposer` and the
-    standard pydantic_ai providers.
+    adapter (see :mod:`bourbaki.prover.native_proposer`); the
+    ``ollama-stream:`` prefix routes through the streaming variant with
+    early-cancel (see :mod:`bourbaki.prover.streaming_proposer`).
+    Everything else flows through :func:`bourbaki.prover.proposer.run_proposer`
+    and the standard pydantic_ai providers.
 
-    Imports the native module lazily so its httpx-based code path isn't
-    pulled in by callers who never use it.
+    Imports the native / streaming modules lazily so their httpx-based
+    code paths aren't pulled in by callers who never use them.
     """
+    if model.startswith(_STREAM_PREFIX):
+        from bourbaki.prover.streaming_proposer import run_proposer_stream
+        return run_proposer_stream
     if model.startswith(_NATIVE_PREFIX):
         from bourbaki.prover.native_proposer import run_proposer_native
         return run_proposer_native
