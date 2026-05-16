@@ -17,6 +17,7 @@ import respx
 from bourbaki.prover import native_proposer as native_mod
 from bourbaki.prover.native_proposer import (
     OLLAMA_NATIVE_CHAT_URL,
+    _coerce_list_fields,
     run_proposer_native,
 )
 from bourbaki.prover.state import (
@@ -393,3 +394,59 @@ async def test_empty_model_name(monkeypatch):
     assert out.kind == "structured_output_parsing_failed"
     assert "empty model name" in out.content
     assert not route.called
+
+
+# ---------------------------------------------------------------------------
+# 14. _coerce_list_fields: tolerant parse for sloppy reasoning models
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_list_fields_wraps_single_string():
+    obj = {"reasoning": "x", "imports": "import Mathlib", "opens": "open Real", "updated_theorem": "t"}
+    _coerce_list_fields(obj)
+    assert obj["imports"] == ["import Mathlib"]
+    assert obj["opens"] == ["open Real"]
+
+
+def test_coerce_list_fields_splits_multiline_string():
+    obj = {"imports": "import Mathlib\nimport Aesop", "opens": "open Real\nopen Set"}
+    _coerce_list_fields(obj)
+    assert obj["imports"] == ["import Mathlib", "import Aesop"]
+    assert obj["opens"] == ["open Real", "open Set"]
+
+
+def test_coerce_list_fields_leaves_lists_alone():
+    obj = {"imports": ["import Mathlib"], "opens": ["open Real"]}
+    _coerce_list_fields(obj)
+    assert obj["imports"] == ["import Mathlib"]
+    assert obj["opens"] == ["open Real"]
+
+
+def test_coerce_list_fields_handles_missing_fields():
+    obj = {"reasoning": "x"}
+    _coerce_list_fields(obj)
+    assert obj == {"reasoning": "x"}
+
+
+@respx.mock
+async def test_string_imports_coerced_before_validation(monkeypatch):
+    """End-to-end: Kimi-style string imports get coerced to lists and validate."""
+    monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "test-key")
+    payload = {
+        "reasoning": "x",
+        "imports": "import Mathlib",
+        "opens": "open Real Set",
+        "updated_theorem": "theorem demo : True := trivial",
+    }
+    respx.post(OLLAMA_NATIVE_CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": json.dumps(payload)}},
+        )
+    )
+
+    out = await run_proposer_native(_make_state(), model="ollama-native:kimi-k2.6")
+
+    assert isinstance(out, ProposalMessage)
+    assert out.imports == ["import Mathlib"]
+    assert out.opens == ["open Real Set"]

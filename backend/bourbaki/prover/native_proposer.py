@@ -44,6 +44,22 @@ _FENCE_PATTERN = re.compile(
 )
 
 
+def _coerce_list_fields(parsed_obj: dict) -> None:
+    """Coerce single-string ``imports`` / ``opens`` to single-element lists.
+
+    Reasoning models (Kimi K2.6 in particular) sometimes emit these
+    fields as a string like ``"import Mathlib"`` instead of a list,
+    despite the JSON Schema spec. Mutate the dict in place so pydantic
+    validation passes. Multi-line strings are split on newlines.
+    """
+    for field in ("imports", "opens"):
+        val = parsed_obj.get(field)
+        if isinstance(val, str):
+            parsed_obj[field] = [
+                line.strip() for line in val.split("\n") if line.strip()
+            ]
+
+
 def _strip_markdown_fences(content: str) -> str:
     """Strip ```json ... ``` fences (any case) from a model response.
 
@@ -214,6 +230,8 @@ async def run_proposer_native(
         return feedback.structured_output_parsing_failed(
             f"failed to parse ollama-native content as JSON: {exc}"
         )
+
+    _coerce_list_fields(parsed_obj)
 
     try:
         output = ProverResult.model_validate(parsed_obj)
