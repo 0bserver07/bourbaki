@@ -264,6 +264,7 @@ def smart_default_fanout(
     tier: str = "balanced",
     include_roles: tuple[str, ...] | None = None,
     verify_with_lean: bool = False,
+    enable_mathlib_search: bool = False,
 ) -> list[ProposerConfig]:
     """Build a fanout list from whichever models have keys configured.
 
@@ -284,6 +285,12 @@ def smart_default_fanout(
             since :class:`ProposerConfig` is frozen). Pair this with
             ``race_mode="first_verified"`` in :func:`parallel_propose`
             so each leg is gated on a compile check before it can win.
+        enable_mathlib_search: If True, every returned config has its
+            ``enable_mathlib_search`` field set to True so the proposer
+            adapter registers the ``mathlib_search`` tool on the leg's
+            agent. Currently only takes effect on ``ollama-native:`` legs
+            (the native ``/api/chat`` adapter); pydantic_ai legs may
+            also support it depending on model.
 
     Returns:
         A non-empty list of :class:`ProposerConfig` legs in deterministic
@@ -327,8 +334,194 @@ def smart_default_fanout(
         )
 
     configs = [p.config for p in after_tier]
-    if verify_with_lean:
-        # ProposerConfig is frozen; replace() returns a new instance.
-        configs = [replace(c, verify_with_lean=True) for c in configs]
+    return _apply_overrides(
+        configs,
+        verify_with_lean=verify_with_lean,
+        enable_mathlib_search=enable_mathlib_search,
+    )
 
-    return configs
+
+# ---------------------------------------------------------------------------
+# Per-problem-source routing
+# ---------------------------------------------------------------------------
+
+# Map source prefixes (lowercased, taken from the leading ``[a-z]+`` of the
+# problem ID) to the role mix that empirically works best for that family.
+#
+# - aime / imo / putnam: hard olympiad-style problems where conceptual
+#   reasoning beats pure pattern-matching. Lead with reasoning models
+#   (ollama-native: kimi + deepseek) and Claude if available.
+# - algebra / mathd_algebra / amc: computational manipulation where
+#   Lean-tuned coders shine — qwen3-coder first, gpt-oss second.
+# - numbertheory / induction: proof structure matters; balanced tier
+#   (baseline + diversity) is the right starting point.
+#
+# Anything unrecognised falls back to balanced tier.
+_SOURCE_ROLE_PREFERENCE: dict[str, tuple[str, ...]] = {
+    # Reasoning-heavy
+    "aime": ("reasoning", "claude", "frontier", "baseline"),
+    "imo": ("reasoning", "claude", "frontier", "baseline"),
+    "putnam": ("reasoning", "claude", "frontier", "baseline"),
+    # Coder-heavy
+    "algebra": ("coder", "frontier", "baseline"),
+    "mathd": ("coder", "frontier", "baseline"),
+    "amc": ("coder", "frontier", "baseline"),
+    # Balanced
+    "numbertheory": ("baseline", "frontier", "coder"),
+    "induction": ("baseline", "frontier", "coder"),
+}
+
+# Hard cap on leg count for per-problem fanouts: 5 keeps wallclock
+# reasonable on a 35-problem subset while still exercising 3-5 model
+# families per problem.
+_FANOUT_FOR_PROBLEM_MAX_LEGS: int = 5
+
+
+def _source_from_problem_id(problem_id: str) -> str:
+    """Extract the source prefix from a problem ID.
+
+    Mirrors the regex used by the miniF2F loader (``^[a-z]+_``) but tolerates
+    IDs without an underscore (returns the whole thing lowercased) so
+    callers can pass arbitrary strings without crashing the auto-route.
+    """
+    head, _, _rest = problem_id.partition("_")
+    return head.lower()
+
+
+def _apply_overrides(
+    configs: list[ProposerConfig],
+    *,
+    verify_with_lean: bool,
+    enable_mathlib_search: bool,
+) -> list[ProposerConfig]:
+    """Apply the ``verify_with_lean`` / ``enable_mathlib_search`` overrides.
+
+    ``ProposerConfig`` is frozen; we use :func:`dataclasses.replace` to
+    return fresh instances rather than mutating the module-level profile
+    templates (which would persist across calls).
+    """
+    if not verify_with_lean and not enable_mathlib_search:
+        return configs
+    out: list[ProposerConfig] = []
+    for c in configs:
+        updates: dict = {}
+        if verify_with_lean:
+            updates["verify_with_lean"] = True
+        if enable_mathlib_search:
+            updates["enable_mathlib_search"] = True
+        out.append(replace(c, **updates))
+    return out
+
+
+def fanout_for_problem(
+    problem_id: str,
+    *,
+    enable_mathlib_search: bool = False,
+    verify_with_lean: bool = False,
+) -> list[ProposerConfig]:
+    """Smart fanout selection by problem source prefix.
+
+    Routing (per leading ``[a-z]+`` token of ``problem_id``):
+
+    - ``aime``, ``imo``, ``putnam`` → reasoning-heavy (kimi + deepseek +
+      claude if available, plus baseline + frontier as fillers)
+    - ``algebra``, ``mathd``, ``mathd_algebra``, ``amc`` → coder-heavy
+      (qwen3-coder + gpt-oss + glm)
+    - ``numbertheory``, ``induction`` → balanced (baseline + frontier + coder)
+    - anything else → :func:`smart_default_fanout` with ``tier="balanced"``
+
+    The function always returns at least one leg as long as at least one
+    profile's env var is set. When the preferred roles for a given source
+    are missing (e.g. no Ollama Cloud key for reasoning routing), the
+    available legs are returned in role-preference order; if fewer than
+    3 legs remain after preference filtering, the result is topped up
+    with balanced-tier legs that were not already selected. The fanout
+    is capped at :data:`_FANOUT_FOR_PROBLEM_MAX_LEGS` (5) total legs.
+
+    Args:
+        problem_id: Benchmark problem identifier (e.g. ``"aime_1988_p3"``,
+            ``"mathd_algebra_116"``, ``"putnam_2020_a1"``). Only the
+            prefix up to the first underscore is consulted.
+        enable_mathlib_search: Forwarded to every returned ``ProposerConfig``.
+        verify_with_lean: Forwarded to every returned ``ProposerConfig``.
+
+    Returns:
+        A non-empty list of :class:`ProposerConfig` legs. Capped at
+        :data:`_FANOUT_FOR_PROBLEM_MAX_LEGS` (5) legs.
+
+    Raises:
+        ValueError: When no API keys are configured. The error is raised
+            by :func:`smart_default_fanout` and names the env vars that
+            would unlock a fanout.
+    """
+    eligible = _eligible_profiles()
+    if not eligible:
+        # Defer to smart_default_fanout's error message so the caller sees
+        # a single canonical "no keys present" diagnostic.
+        return smart_default_fanout(
+            tier="balanced",
+            verify_with_lean=verify_with_lean,
+            enable_mathlib_search=enable_mathlib_search,
+        )
+
+    source = _source_from_problem_id(problem_id)
+    preferred_roles = _SOURCE_ROLE_PREFERENCE.get(source)
+
+    if preferred_roles is None:
+        # Unknown source — fall back to balanced tier so the caller still
+        # gets a sensible default rather than a single baseline leg.
+        return smart_default_fanout(
+            tier="balanced",
+            verify_with_lean=verify_with_lean,
+            enable_mathlib_search=enable_mathlib_search,
+        )
+
+    # Build the per-source fanout: preferred-role legs in profile order
+    # within each role, then top up with balanced-tier legs that weren't
+    # already selected. The balanced top-up handles the "preferred roles
+    # are sparse" case (e.g. reasoning routing with only GLM available).
+    selected: list[ModelProfile] = []
+    seen: set[str] = set()  # model strings already in selected, for dedup
+
+    for role in preferred_roles:
+        for profile in eligible:
+            if profile.role != role:
+                continue
+            if profile.config.model in seen:
+                continue
+            selected.append(profile)
+            seen.add(profile.config.model)
+            if len(selected) >= _FANOUT_FOR_PROBLEM_MAX_LEGS:
+                break
+        if len(selected) >= _FANOUT_FOR_PROBLEM_MAX_LEGS:
+            break
+
+    # Top up with balanced-tier legs if we're short. This ensures the
+    # caller always gets at least the balanced default when keys are
+    # available but the preferred roles aren't represented.
+    if len(selected) < _FANOUT_FOR_PROBLEM_MAX_LEGS:
+        balanced_profiles = _filter_by_tier(eligible, "balanced")
+        for profile in balanced_profiles:
+            if profile.config.model in seen:
+                continue
+            selected.append(profile)
+            seen.add(profile.config.model)
+            if len(selected) >= _FANOUT_FOR_PROBLEM_MAX_LEGS:
+                break
+
+    # If selected is somehow empty (shouldn't be — eligible is non-empty
+    # and balanced tier returns at least one leg when keys are present),
+    # fall back to smart_default_fanout for safety.
+    if not selected:
+        return smart_default_fanout(
+            tier="balanced",
+            verify_with_lean=verify_with_lean,
+            enable_mathlib_search=enable_mathlib_search,
+        )
+
+    configs = [p.config for p in selected]
+    return _apply_overrides(
+        configs,
+        verify_with_lean=verify_with_lean,
+        enable_mathlib_search=enable_mathlib_search,
+    )
