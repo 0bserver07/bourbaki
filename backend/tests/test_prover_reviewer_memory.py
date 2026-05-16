@@ -145,7 +145,9 @@ async def test_reviewer_approves_and_lean_prover_succeeds(monkeypatch):
     monkeypatch.setattr(
         "pydantic_ai.Agent.run", _agent_run_returning(decision)
     )
-    lean_mock = AsyncMock(return_value={"success": True, "errors": None})
+    lean_mock = AsyncMock(return_value={
+        "success": True, "proofComplete": True, "errors": None,
+    })
     monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
 
     result = await run_reviewer(state, model="glm:glm-5.1")
@@ -182,7 +184,9 @@ async def test_reviewer_does_not_double_import_when_preamble_has_import(monkeypa
         reasoning="ok", check_1=True, check_2=True, check_3=True, approved=True,
     )
     monkeypatch.setattr("pydantic_ai.Agent.run", _agent_run_returning(decision))
-    lean_mock = AsyncMock(return_value={"success": True, "errors": None})
+    lean_mock = AsyncMock(return_value={
+        "success": True, "proofComplete": True, "errors": None,
+    })
     monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
 
     await run_reviewer(state, model="glm:glm-5.1")
@@ -220,6 +224,60 @@ async def test_reviewer_rejects_when_lean_prover_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reviewer_rejects_when_success_true_but_proof_complete_false(monkeypatch):
+    """Regression: reviewer must match the outer benchmark verifier's
+    ``proofComplete`` check, not the weaker ``success`` check.
+
+    Reproduces the mathd_algebra_116 false positive from the
+    2026-05-15 fanout-4frontier smoke run (4 legs, deepseek-v4-pro won
+    iter 1, REPL builder reported success, reviewer approved, outer
+    ``_verify_with_lean_prover`` then rejected — 100% false positive on
+    1/2 problems). The disagreement: ``lean_prover`` returns
+    ``success = not has_errors`` (only the regex-parsed stderr is
+    inspected) while ``proofComplete = return_code == 0 and not
+    has_errors and not has_sorry`` (also checks the Lean process exit
+    code). When Lean exits non-zero with stderr that doesn't match the
+    ``filename:line:col: error: msg`` regex (e.g. an elaboration
+    timeout or panic), ``success`` is ``True`` but ``proofComplete``
+    is ``False``; the outer verifier in
+    :mod:`bourbaki.benchmarks.minif2f` checks the stricter field and
+    rejects, producing the false-positive class this gate is supposed
+    to catch.
+    """
+    state = _state_with_proposal(code="theorem t : 1 = 1 := by rfl")
+    decision = ReviewDecision(
+        reasoning="signature unchanged, no sorry/admit",
+        check_1=True,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.Agent.run", _agent_run_returning(decision)
+    )
+    # Mock the exact false-positive shape: Lean exits with a panic that
+    # didn't parse out as a structured error, so the parsed errors list
+    # is empty (``success`` is ``True``) but ``proofComplete`` is still
+    # ``False`` because ``return_code != 0``.
+    lean_mock = AsyncMock(return_value={
+        "success": True,
+        "proofComplete": False,
+        "errors": None,
+        "rawOutput": "(deterministic) timeout at 'elaborator'",
+        "goals": [],
+    })
+    monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
+
+    result = await run_reviewer(state, model="glm:glm-5.1")
+
+    # The reviewer must reject — otherwise the outer benchmark
+    # verifier flags the proof as a false positive.
+    assert result.kind == "review_rejected"
+    assert result.is_success is False
+    assert "final lean_prover verification failed" in result.content
+
+
+@pytest.mark.asyncio
 async def test_reviewer_handles_llm_exception(monkeypatch):
     state = _state_with_proposal()
 
@@ -254,7 +312,9 @@ async def test_reviewer_skips_import_when_already_present(monkeypatch):
     monkeypatch.setattr(
         "pydantic_ai.Agent.run", _agent_run_returning(decision)
     )
-    lean_mock = AsyncMock(return_value={"success": True, "errors": None})
+    lean_mock = AsyncMock(return_value={
+        "success": True, "proofComplete": True, "errors": None,
+    })
     monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
 
     result = await run_reviewer(state, model="glm:glm-5.1")

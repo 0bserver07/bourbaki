@@ -134,7 +134,17 @@ async def run_reviewer(
             f"final lean_prover verification failed: {e}"
         )
 
-    if verify_result.get("success"):
+    # Use ``proofComplete`` (not ``success``) so the reviewer's accept
+    # criterion matches the outer benchmark verifier byte-for-byte.
+    # ``success`` only checks that the regex parsed no errors from
+    # stderr, which is too lenient: when ``lake env lean`` exits with a
+    # non-zero return code AND the stderr text doesn't match the
+    # ``filename:line:col: error: msg`` regex (e.g. an elaboration
+    # timeout panic), ``success`` is ``True`` but ``proofComplete`` is
+    # ``False``. The outer verifier in :mod:`bourbaki.benchmarks.minif2f`
+    # checks ``proofComplete`` and would reject — producing a false
+    # positive of exactly the class this gate is meant to catch.
+    if verify_result.get("proofComplete"):
         return feedback.review_approved(decision.reasoning)
 
     error_summary = _summarize_lean_errors(verify_result)
