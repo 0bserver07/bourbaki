@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from bourbaki.prover import ProverConfig
     from bourbaki.prover.parallel_proposer import ProposerConfig
+    from bourbaki.prover.reviewer_fanout import ReviewerConfig
 
 from bourbaki.benchmarks.loader import (
     MiniF2FProblem,
@@ -554,6 +555,8 @@ async def run_minif2f(
     loop_reviewer_llm_timeout: float | None = None,
     loop_proposer_configs: list["ProposerConfig"] | None = None,
     loop_proposer_race_mode: str = "first_completed",
+    loop_reviewer_configs: list["ReviewerConfig"] | None = None,
+    loop_reviewer_review_mode: str = "first_approved",
     pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,

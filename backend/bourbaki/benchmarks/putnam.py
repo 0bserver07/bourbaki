@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from bourbaki.prover.parallel_proposer import ProposerConfig
+    from bourbaki.prover.reviewer_fanout import ReviewerConfig
 
 from bourbaki.benchmarks.minif2f import (
     attempt_proof_loop,
@@ -465,6 +466,8 @@ async def run_putnam(
     loop_reviewer_llm_timeout: float | None = None,
     loop_proposer_configs: list["ProposerConfig"] | None = None,
     loop_proposer_race_mode: str = "first_completed",
+    loop_reviewer_configs: list["ReviewerConfig"] | None = None,
+    loop_reviewer_review_mode: str = "first_approved",
     pass_n: int = 1,
 ) -> PutnamBenchmarkResult:
     """Run Bourbaki on PutnamBench problems and report pass rate.
@@ -542,6 +545,18 @@ async def run_putnam(
             each leg on a follow-up ``lean_prover`` call so a
             fast-but-broken proof loses to a slower-but-compiling peer.
             Only consulted when ``loop_proposer_configs`` is non-empty.
+        loop_reviewer_configs: Multi-model reviewer fanout configs.
+            When ``None`` (default) the loop runs the single-model
+            reviewer. When a non-empty list is supplied, ``ProverLoop``
+            races those legs via :func:`fanout_review`; the
+            ``lean_prover`` final gate runs exactly once after the
+            ensemble decision.
+        loop_reviewer_review_mode: Combination strategy forwarded to
+            :func:`fanout_review`. ``"first_approved"`` (default) races
+            the legs and accepts the first APPROVE.
+            ``"all_must_approve"`` waits for every leg and accepts only
+            if all approve. Only consulted when ``loop_reviewer_configs``
+            is non-empty.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -753,6 +768,11 @@ async def run_putnam(
                 if loop_proposer_configs:
                     _loop_kwargs["proposer_configs"] = loop_proposer_configs
                     _loop_kwargs["proposer_race_mode"] = loop_proposer_race_mode
+                if loop_reviewer_configs:
+                    _loop_kwargs["reviewer_configs"] = loop_reviewer_configs
+                    _loop_kwargs["reviewer_review_mode"] = (
+                        loop_reviewer_review_mode
+                    )
                 loop_cfg = _ProverConfig(**_loop_kwargs)
                 # PutnamProblem is duck-compatible with MiniF2FProblem on
                 # the fields the loop actually reads (id, source, statement,
@@ -933,6 +953,23 @@ async def run_putnam(
             "loop_proposer_race_mode": (
                 loop_proposer_race_mode
                 if use_loop and loop_proposer_configs
+                else None
+            ),
+            "loop_reviewer_configs": (
+                [
+                    {
+                        "model": c.model,
+                        "llm_timeout": c.llm_timeout,
+                        "label": c.label,
+                    }
+                    for c in loop_reviewer_configs
+                ]
+                if use_loop and loop_reviewer_configs
+                else None
+            ),
+            "loop_reviewer_review_mode": (
+                loop_reviewer_review_mode
+                if use_loop and loop_reviewer_configs
                 else None
             ),
             "pass_n": pass_n if use_loop else None,

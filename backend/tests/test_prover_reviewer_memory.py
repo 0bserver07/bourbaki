@@ -326,6 +326,107 @@ async def test_reviewer_skips_import_when_already_present(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# decide_only flag (for multi-model reviewer fanout)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reviewer_decide_only_skips_lean_prover(monkeypatch):
+    """``decide_only=True`` is the flag the multi-model fanout uses to
+    avoid paying for N parallel ``lean_prover`` compiles. When the LLM
+    approves, the reviewer must return approval purely from the
+    structured-output decision and skip the standalone compile step.
+    """
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="signature unchanged, no sorry",
+        check_1=True,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.Agent.run", _agent_run_returning(decision)
+    )
+    # If lean_prover fires under decide_only=True, the AssertionError
+    # below will surface as a test failure.
+    monkeypatch.setattr(
+        reviewer_mod, "lean_prover",
+        AsyncMock(side_effect=AssertionError(
+            "lean_prover must not run when decide_only=True"
+        )),
+    )
+
+    result = await run_reviewer(
+        state, model="glm:glm-5.1", decide_only=True,
+    )
+
+    assert result.kind == "review_approved"
+    assert result.is_success is True
+    assert "signature unchanged" in result.content
+
+
+@pytest.mark.asyncio
+async def test_reviewer_decide_only_preserves_rejection_path(monkeypatch):
+    """``decide_only=True`` must still reject when the LLM rejects (the
+    flag only affects the post-approval ``lean_prover`` step, not the
+    structured-output decision)."""
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="found a sorry",
+        check_1=True,
+        check_2=False,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.Agent.run", _agent_run_returning(decision)
+    )
+    monkeypatch.setattr(
+        reviewer_mod, "lean_prover",
+        AsyncMock(side_effect=AssertionError(
+            "lean_prover must not run when reviewer rejects"
+        )),
+    )
+
+    result = await run_reviewer(
+        state, model="glm:glm-5.1", decide_only=True,
+    )
+
+    assert result.kind == "review_rejected"
+    assert "found a sorry" in result.content
+
+
+@pytest.mark.asyncio
+async def test_reviewer_decide_only_default_false_unchanged(monkeypatch):
+    """Back-compat: when ``decide_only`` is left at its default ``False``,
+    the legacy behaviour (LLM decision → lean_prover final gate) must
+    run exactly as before. This is the guarantee that no existing
+    caller breaks when the flag is added."""
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="ok",
+        check_1=True,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.Agent.run", _agent_run_returning(decision)
+    )
+    lean_mock = AsyncMock(return_value={
+        "success": True, "proofComplete": True, "errors": None,
+    })
+    monkeypatch.setattr(reviewer_mod, "lean_prover", lean_mock)
+
+    result = await run_reviewer(state, model="glm:glm-5.1")
+
+    assert result.kind == "review_approved"
+    # Default-path back-compat: lean_prover MUST have run.
+    lean_mock.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Memory tests
 # ---------------------------------------------------------------------------
 

@@ -62,6 +62,7 @@ async def run_reviewer(
     state: ProverState,
     model: str = "glm:glm-5.1",
     llm_timeout: float = _REVIEWER_LLM_TIMEOUT,
+    decide_only: bool = False,
 ) -> FeedbackMessage:
     """Run the reviewer node and return a typed feedback message.
 
@@ -69,6 +70,20 @@ async def run_reviewer(
     Errors from the LLM call (validation failures, unexpected behaviour, generic
     exceptions) collapse into a `review_rejected` so the loop can retry rather
     than crash.
+
+    Args:
+        state: Current :class:`ProverState`. The reviewer reads
+            ``state.last_proposal`` and ``state.target_theorem``.
+        model: Pydantic AI model string for the structured-output decision.
+        llm_timeout: Per-LLM-call cap in seconds.
+        decide_only: When True, skip the ground-truth ``lean_prover`` step
+            and return approval/rejection purely from the LLM's
+            structured-output decision. Used by
+            :mod:`bourbaki.prover.reviewer_fanout` so a multi-leg
+            ensemble doesn't run :func:`lean_prover` once per leg —
+            the coordinator runs it exactly once after consensus.
+            Default ``False`` preserves the original behaviour: when
+            the LLM approves, ``lean_prover`` runs as the final gate.
     """
     if state.last_proposal is None:
         return feedback.review_rejected(
@@ -112,6 +127,12 @@ async def run_reviewer(
 
     if not approved:
         return feedback.review_rejected(decision.reasoning)
+
+    # Fanout coordinators ask for the LLM decision only — they run
+    # ``lean_prover`` exactly once after the multi-leg ensemble has
+    # agreed, instead of N times in parallel.
+    if decide_only:
+        return feedback.review_approved(decision.reasoning)
 
     # Final ground-truth gate: standalone lean_prover compile.
     # Use the shared assembler so the outer benchmark verifier sees

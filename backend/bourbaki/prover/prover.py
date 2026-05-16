@@ -13,22 +13,26 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel
 
+from bourbaki.prover import feedback as feedback_module
 from bourbaki.prover import memory as memory_module
 from bourbaki.prover.builder import run_builder
 from bourbaki.prover.feedback import max_iterations as max_iterations_feedback
 from bourbaki.prover.parallel_proposer import parallel_propose
 from bourbaki.prover.proposer import run_proposer
-from bourbaki.prover.reviewer import run_reviewer
+from bourbaki.prover.reviewer import _summarize_lean_errors, run_reviewer
+from bourbaki.prover.reviewer_fanout import fanout_review
 from bourbaki.prover.state import (
     FeedbackMessage,
     ProposalMessage,
     ProverState,
 )
+from bourbaki.tools.lean_prover import lean_prover
 from bourbaki.tools.proof_code_builder import assemble_standalone_proof
 
 if TYPE_CHECKING:
     from bourbaki.benchmarks.loader import MiniF2FProblem
     from bourbaki.prover.parallel_proposer import ProposerConfig
+    from bourbaki.prover.reviewer_fanout import ReviewerConfig
     from bourbaki.tools.lean_repl import LeanREPLSession
 
 
@@ -72,6 +76,23 @@ class ProverConfig(BaseModel):
     # declaring a winner — trades latency for compile-correctness.
     proposer_race_mode: Literal["first_completed", "first_verified"] = (
         "first_completed"
+    )
+    # Multi-model reviewer fanout. When ``None`` (default),
+    # ``ProverLoop._reviewer`` calls :func:`run_reviewer` once with
+    # ``reviewer_model`` / ``reviewer_llm_timeout`` (single-model legacy
+    # path). When a non-empty list is supplied, the loop routes through
+    # :func:`fanout_review` and the single-model fields are ignored for
+    # the reviewer step. The ``lean_prover`` final gate is run exactly
+    # once after the ensemble's decision — never per leg — so adding
+    # legs costs N LLM calls but only 1 standalone compile.
+    reviewer_configs: list["ReviewerConfig"] | None = None
+    # Combination strategy for the reviewer fanout. Only consulted when
+    # ``reviewer_configs`` is non-empty. ``"first_approved"`` (default)
+    # races the legs and accepts the first APPROVE; pending legs are
+    # cancelled. ``"all_must_approve"`` waits for every leg and accepts
+    # only if all approve — strictly more conservative.
+    reviewer_review_mode: Literal["first_approved", "all_must_approve"] = (
+        "first_approved"
     )
 
     model_config = {"arbitrary_types_allowed": True}
@@ -218,10 +239,69 @@ class ProverLoop:
         )
 
     async def _reviewer(self, state: ProverState) -> FeedbackMessage:
+        # Multi-model reviewer fanout: when ``reviewer_configs`` is set,
+        # race the supplied legs and combine their decisions per
+        # ``reviewer_review_mode``. The single-model ``reviewer_model`` /
+        # ``reviewer_llm_timeout`` fields are ignored in this path —
+        # each ``ReviewerConfig`` carries its own. The fanout itself
+        # only invokes :func:`run_reviewer` with ``decide_only=True``,
+        # so the per-leg behaviour stops at the LLM judgement; we run
+        # :func:`lean_prover` here exactly once after the ensemble has
+        # agreed to spare the linear-with-leg-count compile cost.
+        if self.config.reviewer_configs:
+            ensemble = await fanout_review(
+                state,
+                self.config.reviewer_configs,
+                mode=self.config.reviewer_review_mode,
+            )
+            if ensemble.kind != "review_approved":
+                return ensemble
+            return await self._final_lean_gate(state, ensemble)
         return await run_reviewer(
             state,
             model=self.config.reviewer_model or self.config.model,
             llm_timeout=self.config.reviewer_llm_timeout,
+        )
+
+    async def _final_lean_gate(
+        self, state: ProverState, ensemble_approval: FeedbackMessage,
+    ) -> FeedbackMessage:
+        """Run the ground-truth ``lean_prover`` compile once after the
+        multi-leg ensemble has approved.
+
+        Mirrors the second half of :func:`run_reviewer`: same assembled
+        source, same ``proofComplete`` check, same error rendering. The
+        only reason this lives on :class:`ProverLoop` rather than in
+        :mod:`reviewer_fanout` is that the fanout module is intentionally
+        Lean-agnostic — it composes :func:`run_reviewer` results and
+        nothing else.
+        """
+        if state.last_proposal is None:
+            return feedback_module.review_rejected(
+                "reviewer fanout approved but state.last_proposal is None; "
+                "cannot run final lean gate."
+            )
+        full_source = assemble_standalone_proof(
+            state.preamble, state.last_proposal.code
+        )
+        try:
+            verify_result = await lean_prover(
+                code=full_source, mode="check", timeout=240,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "Reviewer-fanout final lean_prover call raised"
+            )
+            return feedback_module.review_rejected(
+                f"final lean_prover verification failed: {e}"
+            )
+
+        if verify_result.get("proofComplete"):
+            return ensemble_approval
+
+        return feedback_module.review_rejected(
+            f"final lean_prover verification failed: "
+            f"{_summarize_lean_errors(verify_result)}"
         )
 
     async def _memory(self, state: ProverState) -> str:
@@ -262,11 +342,19 @@ class ProverLoop:
         return "retry"
 
 
-# Resolve the forward reference on ``ProverConfig.proposer_configs`` —
-# ``ProposerConfig`` is a frozen dataclass living in ``parallel_proposer``
-# and is only imported under ``TYPE_CHECKING`` above to avoid mixing the
-# Pydantic field type-resolution with runtime imports.  Without this
-# rebuild Pydantic raises ``PydanticUserError`` on first instantiation.
+# Resolve the forward references on ``ProverConfig.proposer_configs`` /
+# ``ProverConfig.reviewer_configs`` — ``ProposerConfig`` and
+# ``ReviewerConfig`` are frozen dataclasses living in
+# ``parallel_proposer`` / ``reviewer_fanout`` and are only imported
+# under ``TYPE_CHECKING`` above to avoid mixing the Pydantic field
+# type-resolution with runtime imports.  Without this rebuild Pydantic
+# raises ``PydanticUserError`` on first instantiation.
 from bourbaki.prover.parallel_proposer import ProposerConfig as _ProposerConfig  # noqa: E402
+from bourbaki.prover.reviewer_fanout import ReviewerConfig as _ReviewerConfig  # noqa: E402
 
-ProverConfig.model_rebuild(_types_namespace={"ProposerConfig": _ProposerConfig})
+ProverConfig.model_rebuild(
+    _types_namespace={
+        "ProposerConfig": _ProposerConfig,
+        "ReviewerConfig": _ReviewerConfig,
+    }
+)

@@ -148,6 +148,34 @@ def parse_args() -> argparse.Namespace:
             "exclusive with --proposer-models."
         ),
     )
+    parser.add_argument(
+        "--reviewer-models",
+        type=str,
+        default=None,
+        help=(
+            "Multi-model reviewer fanout. Comma- or pipe-separated list of "
+            "``model[@llm_timeout]`` specs. ``@`` separates the "
+            "(colon-containing) model string from its per-leg timeout in "
+            "seconds. Example: "
+            "'glm:glm-5.1@60,anthropic:claude-sonnet-4-5@90'. When set, "
+            "every approval requires consensus per --reviewer-review-mode "
+            "and the single-model reviewer path is bypassed for the LLM "
+            "decision step. The ``lean_prover`` final gate still runs "
+            "exactly once after the ensemble agrees."
+        ),
+    )
+    parser.add_argument(
+        "--reviewer-review-mode",
+        choices=["first_approved", "all_must_approve"],
+        default="first_approved",
+        help=(
+            "Combination strategy for --reviewer-models. "
+            "'first_approved' (default) races the legs and accepts the "
+            "first APPROVE (looser, faster); 'all_must_approve' waits "
+            "for every leg and accepts only if all approve (stricter, "
+            "useful for borderline proofs)."
+        ),
+    )
     args = parser.parse_args()
     if args.smart_fanout and args.proposer_models:
         parser.error(
@@ -155,6 +183,50 @@ def parse_args() -> argparse.Namespace:
             "pick one"
         )
     return args
+
+
+def _parse_reviewer_models(spec: str | None):
+    """Parse ``--reviewer-models`` into a list of ``ReviewerConfig``.
+
+    Empty / None / whitespace-only input returns ``None`` so the loop
+    falls through to the single-model reviewer path. Grammar matches
+    :func:`_parse_proposer_models`: comma- or pipe-separated entries;
+    ``@<timeout>`` after the colon-containing model string sets the
+    per-leg ``llm_timeout`` (seconds). No verify flag — the reviewer
+    fanout never runs ``lean_prover`` per leg.
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+    from bourbaki.prover.reviewer_fanout import ReviewerConfig
+
+    raw_entries: list[str] = []
+    for chunk in spec.split("|"):
+        raw_entries.extend(chunk.split(","))
+    configs: list[ReviewerConfig] = []
+    for entry in raw_entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            model, _, timeout_str = entry.rpartition("@")
+            model = model.strip()
+            timeout_str = timeout_str.strip()
+            try:
+                llm_timeout = float(timeout_str)
+            except ValueError as e:
+                raise ValueError(
+                    f"--reviewer-models: bad timeout {timeout_str!r} in "
+                    f"entry {entry!r}; expected float seconds"
+                ) from e
+            configs.append(
+                ReviewerConfig(model=model, llm_timeout=llm_timeout)
+            )
+        else:
+            configs.append(ReviewerConfig(model=entry))
+    return configs or None
 
 
 def _parse_proposer_models(spec: str | None, race_mode: str = "first_completed"):
@@ -271,6 +343,17 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
             args.race_mode,
         )
 
+    reviewer_configs = _parse_reviewer_models(args.reviewer_models)
+    if reviewer_configs:
+        logger.info(
+            "Reviewer fanout: %d legs [%s] mode=%s",
+            len(reviewer_configs),
+            ", ".join(
+                f"{c.model}@{c.llm_timeout:.0f}s" for c in reviewer_configs
+            ),
+            args.reviewer_review_mode,
+        )
+
     result = await run_minif2f(
         split=args.split,
         problem_ids=problem_ids,
@@ -285,6 +368,8 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
         loop_reviewer_llm_timeout=args.reviewer_llm_timeout,
         loop_proposer_configs=proposer_configs,
         loop_proposer_race_mode=args.race_mode,
+        loop_reviewer_configs=reviewer_configs,
+        loop_reviewer_review_mode=args.reviewer_review_mode,
         pass_n=args.pass_n,
     )
 
@@ -342,6 +427,8 @@ def main() -> None:
         "proposer_models": args.proposer_models,
         "smart_fanout": args.smart_fanout,
         "race_mode": args.race_mode,
+        "reviewer_models": args.reviewer_models,
+        "reviewer_review_mode": args.reviewer_review_mode,
         "source": "--ids" if args.ids else ("--from-file " + args.from_file if args.from_file else "default 35-problem subset"),
     }
     common.banner(
