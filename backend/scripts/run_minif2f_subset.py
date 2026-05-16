@@ -145,7 +145,20 @@ def parse_args() -> argparse.Namespace:
             "spec required. 'minimal' = baseline + 1 frontier (2 legs); "
             "'balanced' = baseline + 2 frontier + claude-if-available "
             "(3-4 legs); 'max' = every eligible leg (up to 7). Mutually "
-            "exclusive with --proposer-models."
+            "exclusive with --proposer-models and --auto-route."
+        ),
+    )
+    parser.add_argument(
+        "--auto-route",
+        action="store_true",
+        help=(
+            "Per-problem proposer routing via "
+            "``fanout_for_problem`` — the fanout legs are picked from "
+            "the problem ID's source prefix (``aime`` / ``imo`` -> "
+            "reasoning-heavy; ``algebra`` / ``mathd`` -> coder-heavy; "
+            "everything else -> balanced). Inherits --race-mode and "
+            "--enable-mathlib-search on every leg. Mutually exclusive "
+            "with --proposer-models and --smart-fanout."
         ),
     )
     parser.add_argument(
@@ -177,10 +190,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
-    if args.smart_fanout and args.proposer_models:
+    # Three fanout modes are pairwise mutually exclusive. Reject any
+    # combination explicitly so a confusing precedence rule never has
+    # to be inferred at runtime.
+    fanout_flags = [
+        ("--smart-fanout", bool(args.smart_fanout)),
+        ("--proposer-models", bool(args.proposer_models)),
+        ("--auto-route", bool(args.auto_route)),
+    ]
+    enabled = [name for name, on in fanout_flags if on]
+    if len(enabled) > 1:
         parser.error(
-            "--smart-fanout and --proposer-models are mutually exclusive; "
-            "pick one"
+            f"{', '.join(enabled)} are mutually exclusive; pick one"
         )
     return args
 
@@ -307,11 +328,22 @@ def _resolve_problem_ids(args: argparse.Namespace, logger) -> list[str]:
 def _resolve_proposer_configs(args: argparse.Namespace, logger):
     """Resolve proposer fanout configs from CLI args.
 
-    Precedence: ``--smart-fanout`` (auto-built from env) takes priority
-    when set; argparse already rejects the combination with
-    ``--proposer-models``. When neither flag is set, returns ``None`` so
-    the loop falls back to the legacy single-model path.
+    Precedence: ``--auto-route`` is per-problem (no fixed list); when
+    set, returns ``None`` here and lets ``run_minif2f`` call
+    ``fanout_for_problem`` for each problem. ``--smart-fanout``
+    (auto-built from env) takes priority when set. ``argparse``
+    already rejects pairwise combinations of these flags.  When none
+    is set, returns ``None`` so the loop falls back to the legacy
+    single-model path.
+
+    ``args.auto_route`` is read via ``getattr`` so older callers that
+    build a synthetic ``Namespace`` (the pinning tests written before
+    --auto-route landed) keep working without needing to set every
+    new field.
     """
+    if getattr(args, "auto_route", False):
+        # No fixed fanout: per-problem dispatch happens inside run_minif2f.
+        return None
     if args.smart_fanout:
         from bourbaki.config import export_api_keys
         from bourbaki.prover.default_fanout import smart_default_fanout
@@ -331,6 +363,28 @@ def _resolve_proposer_configs(args: argparse.Namespace, logger):
     )
 
 
+def _resolve_reviewer_configs(args: argparse.Namespace, logger):
+    """Resolve reviewer fanout configs from CLI args.
+
+    Mirrors :func:`_resolve_proposer_configs` so callers can use the
+    same call pattern. Currently a thin wrapper around
+    :func:`_parse_reviewer_models`; lifted to a helper for symmetry
+    with the Putnam runner and to give a single place to log the
+    resolved leg list.
+    """
+    configs = _parse_reviewer_models(args.reviewer_models)
+    if configs:
+        logger.info(
+            "Reviewer fanout: %d legs [%s] mode=%s",
+            len(configs),
+            ", ".join(
+                f"{c.model}@{c.llm_timeout:.0f}s" for c in configs
+            ),
+            args.reviewer_review_mode,
+        )
+    return configs
+
+
 async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None:
     from bourbaki.benchmarks.minif2f import run_minif2f
 
@@ -342,17 +396,21 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
             ", ".join(f"{c.model}@{c.llm_timeout:.0f}s" for c in proposer_configs),
             args.race_mode,
         )
+    elif args.auto_route:
+        # ``run_minif2f`` will call ``fanout_for_problem`` per problem and
+        # log the chosen legs.  Bridge .env -> env vars first so the
+        # routing's API-key probes see the same world the dotenv loader
+        # would expose at import time.
+        from bourbaki.config import export_api_keys
 
-    reviewer_configs = _parse_reviewer_models(args.reviewer_models)
-    if reviewer_configs:
+        export_api_keys()
         logger.info(
-            "Reviewer fanout: %d legs [%s] mode=%s",
-            len(reviewer_configs),
-            ", ".join(
-                f"{c.model}@{c.llm_timeout:.0f}s" for c in reviewer_configs
-            ),
-            args.reviewer_review_mode,
+            "auto-route: enabled, per-problem fanout via "
+            "fanout_for_problem (race_mode=%s)",
+            args.race_mode,
         )
+
+    reviewer_configs = _resolve_reviewer_configs(args, logger)
 
     result = await run_minif2f(
         split=args.split,
@@ -370,6 +428,7 @@ async def _run(args: argparse.Namespace, problem_ids: list[str], logger) -> None
         loop_proposer_race_mode=args.race_mode,
         loop_reviewer_configs=reviewer_configs,
         loop_reviewer_review_mode=args.reviewer_review_mode,
+        loop_auto_route=args.auto_route,
         pass_n=args.pass_n,
     )
 
@@ -426,6 +485,7 @@ def main() -> None:
         "reviewer_llm_timeout_s": args.reviewer_llm_timeout,
         "proposer_models": args.proposer_models,
         "smart_fanout": args.smart_fanout,
+        "auto_route": args.auto_route,
         "race_mode": args.race_mode,
         "reviewer_models": args.reviewer_models,
         "reviewer_review_mode": args.reviewer_review_mode,

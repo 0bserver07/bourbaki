@@ -557,6 +557,7 @@ async def run_minif2f(
     loop_proposer_race_mode: str = "first_completed",
     loop_reviewer_configs: list["ReviewerConfig"] | None = None,
     loop_reviewer_review_mode: str = "first_approved",
+    loop_auto_route: bool = False,
     pass_n: int = 1,
     verify: bool = True,
     verify_timeout: int = 150,
@@ -604,6 +605,30 @@ async def run_minif2f(
             each leg on a follow-up ``lean_prover`` call so a
             fast-but-broken proof loses to a slower-but-compiling peer.
             Only consulted when ``loop_proposer_configs`` is non-empty.
+        loop_reviewer_configs: Multi-model reviewer fanout configs.
+            When ``None`` (default) the loop runs the single-model
+            reviewer. When a non-empty list is supplied, ``ProverLoop``
+            races those legs via :func:`fanout_review`; the
+            ``lean_prover`` final gate runs exactly once after the
+            ensemble decision.
+        loop_reviewer_review_mode: Combination strategy forwarded to
+            :func:`fanout_review`. ``"first_approved"`` (default) races
+            the legs and accepts the first APPROVE.
+            ``"all_must_approve"`` waits for every leg and accepts only
+            if all approve. Only consulted when ``loop_reviewer_configs``
+            is non-empty.
+        loop_auto_route: Per-source proposer routing. When True, the
+            proposer fanout is computed PER problem via
+            :func:`bourbaki.prover.default_fanout.fanout_for_problem`
+            (which dispatches on the problem ID prefix — ``aime``,
+            ``imo``, ``mathd``, ``algebra``, etc.) instead of being
+            built once from ``loop_proposer_configs``. Mutually
+            exclusive with ``loop_proposer_configs``: if both are
+            passed, ``loop_auto_route=True`` takes precedence and a
+            warning is logged. Inherits ``loop_proposer_race_mode`` for
+            the per-leg ``verify_with_lean`` flag and
+            ``loop_enable_mathlib_search`` for the mathlib_search tool
+            flag on every produced config.
         pass_n: Pass@N sampling for the loop path. ``1`` (default) calls
             :func:`attempt_proof_loop` once per problem; ``>1`` runs up to
             ``pass_n`` independent loop attempts via
@@ -621,6 +646,16 @@ async def run_minif2f(
             "VERIFICATION DISABLED -- benchmark results will be unreliable. "
             "REPL-reported numbers are inflated by false positives."
         )
+    # Auto-route is mutually exclusive with an explicit fanout list.
+    # The CLI argparse rejects the combo, but ``run_minif2f`` is also
+    # called from notebooks / A/B harnesses, so log + override here
+    # rather than crash silently.
+    if loop_auto_route and loop_proposer_configs:
+        logger.warning(
+            "loop_auto_route=True overrides loop_proposer_configs; "
+            "the explicit fanout list will be ignored on every problem."
+        )
+        loop_proposer_configs = None
     problems = load_minif2f_problems(
         split=split,
         source_filter=source_filter,
@@ -655,12 +690,11 @@ async def run_minif2f(
             logger.warning("REPL not available (%s), using lean_prover", e)
             repl_session = None
 
-    # Build the ProverConfig once per run; the loop reuses it across all
-    # problems. Only override the per-LLM-call timeouts when the caller
-    # explicitly passed them — None falls through to the ProverConfig
-    # defaults (which match the proposer.py / reviewer.py module
-    # constants).
-    def _build_loop_cfg():
+    # Build the ProverConfig per problem so ``loop_auto_route`` can swap
+    # the proposer fanout based on the problem's source prefix. When
+    # auto-route is off, the kwargs are the same on every problem and
+    # the cost of rebuilding the config object is negligible.
+    def _build_loop_cfg(problem_id: str):
         from bourbaki.prover import ProverConfig as _ProverConfig
         kwargs: dict = {
             "model": loop_model,
@@ -673,9 +707,36 @@ async def run_minif2f(
             kwargs["proposer_llm_timeout"] = loop_proposer_llm_timeout
         if loop_reviewer_llm_timeout is not None:
             kwargs["reviewer_llm_timeout"] = loop_reviewer_llm_timeout
-        if loop_proposer_configs:
-            kwargs["proposer_configs"] = loop_proposer_configs
+        # Per-problem proposer routing: when loop_auto_route is set,
+        # ``fanout_for_problem`` returns a source-specific fanout (e.g.
+        # reasoning-heavy for aime / imo / putnam, coder-heavy for
+        # algebra / mathd).  Propagates verify_with_lean and
+        # enable_mathlib_search overrides so the produced legs honor
+        # the runner's race mode and mathlib search flag.
+        per_problem_configs = loop_proposer_configs
+        if loop_auto_route:
+            from bourbaki.prover.default_fanout import (
+                fanout_for_problem as _fanout_for_problem,
+            )
+            per_problem_configs = _fanout_for_problem(
+                problem_id,
+                verify_with_lean=(
+                    loop_proposer_race_mode == "first_verified"
+                ),
+                enable_mathlib_search=loop_enable_mathlib_search,
+            )
+            logger.info(
+                "  auto-route: %d legs [%s] for %s",
+                len(per_problem_configs),
+                ", ".join(c.label or c.model for c in per_problem_configs),
+                problem_id,
+            )
+        if per_problem_configs:
+            kwargs["proposer_configs"] = per_problem_configs
             kwargs["proposer_race_mode"] = loop_proposer_race_mode
+        if loop_reviewer_configs:
+            kwargs["reviewer_configs"] = loop_reviewer_configs
+            kwargs["reviewer_review_mode"] = loop_reviewer_review_mode
         return _ProverConfig(**kwargs)
 
     try:
@@ -684,7 +745,7 @@ async def run_minif2f(
             for i, problem in enumerate(problems):
                 logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
                 if repl_session is not None and use_loop:
-                    loop_cfg = _build_loop_cfg()
+                    loop_cfg = _build_loop_cfg(problem.id)
                     if pass_n > 1:
                         result = await attempt_proof_pass_at_n(
                             problem, repl_session, config=loop_cfg,
@@ -718,7 +779,7 @@ async def run_minif2f(
                 for i, problem in enumerate(problems):
                     logger.info("[%d/%d] %s", i + 1, len(problems), problem.id)
                     if use_loop:
-                        loop_cfg = _build_loop_cfg()
+                        loop_cfg = _build_loop_cfg(problem.id)
                         if pass_n > 1:
                             result = await attempt_proof_pass_at_n(
                                 problem, repl_session, config=loop_cfg,
@@ -834,6 +895,33 @@ async def run_minif2f(
             "loop_proposer_race_mode": (
                 loop_proposer_race_mode
                 if use_loop and loop_proposer_configs
+                else None
+            ),
+            "loop_reviewer_configs": (
+                [
+                    {
+                        "model": c.model,
+                        "llm_timeout": c.llm_timeout,
+                        "label": c.label,
+                    }
+                    for c in loop_reviewer_configs
+                ]
+                if use_loop and loop_reviewer_configs
+                else None
+            ),
+            "loop_reviewer_review_mode": (
+                loop_reviewer_review_mode
+                if use_loop and loop_reviewer_configs
+                else None
+            ),
+            "loop_auto_route": loop_auto_route if use_loop else None,
+            # When auto-route is active, the per-problem proposer race
+            # mode is still meaningful (it controls verify_with_lean on
+            # every produced leg).  Surface it so the reproducibility
+            # record isn't ambiguous.
+            "loop_proposer_race_mode_auto_route": (
+                loop_proposer_race_mode
+                if use_loop and loop_auto_route
                 else None
             ),
             "pass_n": pass_n if use_loop else None,
