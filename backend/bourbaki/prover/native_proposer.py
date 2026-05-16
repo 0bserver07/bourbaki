@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import re
+import time
+from typing import Any
 
 import httpx
 from pydantic import ValidationError
@@ -36,12 +38,41 @@ OLLAMA_NATIVE_CHAT_URL = "https://ollama.com/api/chat"
 _PREFIX = "ollama-native:"
 _DEFAULT_NUM_PREDICT = 8000
 _DEFAULT_LLM_TIMEOUT = 90.0
+_MAX_TOOL_CALL_ROUNDS = 5
 
 
 _FENCE_PATTERN = re.compile(
     r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$",
     re.DOTALL,
 )
+
+
+TOOLS_SCHEMA: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "mathlib_search",
+            "description": (
+                "Search Mathlib for lemmas. Modes: 'name' (Loogle exact/partial), "
+                "'type' (Loogle type signature), 'natural' (LeanSearch), 'semantic' "
+                "(LeanExplore), 'local' (offline FAISS). Returns JSON with "
+                "{success, results, count}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["name", "type", "natural", "semantic", "local"],
+                    },
+                    "max_results": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
 
 
 def _coerce_list_fields(parsed_obj: dict) -> None:
@@ -75,26 +106,142 @@ def _strip_markdown_fences(content: str) -> str:
 
 def _build_request_body(
     model_name: str,
-    system_prompt: str,
-    user_msg: str,
-) -> dict:
+    messages: list[dict[str, Any]],
+    *,
+    include_tools: bool,
+) -> dict[str, Any]:
     """Compose the native ``/api/chat`` body.
 
     Uses the pydantic-generated ``ProverResult.model_json_schema()`` as
     the ``format`` constraint. ``think: false`` is the load-bearing flag
     that prevents reasoning models from looping forever.
     """
-    return {
+    body: dict[str, Any] = {
         "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
+        "messages": messages,
         "think": False,
         "format": ProverResult.model_json_schema(),
         "stream": False,
         "options": {"num_predict": _DEFAULT_NUM_PREDICT},
     }
+    if include_tools:
+        body["tools"] = TOOLS_SCHEMA
+    return body
+
+
+async def _invoke_tool_call(tool_call: dict[str, Any]) -> str:
+    """Execute one tool call and return a JSON-string result.
+
+    Unknown tool names and malformed arguments return a JSON error
+    payload instead of raising — the LLM should observe the failure and
+    retry on the next round.
+    """
+    from bourbaki.tools.mathlib_search import mathlib_search
+
+    function = tool_call.get("function") or {}
+    name = function.get("name", "")
+    raw_args = function.get("arguments", {})
+
+    # Ollama may serialize arguments as a JSON string in some configs.
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"tool arguments not valid JSON: {exc}",
+                }
+            )
+
+    if not isinstance(raw_args, dict):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"tool arguments must be an object, got "
+                    f"{type(raw_args).__name__}"
+                ),
+            }
+        )
+
+    if name != "mathlib_search":
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"unknown tool {name!r}; only 'mathlib_search' is available "
+                    "on the native path."
+                ),
+            }
+        )
+
+    query = raw_args.get("query")
+    if not isinstance(query, str) or not query:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "mathlib_search: missing required 'query' string argument.",
+            }
+        )
+
+    mode = raw_args.get("mode", "name")
+    if not isinstance(mode, str):
+        mode = "name"
+
+    max_results = raw_args.get("max_results", 5)
+    if not isinstance(max_results, int) or isinstance(max_results, bool):
+        max_results = 5
+
+    try:
+        result = await mathlib_search(
+            query=query, mode=mode, max_results=max_results
+        )
+    except Exception as exc:  # noqa: BLE001 — never bubble up
+        logger.exception("mathlib_search tool invocation failed")
+        return json.dumps(
+            {"success": False, "error": f"mathlib_search raised: {exc}"}
+        )
+
+    return json.dumps(result, default=str)
+
+
+def _parse_proposal(
+    raw_content: str, state: ProverState
+) -> ProposalMessage | FeedbackMessage:
+    """Strip fences, parse JSON, coerce sloppy fields, and validate.
+
+    Returns either a fully-formed :class:`ProposalMessage` or a
+    parse-failed :class:`FeedbackMessage` — never raises.
+    """
+    cleaned = _strip_markdown_fences(raw_content)
+    try:
+        parsed_obj = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "run_proposer_native: failed to parse content as JSON: %s", exc
+        )
+        return feedback.structured_output_parsing_failed(
+            f"failed to parse ollama-native content as JSON: {exc}"
+        )
+
+    _coerce_list_fields(parsed_obj)
+
+    try:
+        output = ProverResult.model_validate(parsed_obj)
+    except ValidationError as exc:
+        logger.error("run_proposer_native: validation failed: %s", exc)
+        return feedback.structured_output_parsing_failed(
+            f"ollama-native output failed schema validation: {exc}"
+        )
+
+    return ProposalMessage(
+        reasoning=output.reasoning,
+        imports=output.imports,
+        opens=output.opens,
+        code=output.updated_theorem,
+        iteration=state.iteration + 1,
+    )
 
 
 async def run_proposer_native(
@@ -114,11 +261,13 @@ async def run_proposer_native(
             ``iteration = state.iteration + 1``.
         model: Must begin with ``ollama-native:`` (e.g.
             ``ollama-native:kimi-k2.6``).
-        llm_timeout: Per-LLM-call timeout in seconds; passed as the
-            httpx request timeout.
-        enable_mathlib_search: Accepted for API parity with
-            ``run_proposer``. Native path does NOT yet support proposer
-            tools — logs a WARNING and proceeds as if False.
+        llm_timeout: Total time budget across all tool-call rounds, in
+            seconds. Each round shares the global budget — when it is
+            exhausted we return a parse-failed feedback.
+        enable_mathlib_search: When True, advertise the ``mathlib_search``
+            tool in the request and run the tool-call loop (max
+            :data:`_MAX_TOOL_CALL_ROUNDS` rounds) until the model emits a
+            final structured-output response without ``tool_calls``.
     """
 
     if state.iteration >= state.max_iterations:
@@ -148,9 +297,9 @@ async def run_proposer_native(
         )
 
     if enable_mathlib_search:
-        logger.warning(
-            "run_proposer_native: enable_mathlib_search=True is not supported on "
-            "the native path yet; proceeding without proposer tools."
+        logger.info(
+            "native path: mathlib_search tool enabled (max %d rounds)",
+            _MAX_TOOL_CALL_ROUNDS,
         )
 
     user_msg = _build_user_message(state)
@@ -159,92 +308,150 @@ async def run_proposer_native(
         if state.max_iterations == 1
         else prompts.PROPOSER_SYSTEM_PROMPT
     )
-    body = _build_request_body(model_name, sys_prompt, user_msg)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_msg},
+    ]
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(llm_timeout)) as client:
-            response = await client.post(
-                OLLAMA_NATIVE_CHAT_URL,
-                json=body,
-                headers=headers,
+    deadline = time.monotonic() + llm_timeout
+
+    # Tool-call loop. When enable_mathlib_search is False this runs
+    # exactly once because the model can't request a tool. The cap
+    # protects against pathological loops where the model keeps asking
+    # for searches forever.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(llm_timeout)) as client:
+        for round_idx in range(_MAX_TOOL_CALL_ROUNDS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "run_proposer_native: %s exceeded total %.0fs budget across "
+                    "%d round(s)",
+                    model,
+                    llm_timeout,
+                    round_idx,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native exceeded total {llm_timeout:.0f}s budget "
+                    f"across {round_idx} tool-call round(s)"
+                )
+
+            if round_idx == _MAX_TOOL_CALL_ROUNDS:
+                logger.warning(
+                    "run_proposer_native: %s hit max tool-call rounds (%d); "
+                    "returning parse-failed feedback",
+                    model,
+                    _MAX_TOOL_CALL_ROUNDS,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native exceeded max tool-call rounds "
+                    f"({_MAX_TOOL_CALL_ROUNDS})"
+                )
+
+            body = _build_request_body(
+                model_name, messages, include_tools=enable_mathlib_search
             )
-    except (httpx.TimeoutException, asyncio.TimeoutError):
-        logger.warning(
-            "run_proposer_native: %s call timed out after %.0fs", model, llm_timeout
-        )
-        return feedback.structured_output_parsing_failed(
-            f"ollama-native LLM call timed out after {llm_timeout:.0f}s"
-        )
-    except Exception as exc:  # noqa: BLE001 — never let exceptions bubble up
-        logger.exception("run_proposer_native: %s call failed", model)
-        return feedback.structured_output_parsing_failed(
-            f"native call failed: {exc}"
-        )
 
-    if response.status_code == 429:
-        logger.warning("run_proposer_native: %s rate limited (429)", model)
-        return feedback.structured_output_parsing_failed(
-            "ollama-native rate limited (429); retry on next iteration."
-        )
-    if response.status_code >= 400:
-        snippet = response.text[:200].replace("\n", " ")
-        logger.error(
-            "run_proposer_native: %s returned HTTP %s — %s",
-            model,
-            response.status_code,
-            snippet,
-        )
-        return feedback.structured_output_parsing_failed(
-            f"ollama-native HTTP {response.status_code} error: {snippet}"
-        )
+            try:
+                response = await client.post(
+                    OLLAMA_NATIVE_CHAT_URL,
+                    json=body,
+                    headers=headers,
+                    timeout=httpx.Timeout(remaining),
+                )
+            except (httpx.TimeoutException, asyncio.TimeoutError):
+                logger.warning(
+                    "run_proposer_native: %s call timed out after %.0fs",
+                    model,
+                    llm_timeout,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native LLM call timed out after {llm_timeout:.0f}s"
+                )
+            except Exception as exc:  # noqa: BLE001 — never let exceptions bubble up
+                logger.exception("run_proposer_native: %s call failed", model)
+                return feedback.structured_output_parsing_failed(
+                    f"native call failed: {exc}"
+                )
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        logger.error("run_proposer_native: non-JSON response: %s", exc)
-        return feedback.structured_output_parsing_failed(
-            f"ollama-native returned non-JSON response: {exc}"
-        )
+            if response.status_code == 429:
+                logger.warning("run_proposer_native: %s rate limited (429)", model)
+                return feedback.structured_output_parsing_failed(
+                    "ollama-native rate limited (429); retry on next iteration."
+                )
+            if response.status_code >= 400:
+                snippet = response.text[:200].replace("\n", " ")
+                logger.error(
+                    "run_proposer_native: %s returned HTTP %s — %s",
+                    model,
+                    response.status_code,
+                    snippet,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native HTTP {response.status_code} error: {snippet}"
+                )
 
-    try:
-        raw_content = payload["message"]["content"]
-    except (KeyError, TypeError) as exc:
-        logger.error(
-            "run_proposer_native: missing message.content in response (%s)", exc
-        )
-        return feedback.structured_output_parsing_failed(
-            f"ollama-native response missing message.content: {exc}"
-        )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                logger.error("run_proposer_native: non-JSON response: %s", exc)
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native returned non-JSON response: {exc}"
+                )
 
-    cleaned = _strip_markdown_fences(raw_content)
-    try:
-        parsed_obj = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "run_proposer_native: failed to parse content as JSON: %s", exc
-        )
-        return feedback.structured_output_parsing_failed(
-            f"failed to parse ollama-native content as JSON: {exc}"
-        )
+            try:
+                message = payload["message"]
+            except (KeyError, TypeError) as exc:
+                logger.error(
+                    "run_proposer_native: missing message in response (%s)", exc
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native response missing message: {exc}"
+                )
 
-    _coerce_list_fields(parsed_obj)
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+            if tool_calls:
+                # Append the assistant message verbatim (including the
+                # tool_calls field, even if content is empty) and one
+                # role:tool message per call, then loop.
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content", "") or "",
+                        "tool_calls": tool_calls,
+                    }
+                )
+                for tc in tool_calls:
+                    tool_content = await _invoke_tool_call(tc)
+                    fn = tc.get("function") or {}
+                    tool_name = fn.get("name", "")
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "name": tool_name,
+                            "content": tool_content,
+                        }
+                    )
+                continue
 
-    try:
-        output = ProverResult.model_validate(parsed_obj)
-    except ValidationError as exc:
-        logger.error("run_proposer_native: validation failed: %s", exc)
-        return feedback.structured_output_parsing_failed(
-            f"ollama-native output failed schema validation: {exc}"
-        )
+            try:
+                raw_content = message["content"]
+            except (KeyError, TypeError) as exc:
+                logger.error(
+                    "run_proposer_native: missing message.content in response (%s)",
+                    exc,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"ollama-native response missing message.content: {exc}"
+                )
 
-    return ProposalMessage(
-        reasoning=output.reasoning,
-        imports=output.imports,
-        opens=output.opens,
-        code=output.updated_theorem,
-        iteration=state.iteration + 1,
+            return _parse_proposal(raw_content, state)
+
+    # Unreachable: the loop either returns inside the body or hits the
+    # max-rounds branch. Belt-and-braces fallback for type-checkers.
+    return feedback.structured_output_parsing_failed(
+        "ollama-native tool-call loop terminated unexpectedly"
     )
