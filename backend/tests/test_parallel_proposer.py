@@ -449,3 +449,104 @@ async def test_empty_code_proposal_solo_falls_through(monkeypatch):
 
     assert isinstance(out, FeedbackMessage)
     assert out.kind == "structured_output_parsing_failed"
+
+
+# ---------------------------------------------------------------------------
+# 12. Dispatcher: ollama-native: prefix routes through run_proposer_native
+# ---------------------------------------------------------------------------
+
+
+async def test_dispatcher_routes_native_prefix(monkeypatch):
+    """A ProposerConfig with ``ollama-native:`` prefix must be served by
+    ``run_proposer_native``; the default ``run_proposer`` must not be
+    called for that leg.
+    """
+    from bourbaki.prover import native_proposer as native_mod
+
+    native_proposal = _make_proposal(code="theorem native_won : True := trivial")
+    native_called = {"n": 0}
+    fallback_called = {"n": 0}
+
+    async def fake_native(state, *, model, **kwargs):
+        native_called["n"] += 1
+        assert model.startswith("ollama-native:")
+        return native_proposal
+
+    async def fake_fallback(state, *, model, **kwargs):
+        fallback_called["n"] += 1
+        return _make_feedback(content="should-not-be-called")
+
+    monkeypatch.setattr(native_mod, "run_proposer_native", fake_native)
+    monkeypatch.setattr(pp_mod, "run_proposer", fake_fallback)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="ollama-native:kimi-k2.6")],
+    )
+
+    assert out is native_proposal
+    assert native_called["n"] == 1
+    assert fallback_called["n"] == 0
+
+
+async def test_dispatcher_routes_other_prefixes_to_run_proposer(monkeypatch):
+    """Any prefix that is NOT ``ollama-native:`` must keep using the
+    standard ``run_proposer``.
+    """
+    from bourbaki.prover import native_proposer as native_mod
+
+    glm_proposal = _make_proposal(code="theorem glm_won : True := trivial")
+    glm_called = {"n": 0}
+    native_called = {"n": 0}
+
+    async def fake_glm(state, *, model, **kwargs):
+        glm_called["n"] += 1
+        assert not model.startswith("ollama-native:")
+        return glm_proposal
+
+    async def fake_native(state, *, model, **kwargs):
+        native_called["n"] += 1
+        return _make_feedback(content="native-should-not-be-called")
+
+    monkeypatch.setattr(pp_mod, "run_proposer", fake_glm)
+    monkeypatch.setattr(native_mod, "run_proposer_native", fake_native)
+
+    out = await parallel_propose(
+        _make_state(),
+        [ProposerConfig(model="glm:glm-5.1")],
+    )
+
+    assert out is glm_proposal
+    assert glm_called["n"] == 1
+    assert native_called["n"] == 0
+
+
+async def test_dispatcher_mixed_legs(monkeypatch):
+    """When configs mix prefixes, each one routes to the right callable."""
+    from bourbaki.prover import native_proposer as native_mod
+
+    seen: dict[str, str] = {}
+
+    async def fake_native(state, *, model, **kwargs):
+        seen[model] = "native"
+        return _make_feedback(content=f"native-{model}")
+
+    async def fake_glm(state, *, model, **kwargs):
+        seen[model] = "glm"
+        return _make_feedback(content=f"glm-{model}")
+
+    monkeypatch.setattr(native_mod, "run_proposer_native", fake_native)
+    monkeypatch.setattr(pp_mod, "run_proposer", fake_glm)
+
+    await parallel_propose(
+        _make_state(),
+        [
+            ProposerConfig(model="ollama-native:kimi-k2.6"),
+            ProposerConfig(model="glm:glm-5.1"),
+        ],
+    )
+
+    assert seen == {
+        "ollama-native:kimi-k2.6": "native",
+        "glm:glm-5.1": "glm",
+    }

@@ -23,6 +23,26 @@ from bourbaki.prover.state import (
 logger = logging.getLogger(__name__)
 
 
+_NATIVE_PREFIX = "ollama-native:"
+
+
+def _proposer_for(model: str):
+    """Return the proposer callable matching a model string's routing prefix.
+
+    The ``ollama-native:`` prefix routes through the native /api/chat
+    adapter (see :mod:`bourbaki.prover.native_proposer`); everything else
+    flows through :func:`bourbaki.prover.proposer.run_proposer` and the
+    standard pydantic_ai providers.
+
+    Imports the native module lazily so its httpx-based code path isn't
+    pulled in by callers who never use it.
+    """
+    if model.startswith(_NATIVE_PREFIX):
+        from bourbaki.prover.native_proposer import run_proposer_native
+        return run_proposer_native
+    return run_proposer
+
+
 @dataclass(frozen=True)
 class ProposerConfig:
     """One proposer leg in a parallel fanout.
@@ -105,7 +125,8 @@ async def parallel_propose(
     )
 
     async def _run_one(cfg: ProposerConfig) -> ProposalMessage | FeedbackMessage:
-        return await run_proposer(
+        proposer_fn = _proposer_for(cfg.model)
+        return await proposer_fn(
             state,
             model=cfg.model,
             llm_timeout=cfg.llm_timeout,
