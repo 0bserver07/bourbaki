@@ -100,7 +100,13 @@ async def run_builder(
     # 4a) REPL-level error (timeout, pipe corruption). The send_cmd shape
     # is ``{"error": "..."}`` with no ``messages`` / ``sorries`` keys.
     if "error" in result and "messages" not in result and "sorries" not in result:
-        return feedback.build_failed(str(result.get("error", "unknown REPL error")))
+        repl_error = str(result.get("error", "unknown REPL error"))
+        logger.info(
+            "builder: build_failed for '%s' — REPL-level error: %s",
+            target_name,
+            repl_error,
+        )
+        return feedback.build_failed(repl_error)
 
     # 4b) Compiler errors (severity == "error" in messages).
     messages = result.get("messages") or []
@@ -110,17 +116,33 @@ async def run_builder(
     ]
     if error_messages:
         rendered = _render_repl_errors(error_messages)
+        logger.info(
+            "builder: build_failed for '%s' — %d compiler error(s)",
+            target_name,
+            len(error_messages),
+        )
         return feedback.build_failed(rendered)
 
     # 4c) Remaining sorries — extract goal states.
     sorries = result.get("sorries") or []
     if sorries:
         goal_states = _extract_sorry_goals(sorries)
+        logger.info(
+            "builder: sorries_goal_state for '%s' — %d remaining sorry/sorries",
+            target_name,
+            len(sorries),
+        )
         return feedback.sorries_goal_state(len(sorries), goal_states)
 
     # 4d) Forbidden ``axiom`` declarations (scan post-strip code).
     axiom_count, axiom_locations = _count_pattern(stripped_code, r"\baxiom\b")
     if axiom_count:
+        logger.info(
+            "builder: axiom_detected for '%s' — %d axiom declaration(s) at %s",
+            target_name,
+            axiom_count,
+            axiom_locations,
+        )
         return feedback.axiom_detected(axiom_count, axiom_locations)
 
     # 4e) Banned search tactics (apply? / exact?).
@@ -128,6 +150,13 @@ async def run_builder(
         stripped_code, r"\b(?:apply|exact)\?"
     )
     if search_count:
+        logger.info(
+            "builder: search_tactics_detected for '%s' — %d apply?/exact? "
+            "at %s",
+            target_name,
+            search_count,
+            search_locations,
+        )
         return feedback.search_tactics_detected(search_count, search_locations)
 
     # 4f) Tactic blocklist (REPL false positives — see autonomous/tactics.py).
@@ -145,9 +174,17 @@ async def run_builder(
         if bcount == 0:
             blocations = f"blocklisted tactic: {blocked}"
             bcount = 1
+        logger.info(
+            "builder: search_tactics_detected for '%s' — blocklisted tactic "
+            "'%s' at %s",
+            target_name,
+            blocked,
+            blocations,
+        )
         return feedback.search_tactics_detected(bcount, blocations)
 
     # 5) Clean build.
+    logger.info("builder: build_success for '%s'", target_name)
     return feedback.build_success()
 
 

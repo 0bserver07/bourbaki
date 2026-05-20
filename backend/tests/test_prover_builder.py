@@ -303,6 +303,122 @@ async def test_repl_level_error_is_reported_as_build_failed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Observability: each build outcome emits one INFO log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_success_emits_info_log(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="theorem my_target : True := trivial", problem_id="my_target"
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"messages": [], "sorries": [], "env": 1}
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("build_success for 'my_target'" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_build_failed_compiler_errors_emit_info_log(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="theorem my_target : True := wrong", problem_id="my_target"
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {
+        "messages": [{"severity": "error", "data": "boom"}],
+        "sorries": [],
+        "env": 1,
+    }
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("build_failed" in m and "compiler error" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_repl_level_error_emits_info_log(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="theorem my_target : True := trivial", problem_id="my_target"
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"error": "REPL timed out"}
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("build_failed" in m and "REPL-level error" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_sorries_outcome_emits_info_log_with_count(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="theorem my_target : True := by sorry", problem_id="my_target"
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {
+        "messages": [],
+        "sorries": [{"goal": "⊢ True", "proofState": 0}],
+        "env": 1,
+    }
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("sorries_goal_state" in m and "1 remaining" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_axiom_outcome_emits_info_log(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="axiom my_axiom : True\ntheorem my_target : True := my_axiom",
+        problem_id="my_target",
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"messages": [], "sorries": [], "env": 1}
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("axiom_detected for 'my_target'" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_search_tactics_outcome_emits_info_log(caplog) -> None:
+    import logging
+
+    state = _make_state(
+        code="theorem my_target : True := by\n  apply?", problem_id="my_target"
+    )
+    mock_session = AsyncMock(spec=LeanREPLSession)
+    mock_session.send_cmd.return_value = {"messages": [], "sorries": [], "env": 1}
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.builder"):
+        await run_builder(state, mock_session)
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("search_tactics_detected for 'my_target'" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
 # Helper unit tests
 # ---------------------------------------------------------------------------
 

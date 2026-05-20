@@ -208,6 +208,96 @@ async def test_loop_terminates_on_repeated_parsing_failures(monkeypatch):
     assert state.last_feedback.kind == "max_iterations"
 
 
+# ---------------------------------------------------------------------------
+# Observability: loop entry/exit + route-decision logs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_loop_logs_entry_exit_and_route_decisions(monkeypatch, caplog):
+    """The loop must emit INFO logs for entry, exit, and every routing
+    decision (proposer/builder/reviewer) — these paths were silent."""
+    import logging
+
+    proposal = ProposalMessage(
+        reasoning="rfl works", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=1
+    )
+    loop, _, _, _ = _make_loop(
+        monkeypatch,
+        proposer_returns=[proposal],
+        builder_returns=[fb.build_success()],
+        reviewer_returns=[fb.review_approved("clean")],
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.prover"):
+        await loop.run(_make_problem())
+
+    messages = [r.getMessage() for r in caplog.records]
+    joined = "\n".join(messages)
+    # entry names the problem and the proposer/reviewer path
+    assert any(
+        "entering for problem 'mathd_test_1'" in m and "proposer=single" in m
+        for m in messages
+    )
+    assert any("exiting 'mathd_test_1'" in m for m in messages)
+    # one route line per node, each naming the node and outcome
+    assert any("node=proposer outcome=continue" in m for m in messages)
+    assert any("node=builder outcome=continue" in m for m in messages)
+    assert any("node=reviewer outcome=continue" in m for m in messages)
+    # exit line carries verified status
+    assert "verified=True" in joined
+
+
+@pytest.mark.asyncio
+async def test_loop_logs_max_iterations_exit(monkeypatch, caplog):
+    """The attempts-exceeded branch must log an INFO line, not exit silently."""
+    import logging
+
+    parse_fails = [fb.structured_output_parsing_failed(f"f{i}") for i in range(20)]
+    loop, _, _, _ = _make_loop(
+        monkeypatch,
+        proposer_returns=parse_fails,
+        builder_returns=[],
+        reviewer_returns=[],
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.prover"):
+        await loop.run(_make_problem())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("exceeded max_iterations" in m for m in messages)
+    # the retry route on the proposer should also be logged
+    assert any("node=proposer outcome=retry" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_loop_logs_builder_retry_route(monkeypatch, caplog):
+    """A build failure must produce a builder route=retry INFO log."""
+    import logging
+
+    p1 = ProposalMessage(
+        reasoning="x", code="theorem mathd_test_1 : 1 = 1 := by sorry", iteration=1
+    )
+    p2 = ProposalMessage(
+        reasoning="rfl", code="theorem mathd_test_1 : 1 = 1 := rfl", iteration=2
+    )
+    loop, _, _, _ = _make_loop(
+        monkeypatch,
+        proposer_returns=[p1, p2],
+        builder_returns=[fb.build_failed("type mismatch"), fb.build_success()],
+        reviewer_returns=[fb.review_approved("ok")],
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.prover"):
+        await loop.run(_make_problem())
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "node=builder outcome=retry" in m and "feedback_kind=build_failed" in m
+        for m in messages
+    )
+
+
 def test_extract_preamble_pulls_imports_and_opens():
     from bourbaki.prover.prover import _extract_preamble
 

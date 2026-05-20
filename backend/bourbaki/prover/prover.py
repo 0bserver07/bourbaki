@@ -119,6 +119,17 @@ def _extract_preamble(full_lean_code: str, statement: str) -> str:
     return full_lean_code[:idx].rstrip()
 
 
+def _last_feedback_kind(state: ProverState) -> str:
+    """Return the ``kind`` of the most recent feedback message, for logging.
+
+    Routing decisions are driven by the latest feedback (builder/reviewer)
+    or by a non-proposal proposer result; surfacing the kind makes a route
+    log line self-explanatory. Returns ``"-"`` when no feedback is set.
+    """
+    fb = state.last_feedback
+    return fb.kind if isinstance(fb, FeedbackMessage) else "-"
+
+
 class ProverLoop:
     """Drives the proposer → builder → reviewer cycle for a single theorem."""
 
@@ -141,6 +152,15 @@ class ProverLoop:
             max_iterations=self.config.max_iterations,
         )
 
+        logger.info(
+            "prover loop: entering for problem '%s' (max_iterations=%d, "
+            "proposer=%s, reviewer=%s)",
+            problem.id,
+            state.max_iterations,
+            "fanout" if self.config.proposer_configs else "single",
+            "fanout" if self.config.reviewer_configs else "single",
+        )
+
         # Loop-owned attempt counter — bumped on every proposer call so a
         # streak of parsing failures (which never bump ``state.iteration``,
         # since that tracks successful proposals) can't loop forever.
@@ -152,6 +172,13 @@ class ProverLoop:
                 terminal = max_iterations_feedback(state.max_iterations)
                 state.messages.append(terminal)
                 state.last_feedback = terminal
+                logger.info(
+                    "prover loop: '%s' attempts=%d exceeded max_iterations=%d "
+                    "— ending",
+                    state.problem_id,
+                    attempts,
+                    state.max_iterations,
+                )
                 break
 
             # --- Proposer ---
@@ -164,6 +191,15 @@ class ProverLoop:
                 state.last_feedback = proposed
 
             route = self._route_proposer(state)
+            logger.info(
+                "prover route: node=proposer outcome=%s problem='%s' "
+                "iteration=%d attempts=%d feedback_kind=%s",
+                route,
+                state.problem_id,
+                state.iteration,
+                attempts,
+                _last_feedback_kind(state),
+            )
             if route == "end":
                 break
             if route == "retry":
@@ -176,6 +212,15 @@ class ProverLoop:
             state.last_feedback = build_fb
 
             build_route = self._route_builder(state)
+            logger.info(
+                "prover route: node=builder outcome=%s problem='%s' "
+                "iteration=%d attempts=%d feedback_kind=%s",
+                build_route,
+                state.problem_id,
+                state.iteration,
+                attempts,
+                _last_feedback_kind(state),
+            )
             if build_route == "end":
                 break
             if build_route == "retry":
@@ -186,6 +231,17 @@ class ProverLoop:
             review_fb = await self._reviewer(state)
             state.messages.append(review_fb)
             state.last_feedback = review_fb
+
+            review_route = self._route_reviewer(state)
+            logger.info(
+                "prover route: node=reviewer outcome=%s problem='%s' "
+                "iteration=%d attempts=%d feedback_kind=%s",
+                review_route,
+                state.problem_id,
+                state.iteration,
+                attempts,
+                _last_feedback_kind(state),
+            )
 
             if review_fb.kind == "review_approved":
                 state.approved = True
@@ -209,6 +265,15 @@ class ProverLoop:
             # rejection → memory → next proposer iteration
             state.experience = await self._memory(state)
 
+        logger.info(
+            "prover loop: exiting '%s' — verified=%s approved=%s "
+            "iteration=%d attempts=%d",
+            state.problem_id,
+            state.verified,
+            state.approved,
+            state.iteration,
+            attempts,
+        )
         return state
 
     # ----- Node delegators -----
@@ -254,6 +319,11 @@ class ProverLoop:
                 self.config.reviewer_configs,
                 mode=self.config.reviewer_review_mode,
             )
+            logger.info(
+                "reviewer fanout: ensemble for '%s' returned kind=%s",
+                state.problem_id,
+                ensemble.kind,
+            )
             if ensemble.kind != "review_approved":
                 return ensemble
             return await self._final_lean_gate(state, ensemble)
@@ -297,11 +367,20 @@ class ProverLoop:
             )
 
         if verify_result.get("proofComplete"):
+            logger.info(
+                "reviewer fanout: final lean gate PASSED for '%s'",
+                state.problem_id,
+            )
             return ensemble_approval
 
+        error_summary = _summarize_lean_errors(verify_result)
+        logger.info(
+            "reviewer fanout: final lean gate FAILED for '%s' — %s",
+            state.problem_id,
+            error_summary,
+        )
         return feedback_module.review_rejected(
-            f"final lean_prover verification failed: "
-            f"{_summarize_lean_errors(verify_result)}"
+            f"final lean_prover verification failed: {error_summary}"
         )
 
     async def _memory(self, state: ProverState) -> str:

@@ -427,6 +427,128 @@ async def test_reviewer_decide_only_default_false_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _summarize_lean_errors — return-code fallback
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_lean_errors_renders_errors_list():
+    summary = reviewer_mod._summarize_lean_errors(
+        {"errors": [{"line": 7, "message": "type mismatch"}]}
+    )
+    assert "line 7" in summary
+    assert "type mismatch" in summary
+
+
+def test_summarize_lean_errors_falls_back_to_proof_complete():
+    """Regression: with no errors, no error string, and no rawOutput the
+    summary previously degraded to a bare 'unknown error'. It must now
+    surface the verify result's process outcome (proofComplete / success)
+    — lean_prover's result dict has no subprocess exit-code key.
+    """
+    summary = reviewer_mod._summarize_lean_errors(
+        {"success": False, "proofComplete": False, "duration": 1234}
+    )
+    assert summary != "unknown error"
+    assert "proofComplete=False" in summary
+    assert "success=False" in summary
+    assert "1234" in summary
+
+
+def test_summarize_lean_errors_unknown_when_dict_is_empty():
+    """A truly empty dict (no process keys at all) still yields the bare
+    'unknown error' sentinel — the fallback only triggers when process
+    outcome keys are present."""
+    assert reviewer_mod._summarize_lean_errors({}) == "unknown error"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer observability logs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reviewer_logs_llm_rejection(monkeypatch, caplog):
+    import logging
+
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="signature renamed",
+        check_1=False,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr("pydantic_ai.Agent.run", _agent_run_returning(decision))
+    monkeypatch.setattr(
+        reviewer_mod, "lean_prover",
+        AsyncMock(side_effect=AssertionError("lean_prover must not run")),
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.reviewer"):
+        await run_reviewer(state, model="glm:glm-5.1")
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("LLM rejected proof for 'p1'" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_logs_llm_approval_and_final_gate_pass(monkeypatch, caplog):
+    import logging
+
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="clean",
+        check_1=True,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr("pydantic_ai.Agent.run", _agent_run_returning(decision))
+    monkeypatch.setattr(
+        reviewer_mod, "lean_prover",
+        AsyncMock(return_value={
+            "success": True, "proofComplete": True, "errors": None,
+        }),
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.reviewer"):
+        await run_reviewer(state, model="glm:glm-5.1")
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("LLM approved proof for 'p1'" in m for m in msgs)
+    assert any("final lean gate PASSED for 'p1'" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_logs_final_gate_failure(monkeypatch, caplog):
+    import logging
+
+    state = _state_with_proposal()
+    decision = ReviewDecision(
+        reasoning="ok",
+        check_1=True,
+        check_2=True,
+        check_3=True,
+        approved=True,
+    )
+    monkeypatch.setattr("pydantic_ai.Agent.run", _agent_run_returning(decision))
+    monkeypatch.setattr(
+        reviewer_mod, "lean_prover",
+        AsyncMock(return_value={
+            "success": False,
+            "proofComplete": False,
+            "errors": [{"line": 2, "message": "boom"}],
+        }),
+    )
+
+    with caplog.at_level(logging.INFO, logger="bourbaki.prover.reviewer"):
+        await run_reviewer(state, model="glm:glm-5.1")
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("final lean gate FAILED for 'p1'" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
 # Memory tests
 # ---------------------------------------------------------------------------
 

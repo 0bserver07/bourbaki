@@ -52,6 +52,20 @@ def _summarize_lean_errors(result: dict) -> str:
     raw = result.get("rawOutput") or ""
     if raw:
         return raw[:400]
+    # No errors list, no error string, no raw output. ``lean_prover``'s
+    # result dict has no subprocess exit-code key — its process-outcome
+    # signal is ``proofComplete`` (``return_code == 0 and not has_errors
+    # and not has_sorry``) plus ``success`` (``not has_errors``). Surface
+    # those so a silent failure still carries actionable signal instead
+    # of a bare "unknown error". (``parallel_proposer.py`` makes the same
+    # ``proofComplete``-over-``success`` adaptation for its leg gate.)
+    if "proofComplete" in result or "success" in result:
+        return (
+            f"lean_prover returned no diagnostics "
+            f"(proofComplete={result.get('proofComplete')}, "
+            f"success={result.get('success')}, "
+            f"duration={result.get('duration')}ms)"
+        )
     return "unknown error"
 
 
@@ -126,7 +140,19 @@ async def run_reviewer(
     approved = bool(decision.check_1 and decision.check_2)
 
     if not approved:
+        logger.info(
+            "reviewer: LLM rejected proof for '%s' (check_1=%s check_2=%s)",
+            state.problem_id,
+            decision.check_1,
+            decision.check_2,
+        )
         return feedback.review_rejected(decision.reasoning)
+
+    logger.info(
+        "reviewer: LLM approved proof for '%s' (decide_only=%s)",
+        state.problem_id,
+        decide_only,
+    )
 
     # Fanout coordinators ask for the LLM decision only — they run
     # ``lean_prover`` exactly once after the multi-leg ensemble has
@@ -166,9 +192,18 @@ async def run_reviewer(
     # checks ``proofComplete`` and would reject — producing a false
     # positive of exactly the class this gate is meant to catch.
     if verify_result.get("proofComplete"):
+        logger.info(
+            "reviewer: final lean gate PASSED for '%s' — proof approved",
+            state.problem_id,
+        )
         return feedback.review_approved(decision.reasoning)
 
     error_summary = _summarize_lean_errors(verify_result)
+    logger.info(
+        "reviewer: final lean gate FAILED for '%s' — %s",
+        state.problem_id,
+        error_summary,
+    )
     return feedback.review_rejected(
         f"final lean_prover verification failed: {error_summary}"
     )
