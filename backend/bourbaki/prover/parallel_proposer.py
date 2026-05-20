@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -39,6 +40,52 @@ _NATIVE_PREFIX = "ollama-native:"
 _STREAM_PREFIX = "ollama-stream:"
 
 RaceMode = Literal["first_completed", "first_verified"]
+
+# Upper bound on concurrent ``lean_prover`` compiles inside a single
+# ``parallel_propose`` fanout. Each verify is a full ``lake env lean`` +
+# ``import Mathlib`` compile — very heavy on CPU and RAM. The proposer LLM
+# calls fan out fully parallel (cheap, I/O-bound), but letting every
+# verify-eligible leg shell out to Lean at once thrashes the machine:
+# 7 simultaneous Mathlib compiles measured 7.3x slower wall-clock than 5
+# on the same problem. Only the verify step needs throttling.
+#
+# Overridable via the ``BOURBAKI_MAX_CONCURRENT_VERIFIES`` env var so a
+# bigger box can raise the cap without a code change. Kept local to this
+# module on purpose — it is a property of the verify fanout, not global
+# config. A non-positive or unparseable value falls back to the default.
+_DEFAULT_MAX_CONCURRENT_VERIFIES = 3
+
+
+def _max_concurrent_verifies() -> int:
+    """Resolve the concurrent-verify cap from the environment.
+
+    Reads ``BOURBAKI_MAX_CONCURRENT_VERIFIES`` at call time (not import
+    time) so tests can monkeypatch ``os.environ`` per case. Any value that
+    is not a positive integer falls back to
+    :data:`_DEFAULT_MAX_CONCURRENT_VERIFIES`.
+    """
+    raw = os.environ.get("BOURBAKI_MAX_CONCURRENT_VERIFIES")
+    if raw is None:
+        return _DEFAULT_MAX_CONCURRENT_VERIFIES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "BOURBAKI_MAX_CONCURRENT_VERIFIES=%r is not an int; "
+            "falling back to %d",
+            raw,
+            _DEFAULT_MAX_CONCURRENT_VERIFIES,
+        )
+        return _DEFAULT_MAX_CONCURRENT_VERIFIES
+    if value < 1:
+        logger.warning(
+            "BOURBAKI_MAX_CONCURRENT_VERIFIES=%d is not positive; "
+            "falling back to %d",
+            value,
+            _DEFAULT_MAX_CONCURRENT_VERIFIES,
+        )
+        return _DEFAULT_MAX_CONCURRENT_VERIFIES
+    return value
 
 
 def _proposer_for(model: str):
@@ -121,14 +168,38 @@ def _is_valid_proposal(msg: ProposalMessage | FeedbackMessage) -> bool:
 
 
 def _summarise_lean_errors(verify_result: dict) -> str:
-    """Compact one-line summary of the first lean_prover error, for logs."""
+    """Compact one-line summary of the first lean_prover error, for logs.
+
+    ``lean_prover`` returns no explicit process exit-code key — the
+    process return code is folded internally into ``proofComplete``
+    (``return_code == 0 and not has_errors and not has_sorry``) and never
+    surfaced as its own field. So when ``lake env lean`` exits non-zero
+    but its stderr matched no error regex, ``errors`` and ``rawOutput``
+    are both empty and the old ``"no error detail"`` return silently hid
+    a real failure. The fallback now reports the actual status flags the
+    result dict *does* carry (``proofComplete`` / ``success``) plus the
+    ``error`` key set on the Lean-not-found path, so a regex-miss failure
+    is visible in logs instead of looking like a clean run.
+    """
     errors = verify_result.get("errors") or []
     if errors:
         first = errors[0]
         msg = str(first.get("message", "")).replace("\n", " ")
         return f"line {first.get('line', '?')}: {msg[:120]}"
     raw = (verify_result.get("rawOutput") or "").strip().replace("\n", " ")
-    return raw[:120] if raw else "no error detail"
+    if raw:
+        return raw[:120]
+    # No parseable errors and no raw output. Surface the real status
+    # keys from the lean_prover contract so a non-zero exit that produced
+    # no regex-matched stderr is not mistaken for a clean compile.
+    fatal = verify_result.get("error")
+    if fatal:
+        return f"no error detail (lean_prover error: {str(fatal)[:90]})"
+    return (
+        "no error detail "
+        f"(proofComplete={verify_result.get('proofComplete')!r}, "
+        f"success={verify_result.get('success')!r})"
+    )
 
 
 async def parallel_propose(
@@ -176,12 +247,25 @@ async def parallel_propose(
     if not configs:
         raise ValueError("parallel_propose requires at least one ProposerConfig")
 
+    # One semaphore per parallel_propose call, created here so it binds to
+    # the event loop actually running this fanout. A module-global
+    # ``asyncio.Semaphore()`` would bind to whichever loop was live at
+    # import time and break across pytest's per-test loops. Per-call is
+    # also exactly the right scope: all legs of this one fanout share it
+    # (the contention case), and each new call gets a fresh one. Caps
+    # concurrent ``lean_prover`` compiles only — the proposer LLM calls
+    # stay fully parallel.
+    max_verifies = _max_concurrent_verifies()
+    verify_semaphore = asyncio.Semaphore(max_verifies)
+
     started = time.monotonic()
     logger.info(
-        "parallel_propose: launching %d configs [%s] race_mode=%s",
+        "parallel_propose: launching %d configs [%s] race_mode=%s "
+        "(max concurrent verifies=%d)",
         len(configs),
         ", ".join(_label_for(c) for c in configs),
         race_mode,
+        max_verifies,
     )
 
     # First-feedback bookkeeping is shared across modes; in verified mode
@@ -209,11 +293,25 @@ async def parallel_propose(
                 first_feedback_state["label"] = label
 
     async def _verify_proposal(
-        proposal: ProposalMessage, cfg: ProposerConfig, label: str, prop_s: float
+        proposal: ProposalMessage,
+        cfg: ProposerConfig,
+        label: str,
+        prop_s: float,
+        semaphore: asyncio.Semaphore,
     ) -> ProposalMessage | FeedbackMessage:
         """Run lean_prover against (preamble, proposal.code). Returns the
         proposal unchanged on success, or a structured FeedbackMessage
         on compile-fail / timeout so the all-fail fallback has signal.
+
+        The actual ``lean_prover`` compile runs under ``semaphore`` so at
+        most :func:`_max_concurrent_verifies` Lean compiles are in flight
+        across the whole fanout — a full ``lake env lean`` + Mathlib
+        compile is heavy enough that running one per leg thrashes the box.
+        The ``async with semaphore`` is *outside* the ``asyncio.wait_for``
+        on purpose: ``verify_timeout`` must measure the compile alone, not
+        time spent queued for a slot. ``async with`` releases the slot on
+        ``CancelledError`` too, so a leg cancelled while blocked on — or
+        inside — the semaphore frees its permit for surviving legs.
         """
         source = assemble_standalone_proof(state.preamble, proposal.code)
         logger.info(
@@ -221,35 +319,41 @@ async def parallel_propose(
             label,
             prop_s,
         )
-        verify_start = time.monotonic()
-        try:
-            verify_result = await asyncio.wait_for(
-                lean_prover(source, timeout=int(cfg.verify_timeout)),
-                timeout=cfg.verify_timeout,
-            )
-        except asyncio.TimeoutError:
-            verify_s = time.monotonic() - verify_start
-            logger.info(
-                "parallel_propose[verified]: leg %s proposed in %.1fs but "
-                "lean_prover timed out after %.1fs",
-                label,
-                prop_s,
-                verify_s,
-            )
-            return feedback.structured_output_parsing_failed(
-                f"leg {label} verify timed out after {verify_s:.0f}s"
-            )
-        except Exception as exc:  # noqa: BLE001
-            verify_s = time.monotonic() - verify_start
-            logger.warning(
-                "parallel_propose[verified]: leg %s verify raised after %.1fs: %s",
-                label,
-                verify_s,
-                exc,
-            )
-            return feedback.structured_output_parsing_failed(
-                f"leg {label} verify raised: {exc}"
-            )
+        # The semaphore caps how many Lean compiles run at once. It wraps
+        # only the wait_for below — verify_timeout measures the compile,
+        # never the queue wait. A leg cancelled while parked here (winner
+        # emerged) releases its permit via ``async with``'s __aexit__.
+        async with semaphore:
+            verify_start = time.monotonic()
+            try:
+                verify_result = await asyncio.wait_for(
+                    lean_prover(source, timeout=int(cfg.verify_timeout)),
+                    timeout=cfg.verify_timeout,
+                )
+            except asyncio.TimeoutError:
+                verify_s = time.monotonic() - verify_start
+                logger.info(
+                    "parallel_propose[verified]: leg %s proposed in %.1fs but "
+                    "lean_prover timed out after %.1fs",
+                    label,
+                    prop_s,
+                    verify_s,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"leg {label} verify timed out after {verify_s:.0f}s"
+                )
+            except Exception as exc:  # noqa: BLE001
+                verify_s = time.monotonic() - verify_start
+                logger.warning(
+                    "parallel_propose[verified]: leg %s verify raised after "
+                    "%.1fs: %s",
+                    label,
+                    verify_s,
+                    exc,
+                )
+                return feedback.structured_output_parsing_failed(
+                    f"leg {label} verify raised: {exc}"
+                )
 
         verify_s = time.monotonic() - verify_start
         # Use ``proofComplete`` (not ``success``) so the leg's acceptance
@@ -340,7 +444,9 @@ async def parallel_propose(
                 return downgrade
             return proposal_or_fb
 
-        verified = await _verify_proposal(proposal_or_fb, cfg, label, prop_s)
+        verified = await _verify_proposal(
+            proposal_or_fb, cfg, label, prop_s, verify_semaphore
+        )
         if isinstance(verified, FeedbackMessage):
             await _maybe_record_first_feedback(verified, label)
         return verified

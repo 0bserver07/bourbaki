@@ -12,6 +12,7 @@ Covers:
 - cancellation actually fires on loser tasks
 - INFO-level logs include leg labels and winner
 - empty-code ProposalMessage is treated as a loss
+- concurrent lean_prover verifies are bounded by a semaphore
 """
 
 from __future__ import annotations
@@ -1161,3 +1162,257 @@ async def test_first_verified_rejects_when_proof_complete_missing(monkeypatch):
     )
 
     assert isinstance(out, FeedbackMessage)
+
+
+# ---------------------------------------------------------------------------
+# 15. Concurrent lean_prover verifies are bounded by a semaphore.
+#
+# Each ``lean_prover`` call is a full ``lake env lean`` + ``import Mathlib``
+# compile — heavy on CPU and RAM. Under ``race_mode="first_verified"`` every
+# verify-eligible leg shells out to Lean; without a cap, N legs launch N
+# simultaneous Mathlib compiles and thrash the box (7 legs measured 7.3x
+# slower wall-clock than 5 on the same problem). ``parallel_propose`` creates
+# one ``asyncio.Semaphore`` per call and runs each verify under it, so no
+# more than ``_max_concurrent_verifies()`` compiles are ever in flight.
+#
+# These tests isolate verify-concurrency: the proposer functions are
+# monkeypatched to return canned ProposalMessages instantly, and
+# ``lean_prover`` is a fake that records the running max concurrency.
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrencyProbe:
+    """Fake ``lean_prover`` that records peak concurrent invocations.
+
+    Increments a shared counter on entry, tracks the running max, sleeps
+    briefly so overlapping legs actually overlap on the event loop, then
+    decrements on exit. The recorded ``max_seen`` is the high-water mark
+    of simultaneous Lean compiles the fanout allowed.
+    """
+
+    def __init__(self, *, result: dict, sleep_s: float = 0.03) -> None:
+        self._result = result
+        self._sleep_s = sleep_s
+        self.active = 0
+        self.max_seen = 0
+        self.total_calls = 0
+
+    async def __call__(self, code, **kwargs):  # noqa: ANN001 — mirrors lean_prover
+        self.active += 1
+        self.total_calls += 1
+        self.max_seen = max(self.max_seen, self.active)
+        try:
+            await asyncio.sleep(self._sleep_s)
+            return self._result
+        finally:
+            self.active -= 1
+
+
+async def test_concurrent_verifies_bounded_by_semaphore(monkeypatch):
+    """With more verify-eligible legs than the limit, the observed peak of
+    simultaneous ``lean_prover`` calls must never exceed
+    ``_max_concurrent_verifies()`` (default 3).
+
+    Every leg's verify is made to fail so no winner emerges early — that
+    forces all legs through their verify step, maximising the chance of a
+    semaphore-cap violation if the cap were missing.
+    """
+    # Default cap, no env override.
+    monkeypatch.delenv("BOURBAKI_MAX_CONCURRENT_VERIFIES", raising=False)
+    limit = pp_mod._max_concurrent_verifies()
+    assert limit == 3, "test assumes the default cap of 3"
+
+    n_legs = 7
+    assert n_legs > limit, "test only meaningful with more legs than the cap"
+
+    probe = _ConcurrencyProbe(result=_fail_verify_result("nope"))
+    monkeypatch.setattr(pp_mod, "lean_prover", probe)
+
+    # Each leg returns a distinct, instantly-available ProposalMessage so
+    # the test exercises verify-concurrency, not proposer-LLM behaviour.
+    async def instant_proposer(state, *, model, **kwargs):
+        return _make_proposal(
+            code=f"theorem {model.replace(':', '_')} : True := trivial"
+        )
+
+    monkeypatch.setattr(pp_mod, "run_proposer", instant_proposer)
+
+    configs = [
+        ProposerConfig(model=f"leg{i}:m", verify_with_lean=True)
+        for i in range(n_legs)
+    ]
+
+    out = await parallel_propose(
+        _make_state(), configs, race_mode="first_verified"
+    )
+
+    # All verifies fail → no winner → a FeedbackMessage is surfaced.
+    assert isinstance(out, FeedbackMessage)
+    # Every leg actually reached the verify step.
+    assert probe.total_calls == n_legs
+    # The cap held: at no point were more than `limit` compiles in flight.
+    assert probe.max_seen <= limit, (
+        f"observed {probe.max_seen} concurrent verifies with a cap of {limit}"
+    )
+    # Sanity: the fanout did run things in parallel up to the cap (it did
+    # not silently serialise everything to 1).
+    assert probe.max_seen >= 1
+
+
+async def test_verify_semaphore_respects_env_override(monkeypatch):
+    """``BOURBAKI_MAX_CONCURRENT_VERIFIES`` overrides the default cap; the
+    observed peak concurrency must respect the overridden value.
+    """
+    monkeypatch.setenv("BOURBAKI_MAX_CONCURRENT_VERIFIES", "2")
+    assert pp_mod._max_concurrent_verifies() == 2
+
+    probe = _ConcurrencyProbe(result=_fail_verify_result("nope"))
+    monkeypatch.setattr(pp_mod, "lean_prover", probe)
+
+    async def instant_proposer(state, *, model, **kwargs):
+        return _make_proposal(
+            code=f"theorem {model.replace(':', '_')} : True := trivial"
+        )
+
+    monkeypatch.setattr(pp_mod, "run_proposer", instant_proposer)
+
+    configs = [
+        ProposerConfig(model=f"leg{i}:m", verify_with_lean=True)
+        for i in range(6)
+    ]
+
+    out = await parallel_propose(
+        _make_state(), configs, race_mode="first_verified"
+    )
+
+    assert isinstance(out, FeedbackMessage)
+    assert probe.total_calls == 6
+    assert probe.max_seen <= 2, (
+        f"env override to 2 ignored — saw {probe.max_seen} concurrent verifies"
+    )
+
+
+@pytest.mark.parametrize("bad_value", ["", "abc", "0", "-1", "3.5"])
+def test_invalid_env_override_falls_back_to_default(monkeypatch, bad_value):
+    """A non-positive-integer ``BOURBAKI_MAX_CONCURRENT_VERIFIES`` must fall
+    back to the default cap rather than crashing or producing a degenerate
+    (zero / negative) semaphore.
+    """
+    monkeypatch.setenv("BOURBAKI_MAX_CONCURRENT_VERIFIES", bad_value)
+    assert (
+        pp_mod._max_concurrent_verifies()
+        == pp_mod._DEFAULT_MAX_CONCURRENT_VERIFIES
+    )
+
+
+async def test_verify_semaphore_releases_slot_on_winner_cancellation(monkeypatch):
+    """When a winner emerges, legs still queued on (or inside) the verify
+    semaphore are cancelled. ``async with`` must release their permit so a
+    subsequent ``parallel_propose`` call is not starved.
+
+    The check: run two back-to-back fanouts that share the same module
+    state. If a cancelled leg leaked its permit, the second fanout's verify
+    would deadlock; an ``asyncio.wait_for`` guard turns that into a clean
+    test failure instead of a hang.
+    """
+    monkeypatch.setenv("BOURBAKI_MAX_CONCURRENT_VERIFIES", "1")
+
+    winner_code = "theorem winner : True := trivial"
+
+    async def proposer(state, *, model, **kwargs):
+        if model == "winner:m":
+            return _make_proposal(code=winner_code)
+        # Loser proposes too, so it also tries to grab the verify slot.
+        return _make_proposal(code="theorem loser : True := trivial")
+
+    monkeypatch.setattr(pp_mod, "run_proposer", proposer)
+
+    async def verify(code, **kwargs):
+        if "winner" in code:
+            return _ok_verify_result()
+        # The loser's verify blocks; when the winner wins, the loser leg is
+        # cancelled while waiting on / inside the semaphore.
+        await asyncio.sleep(10.0)
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "lean_prover", verify)
+
+    first = await asyncio.wait_for(
+        parallel_propose(
+            _make_state(),
+            [
+                ProposerConfig(model="winner:m", verify_with_lean=True),
+                ProposerConfig(model="loser:m", verify_with_lean=True),
+            ],
+            race_mode="first_verified",
+        ),
+        timeout=5.0,
+    )
+    assert isinstance(first, ProposalMessage)
+    assert first.code == winner_code
+
+    # Second fanout: if the cancelled loser leaked the only permit, this
+    # call's verify can never acquire the semaphore and wait_for fires.
+    async def verify2(code, **kwargs):
+        return _ok_verify_result()
+
+    monkeypatch.setattr(pp_mod, "lean_prover", verify2)
+
+    second = await asyncio.wait_for(
+        parallel_propose(
+            _make_state(),
+            [ProposerConfig(model="winner:m", verify_with_lean=True)],
+            race_mode="first_verified",
+        ),
+        timeout=5.0,
+    )
+    assert isinstance(second, ProposalMessage)
+
+
+# ---------------------------------------------------------------------------
+# 16. _summarise_lean_errors blind spot — non-zero exit, no regex-matched
+#     error. The old return ``"no error detail"`` hid the failure; the
+#     fallback must surface the real status keys lean_prover does carry.
+# ---------------------------------------------------------------------------
+
+
+def test_summarise_lean_errors_surfaces_status_when_no_detail():
+    """When ``errors`` and ``rawOutput`` are both empty (``lake env lean``
+    exited non-zero but stderr matched no error regex), the summary must
+    expose the ``proofComplete`` / ``success`` flags rather than the
+    silent ``"no error detail"``.
+    """
+    result = {
+        "success": True,
+        "proofComplete": False,
+        "errors": None,
+        "rawOutput": "",
+        "codeUsed": "",
+    }
+    summary = pp_mod._summarise_lean_errors(result)
+    assert "proofComplete=False" in summary
+    assert "success=True" in summary
+
+
+def test_summarise_lean_errors_surfaces_fatal_error_key():
+    """The Lean-not-found result shape sets an ``error`` key (and no
+    ``errors`` / ``rawOutput``). The summary must include that message.
+    """
+    result = {
+        "success": False,
+        "error": "Lean 4 not found. Install from https://leanprover.github.io/",
+        "rawOutput": "",
+        "codeUsed": "",
+    }
+    summary = pp_mod._summarise_lean_errors(result)
+    assert "Lean 4 not found" in summary
+
+
+def test_summarise_lean_errors_prefers_real_errors():
+    """A result with parseable errors still summarises the first error —
+    the new fallback only kicks in when there is genuinely no detail.
+    """
+    result = _fail_verify_result("unknown identifier 'foo'")
+    summary = pp_mod._summarise_lean_errors(result)
+    assert "unknown identifier 'foo'" in summary
+    assert "line 3" in summary
