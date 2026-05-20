@@ -1,5 +1,100 @@
 # Changelog
 
+## Unreleased — multi-provider parallel fanout
+
+The proposer-builder-reviewer loop gained multi-provider routing and
+parallel fanout. The single-model path is unchanged and remains the
+default; the features below are opt-in.
+
+### Model-string routing prefixes
+
+Provider routing is centralized in `backend/bourbaki/providers.py`
+(`resolve_model_object`), with two adapters in the prover package for
+endpoints Pydantic AI's OpenAI-compat path can't drive correctly:
+
+| Prefix | Routes to | Notes |
+|--------|-----------|-------|
+| `glm:` | z.ai Anthropic-compat (`api.z.ai/api/anthropic`) | default; `GLM_API_KEY` |
+| `glm-oai:` | z.ai OpenAI-compat (`api.z.ai/api/paas/v4/`) | `GLM_API_KEY`; separate billing pool |
+| `ollama:` | local Ollama daemon (`OLLAMA_BASE_URL`, default `localhost:11434/v1`) | dummy key; daemon proxies `:cloud` tags |
+| `ollama-cloud:` | Ollama Cloud OpenAI-compat (`ollama.com/v1`) | `OLLAMA_CLOUD_API_KEY`; non-reasoning models |
+| `ollama-native:` | Ollama Cloud `/api/chat` | `OLLAMA_CLOUD_API_KEY`; for reasoning models — sends `think: false` |
+| `ollama-stream:` | Ollama Cloud `/api/chat`, streaming | `OLLAMA_CLOUD_API_KEY`; early-cancels once the proof field is parseable |
+
+Prefix matching checks `ollama-cloud:` before `ollama:` (more specific
+first); a regression guard lives in `tests/test_z_ai_routing.py`.
+
+### Parallel proposer fanout
+
+`backend/bourbaki/prover/parallel_proposer.py` — `parallel_propose`
+races N `ProposerConfig` legs against the same `ProverState` and returns
+the first valid `ProposalMessage`, cancelling the rest. Two race modes:
+
+- `first_completed` (default) — the fastest leg that emits a valid
+  proposal wins.
+- `first_verified` — each leg's proposal is compiled with `lean_prover`
+  before it can win, so a fast-but-broken proof loses to a slower
+  compiling one.
+
+Wired into `ProverLoop` via `ProverConfig.proposer_configs` /
+`ProverConfig.proposer_race_mode`; when `proposer_configs` is `None` the
+loop uses the single-model path.
+
+### Reasoning-model proposer adapters
+
+- `native_proposer.py` (`ollama-native:`) — calls Ollama Cloud's native
+  `/api/chat` with `think: false`, which the OpenAI-compat endpoint
+  ignores. Without it, reasoning models emit unbounded reasoning chains.
+  Supports the `mathlib_search` tool via a bounded tool-call loop.
+- `streaming_proposer.py` (`ollama-stream:`) — streams `/api/chat`
+  token-by-token and closes the connection as soon as the structured
+  output parses with a non-empty proof field. No tool-call support.
+
+### Multi-model reviewer fanout
+
+`backend/bourbaki/prover/reviewer_fanout.py` — `fanout_review` races N
+`ReviewerConfig` legs. Combination modes:
+
+- `first_approved` (default) — first leg to approve wins.
+- `all_must_approve` — approval requires every leg to approve.
+
+Each leg runs the LLM decision only; the `lean_prover` final gate runs
+once after the ensemble decides, not per leg. Wired via
+`ProverConfig.reviewer_configs` / `ProverConfig.reviewer_review_mode`.
+
+### Smart and per-problem fanout
+
+`backend/bourbaki/prover/default_fanout.py`:
+
+- `smart_default_fanout(tier=...)` — builds a fanout from whichever API
+  keys are set in the environment. Tiers: `minimal` (2 legs),
+  `balanced` (3-4 legs), `max` (every eligible leg, up to 7).
+- `fanout_for_problem(problem_id)` — picks legs from the problem ID's
+  source prefix (`aime` / `imo` / `putnam` favor reasoning models;
+  `algebra` / `mathd` / `amc` favor coder models; everything else uses
+  the balanced tier). Capped at 5 legs.
+
+### Benchmark runner flags
+
+`backend/scripts/run_minif2f_subset.py` and
+`backend/scripts/run_putnam_loop.py` gained matching flags:
+`--proposer-models`, `--smart-fanout {minimal,balanced,max}`,
+`--auto-route`, `--race-mode {first_completed,first_verified}`,
+`--reviewer-models`, `--reviewer-review-mode {first_approved,all_must_approve}`,
+`--proposer-llm-timeout`, `--reviewer-llm-timeout`, `--pass-n`,
+`--enable-mathlib-search`. The three fanout selectors (`--proposer-models`,
+`--smart-fanout`, `--auto-route`) are mutually exclusive. Run either
+script with `--help` for the full flag grammar.
+
+### Overnight loop driver
+
+`backend/scripts/autoresearch_step.py` — an overnight loop driver
+script. One invocation runs `run_minif2f_subset.py` once, parses the
+verified pass rate, compares it to history in `.bourbaki/results.tsv`,
+and either commits an edit to `prover/prompts.py` (if the rate held or
+improved) or reverts it (if it regressed). `--dry-run` skips the git
+and TSV side-effects.
+
 ## v0.3.0-pending — 2026-04-25 → 2026-05-14
 
 ### Proposer-builder-reviewer loop replaces HILBERT pipeline

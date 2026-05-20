@@ -1,16 +1,22 @@
 # Bourbaki Assessment Report
 
-> **SUPERSEDED 2026-05-13.** This report was written on 2026-03-19 and
-> describes the decomposer-era architecture (sketch → formalize →
-> decompose → search → stitch). That pipeline was deleted in Phase 3
-> (commit `2113629`, May 2026, net `-6,576 / +118` lines) and replaced by
-> the proposer-builder-reviewer loop in `backend/bourbaki/prover/`.
+> **SUPERSEDED.** This report was written on 2026-03-19 and describes the
+> decomposer-era architecture (sketch → formalize → decompose → search →
+> stitch). That pipeline was deleted in Phase 3 (commit `2113629`, May
+> 2026, net `-6,576 / +118` lines) and replaced by the
+> proposer-builder-reviewer loop in `backend/bourbaki/prover/`. The loop
+> has since gained multi-provider parallel fanout (a proposer step can
+> race legs across z.ai and Ollama Cloud) and a multi-model reviewer
+> fanout.
 >
 > The numbers in this report (28.6% heuristic, 40% with decomposer) are
-> historical. Current verified rates (lean_prover-gated, 0 false positives):
-> **9/10 (90%)** on a 10-problem subset (2026-04-25) and **22/35 (62.9%)**
-> on a 35-problem stratified sample (2026-05-09). For the current state
-> read `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and
+> historical. The last `lean_prover`-gated measurements with 0 false
+> positives were **9/10 (90%)** on a 10-problem subset (2026-04-25) and
+> **22/35 (62.9%)** on a 35-problem stratified sample (2026-05-09); the
+> latter is a lower bound (the reviewer's compile gate was timing out
+> short on that run — fixed afterward in commit `7b07c07`). For the
+> current architecture and an honest history of the numbers read
+> `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, and
 > `docs/REALITY_CHECK.md`.
 >
 > Most module references below (`sketch.py`, `formalizer.py`, `decomposer.py`,

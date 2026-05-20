@@ -84,11 +84,17 @@ backend/bourbaki/
 ├── sessions/
 │   ├── manager.py             # CRUD, persistence, token tracking
 │   └── context_compactor.py   # LLM-based conversation summarization
+├── providers.py               # Model-string → Pydantic AI model routing
 ├── prover/                    # Proposer-builder-reviewer-memory loop
 │   ├── prover.py              # ProverLoop + ProverConfig + routing
 │   ├── proposer.py            # GLM-5.1 proposer node + mathlib_search wiring
+│   ├── parallel_proposer.py   # Multi-provider parallel-fanout proposer
+│   ├── native_proposer.py     # ollama-native: adapter (reasoning models)
+│   ├── streaming_proposer.py  # ollama-stream: adapter (early-cancel)
+│   ├── default_fanout.py      # smart_default_fanout + fanout_for_problem
 │   ├── builder.py             # REPL-backed builder + typed feedback
 │   ├── reviewer.py            # Reviewer node + lean_prover final gate
+│   ├── reviewer_fanout.py     # Multi-model reviewer fanout
 │   ├── memory.py              # Memoryless / PreviousK / Experience strategies
 │   ├── feedback.py            # 10 typed feedback factories
 │   ├── prompts.py             # PROPOSER / REVIEWER / EXPERIENCE prompts
@@ -623,7 +629,7 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 
 ## Solver Architecture
 
-The solver is the proving engine that takes a Lean 4 theorem statement and produces a verified proof. As of Phase 3 (commit `2113629`, May 2026), it runs a single proposer-builder-reviewer-memory loop in the style of ax-prover — no recursive decomposition, no best-first tactic search, no multi-agent coordinator. The whole pipeline is one bounded async `while` loop driven by GLM-5.1 and a warm `LeanREPLSession`.
+The solver is the proving engine that takes a Lean 4 theorem statement and produces a verified proof. As of Phase 3 (commit `2113629`, May 2026), it runs a single proposer-builder-reviewer-memory loop in the style of ax-prover — no recursive decomposition, no best-first tactic search, no multi-agent coordinator. The whole pipeline is one bounded async `while` loop backed by a warm `LeanREPLSession`. The proposer defaults to a single GLM-5.1 call; it can also race a parallel fanout of legs across multiple providers (see "Parallel proposer fanout" below).
 
 <p align="center">
   <img src="assets/prover-loop.svg" alt="Proposer-Builder-Reviewer loop" width="100%">
@@ -696,6 +702,53 @@ The only legacy file that survived Phase 3 is `autonomous/tactics.py` — its bl
 
 `attempt_proof_pass_at_n` runs the loop up to N times per problem, returning the first verified result. Plumbed via `run_minif2f(pass_n=N)`. Default `pass_n=1` is a no-op so existing benchmark runs are unaffected. Shared REPL session across attempts — known leakage caveat documented in the function docstring (lean4-repl has no clean `:reset` primitive).
 
+### Model-string routing
+
+`backend/bourbaki/providers.py::resolve_model_object` maps a Bourbaki model string to a Pydantic AI model object. The leading prefix selects the provider:
+
+| Prefix | Provider | Endpoint | API key |
+|--------|----------|----------|---------|
+| `glm:` | z.ai Anthropic-compat | `api.z.ai/api/anthropic` | `GLM_API_KEY` |
+| `glm-oai:` | z.ai OpenAI-compat | `api.z.ai/api/paas/v4/` | `GLM_API_KEY` |
+| `ollama:` | local Ollama daemon | `OLLAMA_BASE_URL` (default `localhost:11434/v1`) | none (dummy) |
+| `ollama-cloud:` | Ollama Cloud | `ollama.com/v1` | `OLLAMA_CLOUD_API_KEY` |
+| `ollama-native:` | Ollama Cloud `/api/chat` | `ollama.com/api/chat` | `OLLAMA_CLOUD_API_KEY` |
+| `ollama-stream:` | Ollama Cloud `/api/chat` (streaming) | `ollama.com/api/chat` | `OLLAMA_CLOUD_API_KEY` |
+| (none) | passed verbatim to Pydantic AI | — | provider-specific |
+
+`ollama-cloud:` is matched before `ollama:` (more specific first). The `glm:` Anthropic-compat endpoint is where z.ai's GLM resource packages bill; `glm-oai:` targets a separate OpenAI-compat billing pool. The local daemon transparently proxies `:cloud` model tags, so `ollama:kimi-k2.6:cloud` reaches Ollama Cloud without an API key.
+
+`ollama-native:` and `ollama-stream:` exist because Ollama Cloud's OpenAI-compat `/v1/chat/completions` endpoint silently ignores the `think` parameter — reasoning models (Kimi K2.6, DeepSeek) then emit unbounded reasoning chains and never produce structured output. The native `/api/chat` endpoint respects `think: false`. The streaming variant closes the connection as soon as the accumulated buffer parses as a complete `ProverResult` with a non-empty proof field, which is typically faster than waiting for the full response.
+
+### Parallel proposer fanout
+
+`backend/bourbaki/prover/parallel_proposer.py::parallel_propose` races N proposer legs (`ProposerConfig`) against the same `ProverState` in parallel and returns the first valid `ProposalMessage`, cancelling the pending legs. Each leg has its own model string and per-call timeout; the leg's routing prefix selects the proposer implementation (`run_proposer`, `run_proposer_native`, or `run_proposer_stream`).
+
+Two race modes:
+
+- `first_completed` (default) — the fastest leg that emits a valid `ProposalMessage` wins.
+- `first_verified` — each leg's proposal is compiled with `lean_prover` against `assemble_standalone_proof(state.preamble, proposal.code)` before it can win. A leg that compiles clean beats a faster leg whose proof does not. The acceptance criterion (`proofComplete`) matches the reviewer's final gate.
+
+`ProverLoop._proposer` uses this path when `ProverConfig.proposer_configs` is a non-empty list; otherwise it calls `run_proposer` once (single-model path). `ProverConfig.proposer_race_mode` selects the mode.
+
+### Multi-model reviewer fanout
+
+`backend/bourbaki/prover/reviewer_fanout.py::fanout_review` races N reviewer legs (`ReviewerConfig`). Each leg runs `run_reviewer(..., decide_only=True)` — the LLM approve/reject decision only, with no `lean_prover` call. The coordinator runs the `lean_prover` final gate exactly once after the ensemble decides, so adding legs costs N LLM calls but only one standalone compile.
+
+Two combination modes:
+
+- `first_approved` (default) — the first leg to approve wins; pending legs are cancelled. If every leg rejects, the first rejection is surfaced.
+- `all_must_approve` — every leg must finish and approve; any rejection rejects the ensemble.
+
+`ProverLoop._reviewer` uses this path when `ProverConfig.reviewer_configs` is a non-empty list; `ProverConfig.reviewer_review_mode` selects the mode.
+
+### Smart and per-problem fanout selection
+
+`backend/bourbaki/prover/default_fanout.py` builds fanout lists without a hand-written `--proposer-models` spec:
+
+- `smart_default_fanout(tier=...)` reads which API keys are present in the environment and returns a tiered fanout. `minimal` is 2 legs (one baseline + one frontier), `balanced` is 3-4 legs, `max` is every eligible leg (up to 7). Profile order is fixed, so the fanout is deterministic.
+- `fanout_for_problem(problem_id)` routes by the problem ID's source prefix: `aime` / `imo` / `putnam` lead with reasoning models, `algebra` / `mathd` / `amc` lead with coder models, and other prefixes fall back to the balanced tier. The result is capped at 5 legs.
+
 ### Why this replaced the HILBERT pipeline
 
 The previous pipeline (sketch → formalize → decompose → search-tree → stitch) sat at 5/10 (50%) on the same 10-problem subset where the loop now hits 9/10 (90%), and on a 35-problem stratified sample it scored 10/35 (28.6%) where the loop now hits 22/35 (62.9%) — both with zero false positives.
@@ -761,6 +814,27 @@ backend/bourbaki/benchmarks/
 2. Initialize REPL with full Mathlib import (~80s one-time)
 3. For each problem: `attempt_proof_loop(problem, session, config, timeout)` — runs `ProverLoop.run` until `state.verified`, terminal feedback, or timeout
 4. Mandatory `_verify_with_lean_prover` post-hook on every reported solve — false-positive catcher independent of the reviewer's own `lean_prover` call
+
+### Standalone runner scripts
+
+`backend/scripts/run_minif2f_subset.py` (miniF2F) and `backend/scripts/run_putnam_loop.py` (PutnamBench) drive the loop outside a managed shell session — the asyncio loop lives in a single Python process, so killing the launching shell does not kill the run. Both scripts accept the same proving flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--model` | Single-model loop model (default `glm:glm-5.1`) |
+| `--proposer-models` | Multi-provider proposer fanout. Comma- or pipe-separated `model[@timeout]` legs (the `@` precedes the per-leg timeout in seconds, since model strings contain colons) |
+| `--smart-fanout {minimal,balanced,max}` | Auto-build a fanout from whichever API keys are set |
+| `--auto-route` | Per-problem fanout via `fanout_for_problem` (legs picked from the problem's source prefix) |
+| `--race-mode {first_completed,first_verified}` | Proposer race semantics (default `first_completed`) |
+| `--reviewer-models` | Multi-model reviewer fanout, same `model[@timeout]` grammar |
+| `--reviewer-review-mode {first_approved,all_must_approve}` | Reviewer combination strategy (default `first_approved`) |
+| `--proposer-llm-timeout` / `--reviewer-llm-timeout` | Per-LLM-call timeouts (seconds) |
+| `--pass-n` | Pass@N sampling count (default 1) |
+| `--enable-mathlib-search` | Register `mathlib_search` as a proposer tool |
+
+`--proposer-models`, `--smart-fanout`, and `--auto-route` are pairwise mutually exclusive — the runner rejects any combination of them. Run either script with `--help` for the complete list.
+
+`backend/scripts/autoresearch_step.py` is an overnight loop driver script: each invocation runs `run_minif2f_subset.py` once, parses the verified pass rate from the newest result JSON, compares it to history in `.bourbaki/results.tsv`, and either commits an edit to `prover/prompts.py` (rate held or improved) or reverts it (rate regressed). `--dry-run` skips the git and TSV side-effects.
 
 **Current results (miniF2F valid split, 244 problems):**
 

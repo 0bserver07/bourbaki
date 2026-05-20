@@ -96,13 +96,30 @@ Skills can be added at three levels: built-in (`src/skills/`), user (`~/.bourbak
 
 ## Autonomous Mode
 
-Long-running proof search via a proposer-builder-reviewer loop driven by GLM-5.1 and a warm `LeanREPLSession`. One proposal per iteration, bounded by `max_iterations` (default 50, 8 for interactive). Every reported solve is gated by a `lean_prover` whole-file compile — no REPL-only claims.
+Long-running proof search via a proposer-builder-reviewer loop backed by a warm `LeanREPLSession`. One proposal per iteration, bounded by `max_iterations` (default 50, 8 for interactive). Every reported solve is gated by a `lean_prover` whole-file compile — no REPL-only claims.
 
 <p align="center">
   <img src="assets/prover-loop.svg" alt="Proposer-Builder-Reviewer loop" width="100%">
 </p>
 
 Drive the loop from `backend/bourbaki/benchmarks/minif2f.py::attempt_proof_loop` or from the FastAPI `/query` endpoint with `use_loop=True`. (The TUI's `/prove <id>` command still points at the legacy `/autonomous/start` route, which now returns HTTP 410 Gone — the legacy pipeline was deleted in commit `2113629`. Rewiring the TUI to the new loop is tracked separately.)
+
+### Multi-provider routing and fanout
+
+The proposer defaults to a single GLM-5.1 call. It can also route to other providers, or race a parallel fanout of legs across several providers and take the first valid (or first compile-verified) proof.
+
+A model string's leading prefix selects the provider:
+
+| Prefix | Provider |
+|--------|----------|
+| `glm:` | z.ai Anthropic-compat endpoint (default) |
+| `glm-oai:` | z.ai OpenAI-compat endpoint |
+| `ollama:` | local Ollama daemon |
+| `ollama-cloud:` | Ollama Cloud (non-reasoning models) |
+| `ollama-native:` | Ollama Cloud `/api/chat` (reasoning models — sends `think: false`) |
+| `ollama-stream:` | Ollama Cloud `/api/chat`, streaming with early-cancel |
+
+The benchmark runners `backend/scripts/run_minif2f_subset.py` and `backend/scripts/run_putnam_loop.py` expose this through `--proposer-models` (an explicit fanout spec), `--smart-fanout {minimal,balanced,max}` (a fanout built from whichever API keys are set), `--auto-route` (a per-problem fanout chosen from the problem's source prefix), `--reviewer-models` (a multi-model reviewer fanout), and `--race-mode {first_completed,first_verified}`. Run either script with `--help` for the full flag list, or see [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the fanout works.
 
 ## Results
 
@@ -126,11 +143,11 @@ The 2026-02-17 v0.2.0 and 2026-02-18 v0.2.1 releases claimed 91.8% / 94.3% on th
 
 ## Known limitations
 
-- **Reviewer's `lean_prover` timeout was 30s until commit `7b07c07`** ([#19](https://github.com/0bserver07/bourbaki/issues/19)). Standalone `lake env lean + import Mathlib` typically needs 60-180s on a cold cache, so on busy/cold systems the gate silently rejected correct proofs. Bumped to 240s — the 2026-05-09 22/35 result is a lower bound; the new headline lands once #19's re-run completes.
-- **The Bash-tool-managed sessions some agents use kill long background processes** when their parent shell exits. The standalone scripts in `backend/scripts/` (and their `just` wrappers) launch the asyncio loop inside a single Python process, but the launching shell still owns the process group — run benchmarks from a normal terminal (or with `nohup`/`tmux`/`screen`) rather than from inside an ephemeral agent session.
-- **z.ai has two separate billing pools.** `glm:` routes via the Anthropic-compat endpoint, `glm-oai:` via the OpenAI-compat one. Funds in one pool do NOT cover the other — verify your balance is on the side your prefix targets (the loop defaults to `glm:` after commit `66cba4c`).
-- **The loop's ceiling on AIME/IMO problems is GLM-5.1's familiarity, not a code bug.** On the 2026-05-09 35-problem run, aime 0/3 and imo 0/3 was a model-capability floor — the proposer simply did not produce proof candidates for problems in styles GLM-5.1 has weak coverage of. A stronger LLM would lift these without architectural changes.
-- **Pass@N shares a single REPL session across attempts.** `attempt_proof_pass_at_n` runs the loop up to N times per problem but does not currently reset the Lean session between attempts. The lean4-repl has no clean `:reset` primitive, so state from attempt K can leak into attempt K+1. Documented in the function docstring; A/B tracked in [#18](https://github.com/0bserver07/bourbaki/issues/18).
+- **Run benchmarks from a normal terminal, not an ephemeral agent shell.** The standalone scripts in `backend/scripts/` (and their `just` wrappers) launch the asyncio loop inside a single Python process, but the launching shell still owns the process group. A bash-tool-managed session that kills its process group on exit will kill a long-running benchmark with it — use `nohup`/`tmux`/`screen` for overnight runs.
+- **z.ai has two separate billing pools.** `glm:` routes via the Anthropic-compat endpoint, `glm-oai:` via the OpenAI-compat one. Funds in one pool do NOT cover the other — verify your balance is on the side your prefix targets (the loop defaults to `glm:`).
+- **Reasoning models need the native endpoint.** Ollama Cloud's OpenAI-compat endpoint ignores the `think` parameter, so reasoning models routed through `ollama-cloud:` emit unbounded reasoning and never return structured output. Use the `ollama-native:` or `ollama-stream:` prefix for reasoning models (Kimi K2.6, DeepSeek); `ollama-stream:` does not support the `mathlib_search` tool.
+- **`first_verified` race mode trades latency for correctness.** Under `--race-mode first_verified`, every proposer leg's proof is compiled with `lean_prover` before the leg can win. The compile adds 60-180s per leg on a cold cache, so a verified-race fanout finishes slower than a `first_completed` one; budget per-problem timeouts accordingly.
+- **Pass@N shares a single REPL session across attempts.** `attempt_proof_pass_at_n` runs the loop up to N times per problem but does not reset the Lean session between attempts. The lean4-repl has no clean `:reset` primitive, so state from attempt K can leak into attempt K+1. Documented in the function docstring; A/B tracked in [#18](https://github.com/0bserver07/bourbaki/issues/18).
 
 ## Example Usage
 

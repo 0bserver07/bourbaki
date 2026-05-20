@@ -28,6 +28,13 @@ HILBERT pipeline (`sketch` / `formalizer` / `decomposer` / `search_tree` /
 in Phase 3; `backend/bourbaki/autonomous/` retains only `tactics.py` for its
 blocklist.
 
+The proposer step supports multi-provider parallel fanout: a model
+string's prefix (`glm:`, `glm-oai:`, `ollama:`, `ollama-cloud:`,
+`ollama-native:`, `ollama-stream:`) selects the provider via
+`backend/bourbaki/providers.py`, and a list of `ProposerConfig` legs can
+race in parallel. The reviewer step has an equivalent multi-model
+fanout. The single-model path is the default; fanout is opt-in.
+
 ## Core Tools (Python Backend)
 
 | Tool | File | Purpose |
@@ -144,7 +151,16 @@ BOURBAKI_BACKEND_URL=http://localhost:8000 bun start
 | `backend/bourbaki/server/routes/query.py` | SSE streaming endpoint |
 | `backend/bourbaki/prover/prover.py` | `ProverLoop` driver (proposer / builder / reviewer / memory routing) |
 | `backend/bourbaki/prover/state.py` | `ProverState`, `ProposalMessage`, `FeedbackMessage`, `ProverResult`, `ReviewDecision` |
+| `backend/bourbaki/providers.py` | `resolve_model_object` — model-string prefix → Pydantic AI model |
+| `backend/bourbaki/prover/parallel_proposer.py` | `parallel_propose` + `ProposerConfig` — multi-provider proposer fanout |
+| `backend/bourbaki/prover/native_proposer.py` | `ollama-native:` adapter (reasoning models via `/api/chat`) |
+| `backend/bourbaki/prover/streaming_proposer.py` | `ollama-stream:` adapter (streaming with early-cancel) |
+| `backend/bourbaki/prover/reviewer_fanout.py` | `fanout_review` + `ReviewerConfig` — multi-model reviewer fanout |
+| `backend/bourbaki/prover/default_fanout.py` | `smart_default_fanout` + `fanout_for_problem` — fanout selection |
 | `backend/bourbaki/tools/proof_code_builder.py` | `assemble_standalone_proof(preamble, code)` shared by builder and reviewer |
+| `backend/scripts/run_minif2f_subset.py` | miniF2F subset runner (loop + fanout flags) |
+| `backend/scripts/run_putnam_loop.py` | PutnamBench runner (loop + fanout flags) |
+| `backend/scripts/autoresearch_step.py` | Overnight loop driver — one measure/commit/revert iteration |
 | `src/agent/types.ts` | Event type definitions (the contract) |
 | `src/hooks/useAgentRunner.ts` | TUI ↔ backend bridge (fetch+SSE) |
 
