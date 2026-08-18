@@ -113,6 +113,48 @@ def test_accepts_decidable_true_style_identifiers():
     assert not check_trivialization(code).is_trivial
 
 
+def test_accepts_true_or_false_appearing_only_in_a_binder():
+    """The most dangerous false positive: a binder whose type is `True` or
+    `False`. If the parser picked the binder's `:` instead of the depth-zero
+    one it would reject a perfectly good theorem."""
+    assert not check_trivialization(
+        "theorem foo (h : True) : 1 = 1 := rfl"
+    ).is_trivial
+    assert not check_trivialization(
+        "theorem foo (h : False) : 2 = 3 := absurd rfl h"
+    ).is_trivial
+
+
+def test_accepts_declaration_name_beginning_with_true():
+    assert not check_trivialization("theorem True_intro_alt : 1 = 1 := rfl").is_trivial
+
+
+def test_accepts_anonymous_constructor_body():
+    """`⟨0⟩` contains bracket characters the depth scanner must balance."""
+    assert not check_trivialization("theorem foo : Nonempty ℕ := ⟨0⟩").is_trivial
+
+
+# ---------------------------------------------------------------------------
+# Known limits — documented, not defects. The guard catches the degenerate
+# case cheaply; anything subtler is the fidelity grader's job (#24).
+# ---------------------------------------------------------------------------
+
+
+def test_known_limit_conjunction_of_true_is_not_caught():
+    """`True ∧ True` asserts nothing either, but is not a bare vacuous target.
+
+    Catching it needs term-level reasoning, which is out of scope for a
+    syntactic filter. Recorded so the limit is visible rather than surprising.
+    """
+    assert not check_trivialization("theorem foo : True ∧ True := ⟨trivial, trivial⟩").is_trivial
+
+
+def test_known_limit_tautology_is_not_caught():
+    """`1 = 1` is trivially true but is a real proposition, not a vacuous
+    target. Out of scope by design — rejecting it would be a false reject."""
+    assert not check_trivialization("theorem foo : 1 = 1 := rfl").is_trivial
+
+
 def test_accepts_statement_with_sorry_body():
     """A `sorry` body is the reviewer's business, not the guard's."""
     assert not check_trivialization("theorem foo (n : ℕ) : n = n := by sorry").is_trivial
