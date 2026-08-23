@@ -83,9 +83,17 @@ def resolve_model_object(model_str: str) -> str | OpenAIChatModel | AnthropicMod
 
     if model_str.startswith("glm:"):
         model_name = model_str.removeprefix("glm:")
-        api_key = os.environ.get("GLM_API_KEY", "")
+        # z.ai bills its Anthropic-compatible coding plan separately from the
+        # PaaS API. ANTHROPIC_AUTH_TOKEN is the coding-plan credential and takes
+        # precedence: GLM_API_KEY can be live for /paas/v4 while the coding plan
+        # is out of balance, or exactly the reverse — which is what stalled the
+        # 2026-08-18 benchmark. Prefer the coding-plan token, fall back to the
+        # PaaS key so existing single-key setups keep working.
+        api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get(
+            "GLM_API_KEY", ""
+        )
         provider = AnthropicProvider(
-            base_url=ZAI_ANTHROPIC_BASE_URL,
+            base_url=os.environ.get("ANTHROPIC_BASE_URL") or ZAI_ANTHROPIC_BASE_URL,
             api_key=api_key,
         )
         return AnthropicModel(model_name, provider=provider)
